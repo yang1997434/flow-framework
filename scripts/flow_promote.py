@@ -52,6 +52,26 @@ class PromotionMetrics:
     source_size_chars: int
 
 
+def rewrite_frontmatter_for_promotion(content: str, target_path: str, today_iso: str) -> str | None:
+    """Append promotion metadata to YAML frontmatter, preserving body verbatim.
+
+    Returns the rewritten content, or None if `content` has no valid frontmatter.
+    """
+    if not content.startswith("---"):
+        return None
+    end_match = re.search(r"\n---\n", content[3:])
+    if not end_match:
+        return None
+    split_pos = 3 + end_match.start()
+    frontmatter = content[3:split_pos].strip()
+    rest = content[split_pos + 5:]
+    new_frontmatter = (
+        frontmatter
+        + f"\nstatus: promoted\npromoted_to: {target_path}\npromoted_date: {today_iso}"
+    )
+    return f"---\n{new_frontmatter}\n---\n{rest}"
+
+
 def detect_kind(file: Path) -> str:
     p = str(file)
     if "/pitfalls/" in p:
@@ -276,18 +296,9 @@ def main():
     target.write_text(content + promotion_note, encoding="utf-8")
 
     # Update source frontmatter
-    if content.startswith("---"):
-        end_match = re.search(r"\n---\n", content[3:])
-        if end_match:
-            split_pos = 3 + end_match.start()
-            frontmatter = content[3:split_pos]
-            rest = content[split_pos + 5:]
-            new_frontmatter = (
-                frontmatter.rstrip()
-                + f"\nstatus: promoted\npromoted_to: {target}\npromoted_date: {today}\n"
-            )
-            new_source_content = f"---\n{new_frontmatter}\n---\n{rest}"
-            source.write_text(new_source_content, encoding="utf-8")
+    rewritten = rewrite_frontmatter_for_promotion(content, str(target), today)
+    if rewritten is not None:
+        source.write_text(rewritten, encoding="utf-8")
 
     print(f"\n✅ Promoted: {source.name} → {target}")
     print(f"   Source frontmatter updated with status: promoted")

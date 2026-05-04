@@ -1,5 +1,95 @@
 # Changelog
 
+## v0.4.0 (2026-05-04)
+
+Major v0.4 release. Addresses 9 sub-projects identified in the v0.3.1 audit
+(`05-04-audit-flow-issues`). Production goal: **断点能记 / 长期记忆能沉淀 / 踩坑能沉淀**.
+
+### Highlights
+
+- **Capability registry** — prompt files no longer hard-code skill names. 13 capabilities
+  + 5 model roles, all overridable via `flow.config.local.yaml`. Skill churn → 1 yaml line.
+- **Real-automation install** — `install.sh` declarative (`dependencies.json`-driven):
+  registers marketplaces, installs plugins via `claude plugin install`, merges hooks into
+  `~/.claude/settings.json` with isolated matcher entries (Issue #415 mitigation), runs
+  `flow selftest` to prove it actually works.
+- **Worktree-per-task (default `shared`, opt-in `worktree`)** — task isolation that doesn't
+  poison the shared tree on cross-task switches. `flow status` / `flow switch` UX added.
+- **Three-tier autosave** — Lv1 trickle (git commit / file touch append) / Lv2 phase-boundary
+  / Lv3 distill-on-pause-or-stop with cooldown + heartbeat. Layer-1 raw persistence delegated
+  to context-mode plugin (hard dep).
+- **Ralph bash-loop** — Phase 2 alt mode for autonomous PRD-checklist runs. `scripts/flow_ralph.sh`
+  reimplements the Anthropic ralph-wiggum pattern in bash to avoid Stop-hook collisions.
+- **Skill diff hook** — SessionStart compares installed plugins to last snapshot, scores
+  capability overlap (Szymkiewicz–Simpson), surfaces "consider replacing X with Y" suggestions.
+- **Rule integration** — flow phases explicitly reference `~/.claude/rules/code-delivery.md`,
+  `code-review.md`, `knowledge-base.md`; new `behavioral_guidelines` capability invokes
+  Karpathy's guidelines at the implement boundary.
+
+### Added
+
+- `dependencies.json` — declarative manifest (system commands / marketplaces / plugins)
+- `claude/capabilities/defaults.json` — built-in capability + model_role mapping
+- `scripts/flow_capability.py` — resolver + template renderer (dotted access supported)
+- `scripts/flow_install.py` — install orchestrator (5 subcommands + dry-run)
+- `scripts/flow_doctor.py` — environment diagnostic incl. hook-isolation + context-mode check
+- `scripts/flow_selftest.py` — functional verification (hooks dry-fire / init / task-roundtrip /
+  plugins / rendered prompts / doctor recap)
+- `scripts/flow_skill_diff.py` — capability overlap analysis with per-(spec, version) cache
+- `scripts/flow_autosave.py` — Lv1/Lv2/Lv3 orchestrator (queue-based; LLM distill deferred to
+  next interactive session, never invoked from hook context)
+- `scripts/flow_ralph.sh` — Phase 2 ralph-loop wrapper (375 LOC, dry-run + fake-mode for tests)
+- `claude/hooks/post-tool-edit.py` — Lv1 file-touch tracking with debounce
+- `claude/hooks/settings.template.json` — replaces old `.snippet`; templated `{{REPO_ROOT}}`
+- `tests/smoke/` — 73 unittest cases + 12 ralph bash-test cases (was: empty in v0.3.1)
+
+### Changed
+
+- `claude/skills/flow/*/SKILL.md` and `claude/commands/flow/*.md` — every concrete skill name /
+  model name replaced with `{{capability:X}}` / `{{model:Y}}` placeholder; rendered at install
+- `install.sh` — slim orchestrator over `flow_install.py`; auto-removes legacy symlinks before
+  rendering; runs selftest at end and fails install if non-functional
+- `claude/hooks/stop.py` — removed raw save (delegated to context-mode); now triggers Lv3 distill
+  with 5-min cooldown
+- `claude/hooks/post-tool-bash.py` — added Lv1 git-commit append (hash-uniqueness debounce);
+  preserved credential grep
+- `claude/hooks/session-start.py` — runs `flow_skill_diff.py diff --quiet` (best-effort, 8s
+  timeout) and surfaces pending suggestions in injected context
+- `scripts/flow_task.py` — worktree creation + `.location` file + `cmd_status` (tree view) +
+  `cmd_switch` (eval-friendly cd output) + worktree cleanup on archive
+- `templates/flow.config.yaml.template` — new fields: `task_isolation`, `phase2_mode`, `autosave`
+- `templates/progress.md.template` — added YAML frontmatter (`slug` / `status` / `phase` /
+  `blocked_by`) for `cmd_status` to read
+
+### Fixed (P0 from audit)
+
+- `claude/hooks/pre-tool-task.py:62` — removed `or True` debug leftover
+- `scripts/flow_task.py:cmd_archive` — capture `was_current` BEFORE `shutil.move` (was: any
+  archive cleared `.current-task` pointer regardless of which task was archived)
+- `scripts/flow_promote.py:rewrite_frontmatter_for_promotion` — extracted as pure function;
+  `strip()` instead of `rstrip()` to avoid blank-line accumulation across re-promotions
+
+### Removed
+
+- `claude/hooks/settings.json.snippet` — superseded by `settings.template.json`
+
+### Pitfalls captured this cycle
+
+1. **render write-through symlink** — first install attempt wrote rendered output back into
+   source templates because `~/.claude/skills/flow/` was a legacy symlink to repo. Fixed by
+   adding fail-loud detection in `flow_install.py render-prompts` + auto-unlink in `install.sh`.
+2. **Sub-agent model selection** — dispatching with `model: sonnet` failed silently when that
+   model wasn't accessible in the local environment. Now: don't specify model unless certain.
+3. **`shutil.move` then query stale state** — pattern repeats across the codebase; archive
+   logic in `flow_task.py` was the surface case but worth promoting to vault.
+
+### Acknowledgments
+
+v0.4 absorbed two external plugins as dependencies:
+- [`mksglu/context-mode`](https://github.com/mksglu/context-mode) (Elastic 2.0) — Layer-1 raw
+  session persistence + tool output sandboxing
+- Anthropic's `ralph-wiggum` pattern — reimplemented in bash to avoid Stop-hook collisions
+
 ## v0.3.1-alpha (2026-05-04 later)
 
 Sandbox dogfood test exposed bugs + completed three stubs.

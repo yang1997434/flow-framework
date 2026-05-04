@@ -7,6 +7,13 @@ description: "Use when user says '走 Flow' / 'use Flow' / 'start a task with fr
 
 You are the entry point for the **Flow** AI coding framework. The user wants to work on a task using the framework's 4-phase workflow.
 
+## Relationship to global rules
+
+Flow runs **inside** Claude Code's global gravity, not on top of it. Specifically:
+- `~/.claude/CLAUDE.md` and the rules under `~/.claude/rules/*.md` are auto-loaded at session start and apply at every phase.
+- Flow does **not** replace those rules; it surfaces them at decision points where context dilution makes the model forget.
+- When in doubt, prefer the rule over flow's own instruction.
+
 ## Your job
 
 Identify intent → run Triage → invoke the right phase skill → don't do the work yourself, **delegate to phase skills**.
@@ -37,7 +44,7 @@ Also classify **task type**:
 | frontend / UI | "add settings page" | impeccable + frontend-design |
 | data / script | "process CSV" | karpathy + planning-with-files |
 | documentation | "write API docs" | document-skills + clarify |
-| deploy / ops | "deploy to staging" | gstack:ship + canary |
+| deploy / ops | "deploy to staging" | `{{capability:deploy_chain}}` |
 | research | "compare libraries" | active-research + planning-with-files |
 
 ## Step 3 — Bootstrap structure (if simple+)

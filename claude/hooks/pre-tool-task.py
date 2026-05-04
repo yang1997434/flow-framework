@@ -59,10 +59,9 @@ def pick_jsonl(task_dir: Path, prompt: str) -> Path | None:
         if target.is_file():
             return target
 
-    if impl_keywords.search(prompt) or True:  # default
-        target = task_dir / "implement.jsonl"
-        if target.is_file():
-            return target
+    target = task_dir / "implement.jsonl"
+    if target.is_file():
+        return target
 
     return None
 

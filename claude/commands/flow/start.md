@@ -59,11 +59,11 @@ python3 ~/projects/flow-framework/scripts/flow_task.py create "${TASK_TITLE}" --
 
 Now invoke the **flow-phase1-plan** skill (if loaded) or run inline:
 
-1. **Brainstorm** — Use `superpowers:brainstorming` skill. One question at a time, fill prd.md.
-2. **(UI tasks)** — Also invoke `impeccable:shape` for UX brief.
-3. **(Research needed)** — Dispatch parallel `general-purpose` sub-agents (model: sonnet) to write to `${TASK_DIR}/research/<topic>.md`. Return only summaries to main session.
+1. **Brainstorm** — Use `{{capability:brainstorm}}` skill. One question at a time, fill prd.md.
+2. **(UI tasks)** — Also invoke `{{capability:ux_brief}}` for UX brief.
+3. **(Research needed)** — Dispatch parallel `general-purpose` sub-agents (model: `{{model:research}}`) to write to `${TASK_DIR}/research/<topic>.md`. Return only summaries to main session.
 4. **ADR-lite** — When a major decision is made, fill the Decision section in prd.md with Context / Decision / Consequences / Revisit triggers.
-5. **(High-reversal-cost decision)** — Invoke `gstack:codex` (consult mode) for cross-model second opinion.
+5. **(High-reversal-cost decision)** — Invoke `{{capability:cross_model_consult}}` (mode={{capability:cross_model_consult.args.mode}}) for cross-model second opinion.
 
 After Phase 1 done, prd.md should be complete and user has confirmed requirements.
 

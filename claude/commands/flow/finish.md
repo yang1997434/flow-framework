@@ -18,8 +18,8 @@ CURRENT=$(cat .flow/.current-task 2>/dev/null)
 If `## Verify Report` in progress.md is empty:
 - Dispatch fresh-context verify sub-agent (Sonnet)
 - Run lint / typecheck / tests / credential grep
-- If task qualifies: run `gstack:codex` review
-- If UI: `impeccable:audit` + `polish` + `gstack:design-review`
+- If task qualifies: run `{{capability:cross_model_review}}` (mode={{capability:cross_model_review.args.mode}})
+- If UI: `{{capability:ui_audit}}` (auto-follows with `{{capability:ui_audit.follow_with}}`) + `{{capability:ui_visual_review}}`
 - Write `## Verify Report`
 
 ## Step 2 — Commit (if dirty tree)
@@ -43,7 +43,7 @@ Write `## Sediment Notes` section with these decisions:
 
 ## Step 4 — Auto-save
 
-Invoke `yangpeng-claude-skills:save` skill to write session breakpoint.
+Invoke `{{capability:session_save}}` skill to write session breakpoint.
 
 Also append to `.flow/workspace/${USER}/journal.md`:
 ```markdown

@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "version": 1,
+  "_comment": "Flow Framework declarative dependency manifest. Edited by humans, consumed by scripts/flow_install.py and scripts/flow_doctor.py. Required deps fail-loud on install; optional deps emit warnings only.",
+
+  "system_commands": {
+    "required": [
+      {"name": "git",     "hint": "System package manager (apt/brew/yum)"},
+      {"name": "python3", "min_version": "3.11", "hint": "Required by flow scripts (tomllib, modern type syntax)"},
+      {"name": "bash",    "hint": "Standard on Linux/macOS"},
+      {"name": "claude",  "hint": "Claude Code CLI: https://claude.com/claude-code"}
+    ],
+    "optional": [
+      {"name": "gh",      "capability": "github_pr",         "hint": "GitHub CLI for /codex review etc — https://cli.github.com/"},
+      {"name": "codex",   "capability": "cross_model_check", "hint": "OpenAI Codex CLI — npm install -g @openai/codex"},
+      {"name": "jq",      "capability": "json_parse_in_hooks", "hint": "Standard package"}
+    ]
+  },
+
+  "marketplaces": [
+    {"name": "claude-plugins-official", "source": "anthropics/claude-plugins-official", "purpose": "Official Anthropic plugins (superpowers, ralph-wiggum, etc.)"},
+    {"name": "context-mode",            "source": "mksglu/context-mode",                "purpose": "Session persistence + tool output sandboxing (P0 dep for flow v0.4)"},
+    {"name": "impeccable",              "source": "pbakaus/impeccable",                 "purpose": "UI design skills (frontend-design, audit, polish)"},
+    {"name": "planning-with-files",     "source": "OthmanAdi/planning-with-files",      "purpose": "Manus-style file-based planning (runtime files protocol)"},
+    {"name": "karpathy-skills",         "source": "andrejkarpathy/karpathy-skills",     "purpose": "Behavioral guidelines (surgical changes, define success criteria, etc.)"}
+  ],
+
+  "plugins": {
+    "required": [
+      {
+        "name": "superpowers",
+        "marketplace": "claude-plugins-official",
+        "capabilities": ["brainstorm", "plan_writing", "tdd", "parallel_dispatch", "verification_before_completion"]
+      },
+      {
+        "name": "context-mode",
+        "marketplace": "context-mode",
+        "capabilities": ["session_persistence", "tool_output_sandbox", "pre_compact_snapshot"]
+      }
+    ],
+    "optional": [
+      {
+        "name": "impeccable",
+        "marketplace": "impeccable",
+        "capabilities": ["ui_implement", "ui_audit", "ui_visual_review"]
+      },
+      {
+        "name": "planning-with-files",
+        "marketplace": "planning-with-files",
+        "capabilities": ["task_planning_runtime"]
+      },
+      {
+        "name": "andrej-karpathy-skills",
+        "marketplace": "karpathy-skills",
+        "capabilities": ["behavioral_guidelines"]
+      }
+    ]
+  }
+}

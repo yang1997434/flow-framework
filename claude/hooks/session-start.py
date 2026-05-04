@@ -49,6 +49,30 @@ def load_active_task(flow: Path) -> dict | None:
     return info
 
 
+def run_skill_diff_silently() -> str | None:
+    """Trigger flow_skill_diff against current snapshot.
+
+    Returns the contents of skill-diff-pending.md if there's an unresolved
+    suggestion (either freshly generated or leftover from before). Best-effort:
+    failures are silent — never block session start.
+    """
+    pending = Path.home() / ".flow" / ".runtime" / "skill-diff-pending.md"
+    diff_script = REPO_ROOT / "scripts" / "flow_skill_diff.py"
+    if not diff_script.is_file():
+        return pending.read_text(encoding="utf-8") if pending.is_file() else None
+    try:
+        import subprocess
+        subprocess.run(
+            ["python3", str(diff_script), "diff", "--quiet"],
+            capture_output=True, timeout=8,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    if pending.is_file():
+        return pending.read_text(encoding="utf-8")
+    return None
+
+
 def find_relevant_pitfalls(flow: Path, vault: Path) -> list[str]:
     """Find pitfalls whose trigger_paths might match files in this project.
 
@@ -114,6 +138,13 @@ def main():
     else:
         parts.append("\n## Status")
         parts.append("No `.flow/` in this project. Run `flow init` to set up.")
+
+    # Skill compatibility diff — surface pending suggestion if any
+    skill_diff = run_skill_diff_silently()
+    if skill_diff:
+        parts.append("\n## Skill Compatibility Diff (pending)")
+        parts.append(skill_diff.rstrip())
+        parts.append("\nIf no action needed, dismiss with: `flow skill-diff clear`")
 
     parts.append("</flow-context>")
 

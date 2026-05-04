@@ -16,7 +16,7 @@ Why: Anthropic research shows agents praise their own work. Fresh context elimin
 ```
 Agent(
   subagent_type: "general-purpose",
-  model: "sonnet",  # verify = sonnet
+  model: "{{model:review}}",
   description: "Fresh-context final verify",
   prompt: """
     You have NO history of this task. You see only:
@@ -50,9 +50,9 @@ Agent(
 **Skip**:
 - Trivial / pure docs / pure tests
 
-If triggered: invoke `gstack:codex` (review mode). Pass full diff + prd.md.
+If triggered: invoke `{{capability:cross_model_review}}` (mode={{capability:cross_model_review.args.mode}}). Pass full diff + prd.md.
 
-For UI tasks: also invoke `impeccable:audit` + `impeccable:polish` + `gstack:design-review` (real browser visual audit).
+For UI tasks: also invoke `{{capability:ui_audit}}` (auto-follows with `{{capability:ui_audit.follow_with}}`) + `{{capability:ui_visual_review}}` (real browser visual audit).
 
 ## Step 3 — Process verify + review output
 
@@ -78,6 +78,13 @@ Append to progress.md `## Verify Report`:
 ```
 
 ## Step 5 — Commit
+
+Before drafting the commit, re-anchor the three-step delivery rule from `~/.claude/rules/code-delivery.md`:
+1. **自测** — run small data through the full pipeline, no errors
+2. **审查** — check quality, error handling, edge cases
+3. **交付** — only commit after the first two pass
+
+For tool routing on cross-model review (which alternative reviewer to pick), see `~/.claude/rules/code-review.md`. Flow defaults to `{{capability:cross_model_review}}` (codex), but `/code-review` and `/review-pr` are valid alternatives — the rule documents when each fits.
 
 ```bash
 git status --porcelain

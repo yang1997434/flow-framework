@@ -67,3 +67,29 @@ tool_count_escape_threshold: 10
 
 # Team mode
 team_mode: false  # true: workspace/<dev>/ committed, --assignee enforced
+
+# Task isolation strategy (v0.4 — multi-task parallel)
+#   worktree — each task gets its own git worktree at ../<repo>-flow-<slug>
+#              (recommended for git repos; falls back to shared if not a git repo)
+#   branch   — switch branches in-place (single tree, may conflict)
+#   shared   — single shared working tree, switch via .current-task pointer (v0.3 default)
+# Default is `shared` because non-git repos must safely fall back; opt in to `worktree`
+# only when project is a git repo and you want true isolation.
+task_isolation: shared  # worktree | branch | shared
+
+# Phase 2 execution mode (v0.4)
+#   interactive          — main session orchestrates sub-agents (default, human-in-the-loop)
+#   ralph-loop           — bash loop calling `claude --print` headlessly until PRD's
+#                          Acceptance Criteria checklist is complete or --max-iterations
+#                          is reached. See scripts/flow_ralph.sh. Best for long autonomous
+#                          runs against PRDs whose criteria are individually testable.
+#   parallel-subagents   — N parallel sub-agents in worktrees (current main flow for
+#                          ≥3 independent modules).
+phase2_mode: interactive
+
+# Layer-2 semantic checkpoint (v0.4 — Lv1/Lv2/Lv3 event-driven save).
+# Layer-1 raw persistence is delegated to context-mode plugin.
+autosave:
+  heartbeat_minutes: 30           # Lv3 heartbeat: time threshold
+  heartbeat_tool_calls: 50        # Lv3 heartbeat: tool-call threshold
+  distill_cooldown_minutes: 5     # min gap between non-explicit Lv3 distills

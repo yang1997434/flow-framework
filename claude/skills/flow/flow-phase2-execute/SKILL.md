@@ -29,6 +29,26 @@ Read prd.md. Decide:
 
 **Tool count escape hatch**: if task needs >10 distinct tools → fallback to single agent (arxiv 2512.08296 β=−0.330).
 
+## Step 1.5 — Execution mode selection
+
+flow Phase 2 supports three execution modes. Pick one based on the task profile and the project's `phase2_mode` setting in `.flow/config.yaml` (default: `interactive`).
+
+| Mode | When to use | How it runs |
+|------|-------------|-------------|
+| `interactive` (default) | Most tasks. Main session orchestrates: writes Plan, dispatches sub-agents, integrates, decides when to stop. Human-in-the-loop friendly. | Steps 2–8 below, with you as the conductor. |
+| `parallel-subagents` | ≥3 independent modules / breadth-first scopes that don't share contracts. Currently the dominant flow Phase 2 mode. | Same as interactive but with N sub-agents in parallel; each in its own worktree. Use `{{capability:parallel_dispatch}}` for orchestration discipline. |
+| `ralph-loop` | Long autonomous runs against a well-specified PRD checklist (every Acceptance Criterion is independently testable). Useful overnight / when you want to walk away. | Shell out to `scripts/flow_ralph.sh <task-slug>`. The script repeatedly invokes `claude --print` headlessly with fresh context per iteration; it picks the next `- [ ]` from prd.md, implements it, ticks the box, and exits when either the completion-promise string appears or `--max-iterations` (default 20) is hit. Logs land in `~/.flow/.runtime/ralph-<slug>.log`. |
+
+**Why bash, not the official ralph-wiggum plugin?** Anthropic's plugin loops via an in-session Stop hook, which (a) collides with flow's own `stop.py` and (b) cannot be cleanly nested inside a sub-agent — see `.flow/tasks/05-04-audit-flow-issues/research/B-context-mode-ralph-loop.md`. The bash wrapper sidesteps both issues by running each iteration as a fresh `claude --print` process.
+
+**Rules for `ralph-loop` mode**:
+- The PRD's Acceptance Criteria checklist is load-bearing; vague items will produce vague iterations.
+- Always set a sane `--max-iterations` (it is the real budget cap; the completion-promise string match is best-effort and can be missed by the model).
+- Do NOT inject a system prompt that re-enters `flow:start` — that would nest a Phase 2 inside Phase 2 indefinitely. The wrapper deliberately keeps prompts plain.
+- For dry-runs / CI, pass `--dry-run` to print the planned prompt without spending tokens.
+
+If `phase2_mode` is `interactive` or `parallel-subagents`, continue to Step 2. If it is `ralph-loop`, hand off to `scripts/flow_ralph.sh` and skip directly to Step 8 (Phase 2 done check) once the script exits.
+
 ## Step 2 — Write scope plan to progress.md
 
 Before any sub-agent dispatch, write `## Plan` in progress.md:
@@ -50,7 +70,7 @@ For each sub-agent:
 ```
 Agent(
   subagent_type: "general-purpose",
-  model: "opus",  # implement = opus by default
+  model: "{{model:implement}}",
   isolation: "worktree",  # if change size warrants
   description: "Implement <scope>",
   prompt: """
@@ -69,11 +89,13 @@ Agent(
 )
 ```
 
-For **UI tasks**: sub-agent prompt should include "Use `impeccable:frontend-design` skill for component design quality."
+For **UI tasks**: sub-agent prompt should include "Use `{{capability:ui_implement}}` skill for component design quality."
 
 ## Step 4 — TDD when applicable
 
-If project has test infrastructure: invoke `superpowers:test-driven-development` to write tests first, before implement sub-agent dispatches.
+If project has test infrastructure: invoke `{{capability:tdd}}` to write tests first, before implement sub-agent dispatches.
+
+Also invoke `{{capability:behavioral_guidelines}}` once before the first implement sub-agent — its principles (surgical changes, define success criteria, surface assumptions, avoid over-engineering) are easy for the model to drop in long sessions and need re-surfacing at the implement boundary.
 
 ## Step 5 — Append to Execute Log
 
@@ -90,7 +112,7 @@ Dispatch a check sub-agent (Sonnet, no worktree — reads diff):
 ```
 Agent(
   subagent_type: "general-purpose",
-  model: "sonnet",  # check = sonnet
+  model: "{{model:review}}",
   description: "Quality check this diff",
   prompt: """
     Read prd.md (Acceptance Criteria), check.jsonl (if exists, load specs).
@@ -108,7 +130,7 @@ For **cross ≥3 layers** changes: upgrade check sub-agent to Opus.
 ## Step 7 — Stuck protocol
 
 If main session has tried fixing same bug 3+ times:
-- Invoke `gstack:codex` (challenge mode) — GPT-5.5 attacks assumptions
+- Invoke `{{capability:cross_model_challenge}}` (mode={{capability:cross_model_challenge.args.mode}}) — attacks assumptions
 - If still stuck after challenge: `/clear` and rewrite prompt with what was learned
 
 ## Step 8 — Phase 2 done

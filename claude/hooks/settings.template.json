@@ -1,0 +1,105 @@
+{
+  "_comment": "Flow Framework hook template. install.sh / flow_install.py replaces {{REPO_ROOT}} with the actual repo path. Each hook lives in its OWN matcher entry to satisfy context-mode Issue #415 (sibling hooks must not share matcher groups). PostToolUse splits Bash / Edit / Write into three independent matchers.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 {{REPO_ROOT}}/claude/hooks/session-start.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 {{REPO_ROOT}}/claude/hooks/session-start.py",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 {{REPO_ROOT}}/claude/hooks/session-start.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "flow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 {{REPO_ROOT}}/claude/hooks/user-prompt-submit.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 {{REPO_ROOT}}/claude/hooks/pre-tool-task.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 {{REPO_ROOT}}/claude/hooks/post-tool-bash.py",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 {{REPO_ROOT}}/claude/hooks/post-tool-edit.py",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 {{REPO_ROOT}}/claude/hooks/post-tool-edit.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "flow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 {{REPO_ROOT}}/claude/hooks/stop.py",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

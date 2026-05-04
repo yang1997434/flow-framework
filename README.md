@@ -24,22 +24,23 @@ A composable framework that wraps your existing skill ecosystem (superpowers / i
 ## Quick start
 
 ```bash
-# Clone (private repo or local)
-git clone <this-repo> ~/projects/flow-framework
-cd ~/projects/flow-framework
+# Clone
+git clone <this-repo> /path/to/flow-framework
+cd /path/to/flow-framework
 
-# Install (creates symlinks under ~/.claude/, ~/.flow/, etc.)
-./install.sh
+# Install (declarative — driven by dependencies.json)
+./install.sh                   # or `./install.sh --dry-run` to preview
+flow doctor                    # verify
 
 # In any project:
 cd <your-project>
-python3 ~/projects/flow-framework/scripts/flow_init.py
-# Or once installed: flow init
+flow init
 
-# Start a task:
-# (in Claude Code, after install)
+# Start a task (in Claude Code, after install):
 /flow:start "<task description>"
 ```
+
+`install.sh` handles: marketplaces (`claude plugin marketplace add`) → required plugins (`claude plugin install`) → hooks (merged into `~/.claude/settings.json` with isolated matcher entries) → CLI shim. See [`docs/USAGE.md`](docs/USAGE.md) for full detail.
 
 ## 4-Phase Workflow
 

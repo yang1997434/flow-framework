@@ -1,3 +1,16 @@
+---
+slug: {{SLUG}}
+status: active   # active | paused | blocked | done
+phase: triage    # triage | research | implement | check | verify | sediment
+# blocked_by: list of task slugs this task depends on. Used by `flow task status`
+# to draw the dependency graph (parent slugs must finish first). Default: empty.
+# Example:
+#   blocked_by:
+#     - capability-registry-and-model-roles
+#     - prereq-installer-and-doctor
+blocked_by: []
+---
+
 # progress.md — {{SLUG}}
 
 ## Plan

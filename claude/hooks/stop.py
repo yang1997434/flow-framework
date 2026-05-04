@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Stop hook — auto-save current task progress when session ends.
+"""Stop hook — Lv3 distill trigger (with cooldown).
 
-Triggered when Claude Code session ends or context is exhausted.
-Calls flow_save.py to write a journal entry for the active task.
+v0.4 change: raw session persistence is delegated to the context-mode plugin
+(Layer 1). flow's stop.py no longer writes a raw journal entry. Instead it
+queues an Lv3 semantic distill via scripts/flow_autosave.py — which itself
+does NOT call an LLM (hook timeout / cost risk). The orchestrator only writes
+a "distill queued" marker to the active task's progress.md `## Sediment Notes`
+section and appends a record to ~/.flow/.runtime/distill-queue.jsonl. A later
+SessionStart / explicit slash command can drive the actual LLM distillation.
 
 Best-effort: if anything fails, exit silently (don't block session close).
 """
@@ -17,7 +22,7 @@ from pathlib import Path
 
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parent.parent.parent
-FLOW_SAVE = REPO_ROOT / "scripts" / "flow_save.py"
+FLOW_AUTOSAVE = REPO_ROOT / "scripts" / "flow_autosave.py"
 
 
 def find_project_flow(start: Path) -> Path | None:
@@ -42,21 +47,28 @@ def main():
 
     pointer = flow / ".current-task"
     if not pointer.is_file():
+        # No active task -> nothing to distill at the semantic layer.
         sys.exit(0)
 
-    if not FLOW_SAVE.is_file():
+    if not FLOW_AUTOSAVE.is_file():
         sys.exit(0)
 
-    # Run flow_save in best-effort mode
+    # Queue an Lv3 distill (cooldown is enforced inside flow_autosave.py).
     try:
         subprocess.run(
-            [sys.executable, str(FLOW_SAVE), "--note", "auto-save (session stop)", "--no-commit"],
+            [
+                sys.executable,
+                str(FLOW_AUTOSAVE),
+                "distill",
+                "--trigger", "stop",
+                "--cwd", str(cwd),
+            ],
             cwd=flow.parent,
             capture_output=True,
             timeout=10,
         )
     except Exception:
-        pass  # silent
+        pass  # silent — Stop hook must never block
 
     sys.exit(0)
 

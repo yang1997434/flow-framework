@@ -14,13 +14,13 @@ Run the planning phase: brainstorm → (optional research) → prd.md complete �
 
 ## Step 1 — Brainstorm
 
-Invoke `superpowers:brainstorming` skill. Follow its protocol:
+Invoke `{{capability:brainstorm}}` skill. Follow its protocol:
 - One question at a time
 - Update prd.md immediately after each user answer
 - No meta questions ("should I search?")
 - Prefer offering 2-3 concrete options over open-ended questions
 
-For UI tasks: **also invoke `impeccable:shape`** to produce UX brief alongside requirements.
+For UI tasks: **also invoke `{{capability:ux_brief}}`** to produce UX brief alongside requirements.
 
 ## Step 2 — Auto-context (before asking)
 
@@ -45,7 +45,7 @@ Trigger conditions:
 For each topic:
   Agent(
     subagent_type: "general-purpose",
-    model: "sonnet",  # research is sonnet by default
+    model: "{{model:research}}",
     description: "Research <topic>",
     prompt: "Research <specific question>; persist findings to {TASK_DIR}/research/<topic-slug>.md. Return only 1-line summary + file path."
   )
@@ -83,7 +83,7 @@ When a design decision with non-trivial reversal cost is made:
 **Revisit triggers**: <conditions to re-open>
 ```
 
-For **high reversal cost** decisions: invoke `gstack:codex` (consult mode) for cross-model second opinion.
+For **high reversal cost** decisions: invoke `{{capability:cross_model_consult}}` (mode={{capability:cross_model_consult.args.mode}}) for cross-model second opinion.
 
 ## Step 6 — Final confirmation
 

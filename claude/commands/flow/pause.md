@@ -34,7 +34,7 @@ If currently in middle of an Execute or Verify step, note partial state:
 
 ## Step 3 — Auto-save
 
-Invoke `yangpeng-claude-skills:save` skill.
+Invoke `{{capability:session_save}}` skill.
 
 Also write a focused journal entry to `.flow/workspace/${USER}/journal.md`:
 ```markdown

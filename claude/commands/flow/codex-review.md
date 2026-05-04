@@ -4,7 +4,7 @@ description: "Trigger cross-model review with Codex (GPT-5.5) on current diff"
 
 # /flow:codex-review
 
-Manually trigger cross-model review via gstack `/codex review`.
+Manually trigger cross-model review via `{{capability:cross_model_review}}` (mode={{capability:cross_model_review.args.mode}}).
 
 ## When to use this manual trigger
 
@@ -32,7 +32,7 @@ If no changes: tell user "Nothing to review."
 
 ## Step 2 — Invoke gstack codex
 
-Use `gstack:codex` skill in **review mode**.
+Use `{{capability:cross_model_review}}` skill (mode={{capability:cross_model_review.args.mode}}).
 
 Pass to codex:
 - The full git diff (current uncommitted or current branch vs base)

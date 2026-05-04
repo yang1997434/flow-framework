@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "version": 1,
+  "_comment": "Built-in defaults for capability → concrete skill mapping AND model role → concrete model id. Override at: ~/.flow/config.yaml (user global) → <project>/.flow/config.yaml (project) → <project>/.flow/config.local.yaml (project local). install-time render substitutes {{capability:X}} and {{model:X}} placeholders in prompt files (claude/{commands,skills}/flow/*.md) using this resolution chain.",
+
+  "capabilities": {
+    "brainstorm": {
+      "default": "superpowers:brainstorming",
+      "description": "Phase 1 — explore approaches, refine requirements"
+    },
+    "ux_brief": {
+      "default": "impeccable:shape",
+      "description": "Phase 1 (UI) — design shaping / UX brief",
+      "skip_if_not_available": true
+    },
+    "cross_model_consult": {
+      "default": "gstack:codex",
+      "args": {"mode": "consult"},
+      "requires_cli": "codex",
+      "description": "Phase 1 — high-reversal-cost cross-model second opinion",
+      "skip_if_not_available": true
+    },
+    "tdd": {
+      "default": "superpowers:test-driven-development",
+      "description": "Phase 2 — write tests first; gate before implementation",
+      "skip_if_not_available": true
+    },
+    "worktree": {
+      "default": "superpowers:using-git-worktrees",
+      "description": "Phase 2 — isolated worktree per task or sub-agent"
+    },
+    "parallel_dispatch": {
+      "default": "superpowers:dispatching-parallel-agents",
+      "description": "Phase 2 — parallel sub-agent orchestration"
+    },
+    "ui_implement": {
+      "default": "impeccable:frontend-design",
+      "fallback": ["frontend-design:frontend-design"],
+      "description": "Phase 2 (UI) — frontend component construction"
+    },
+    "cross_model_challenge": {
+      "default": "gstack:codex",
+      "args": {"mode": "challenge"},
+      "requires_cli": "codex",
+      "description": "Phase 2 — adversarial cross-model attack when stuck",
+      "skip_if_not_available": true
+    },
+    "cross_model_review": {
+      "default": "gstack:codex",
+      "args": {"mode": "review"},
+      "requires_cli": "codex",
+      "description": "Phase 3 — cross-model diff review at task close"
+    },
+    "ui_audit": {
+      "default": "impeccable:audit",
+      "follow_with": "impeccable:polish",
+      "description": "Phase 3 (UI) — accessibility / consistency audit"
+    },
+    "ui_visual_review": {
+      "default": "gstack:design-review",
+      "requires_cli": "gstack",
+      "description": "Phase 3 (UI) — real-browser visual audit",
+      "skip_if_not_available": true
+    },
+    "session_save": {
+      "default": "yangpeng-claude-skills:save",
+      "description": "Phase 4 — session breakpoint capture",
+      "skip_if_not_available": true
+    },
+    "deploy_chain": {
+      "default": "gstack:ship,gstack:canary",
+      "description": "Phase 2/3 (deploy task) — ship → canary monitoring chain",
+      "skip_if_not_available": true
+    },
+    "behavioral_guidelines": {
+      "default": "andrej-karpathy-skills:karpathy-guidelines",
+      "description": "Phase 2 — surgical changes / define success criteria / surface assumptions / avoid over-engineering",
+      "skip_if_not_available": true
+    }
+  },
+
+  "model_roles": {
+    "triage": {
+      "default": "claude-haiku-4-5",
+      "description": "Cheap classification (task complexity, keyword detection)"
+    },
+    "research": {
+      "default": "claude-sonnet-4-6",
+      "description": "Sub-agent research / scanning / cross-file inspection"
+    },
+    "plan": {
+      "default": "claude-sonnet-4-6",
+      "description": "Plan writing + ADR drafting"
+    },
+    "implement": {
+      "default": "claude-opus-4-7",
+      "description": "Code generation / refactoring / debugging"
+    },
+    "review": {
+      "default": "claude-sonnet-4-6",
+      "description": "Self-review of diffs (when cross_model_review skipped)"
+    }
+  }
+}

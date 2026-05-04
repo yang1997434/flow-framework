@@ -20,3 +20,15 @@ Thumbs.db
 # Test artifacts
 tests/output/
 tests/temp/
+
+# Flow Framework — runtime + machine-local + per-user workspace
+.flow/.runtime/
+.flow/.current-task
+.flow/config.local.yaml
+.flow/workspace/*
+!.flow/workspace/.gitkeep
+.flow/**/*.tmp
+.flow/**/.backup-*
+
+# Claude Agent SDK local scratch (ephemeral worktrees, etc.)
+.claude/

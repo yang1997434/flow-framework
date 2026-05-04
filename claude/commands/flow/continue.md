@@ -33,7 +33,7 @@ Inspect progress.md sections:
 ## Step 3 — Run the appropriate Phase
 
 ### Phase 1 → continue brainstorm
-Invoke `superpowers:brainstorming` to keep filling prd.md.
+Invoke `{{capability:brainstorm}}` to keep filling prd.md.
 
 ### Phase 2 → implement
 Read prd.md `## Acceptance Criteria` and `## Technical Approach`.
@@ -46,19 +46,19 @@ Read prd.md `## Acceptance Criteria` and `## Technical Approach`.
 Before dispatching: write scope plan to progress.md `## Plan` section. **Sub-agent scopes MUST NOT overlap**.
 
 Use:
-- `superpowers:test-driven-development` (write tests first)
-- `superpowers:using-git-worktrees` (when worktree needed)
-- `superpowers:dispatching-parallel-agents` (when N≥2)
-- `impeccable:frontend-design` or `frontend-design:frontend-design` (UI tasks)
-- `Agent` tool with `model: opus` for implement, `subagent_type: general-purpose`, `isolation: worktree` when needed
+- `{{capability:tdd}}` (write tests first)
+- `{{capability:worktree}}` (when worktree needed)
+- `{{capability:parallel_dispatch}}` (when N≥2)
+- `{{capability:ui_implement}}` (UI tasks)
+- `Agent` tool with `model: {{model:implement}}` for implement, `subagent_type: general-purpose`, `isolation: worktree` when needed
 
 After each sub-agent finishes, append to `## Execute Log`.
 
-If stuck (same bug 3+ times): invoke `gstack:codex` (challenge mode).
+If stuck (same bug 3+ times): invoke `{{capability:cross_model_challenge}}` (mode={{capability:cross_model_challenge.args.mode}}).
 
 ### Phase 3 → verify + commit
 **Use fresh-context Generator/Evaluator pattern**:
-- Dispatch a fresh `Agent(subagent_type: "general-purpose", model: "sonnet")` 
+- Dispatch a fresh `Agent(subagent_type: "general-purpose", model: "{{model:review}}")` 
 - Pass: only `git diff` + `prd.md`
 - Task: check Acceptance Criteria, run lint/typecheck/tests, run credential grep
 - Sub-agent must NOT see main session history (avoids self-praise bias)
@@ -74,7 +74,7 @@ Draft commit message → confirm with user → commit.
 **This is a separate phase, do not skip even if "no new sediment"**:
 - Decide promotion: ADR / pattern / pitfall to which tier
 - Write `## Sediment Notes` section
-- Auto-save: invoke `yangpeng-claude-skills:save` and append journal entry
+- Auto-save: invoke `{{capability:session_save}}` and append journal entry
 - Suggest `/flow:finish` to archive
 
 ## Constraints

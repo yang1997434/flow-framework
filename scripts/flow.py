@@ -9,6 +9,10 @@ Usage:
   flow staleness         -- check stale memory references
   flow conflict          -- detect rule/ADR conflicts (heuristic)
   flow promote           -- promote knowledge between tiers
+  flow install <subcmd>  -- declarative install (check-system / register-marketplaces / install-plugins / install-hooks / all)
+  flow doctor            -- environment consistency diagnostic (static)
+  flow selftest [scope]  -- functional verification (dynamic; scope: hooks/init/task/plugins/doctor/all)
+  flow skill-diff <sub>  -- compare new plugins against capability registry (snapshot/diff/show/clear/reset-cache)
   flow version           -- show version
 """
 from __future__ import annotations
@@ -51,6 +55,10 @@ def main():
         "staleness": "flow_staleness.py",
         "conflict": "flow_conflict.py",
         "promote": "flow_promote.py",
+        "install": "flow_install.py",
+        "doctor": "flow_doctor.py",
+        "selftest": "flow_selftest.py",
+        "skill-diff": "flow_skill_diff.py",
     }
 
     if cmd in ("version", "--version", "-v"):

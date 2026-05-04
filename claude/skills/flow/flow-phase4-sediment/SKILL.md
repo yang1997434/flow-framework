@@ -34,6 +34,8 @@ Review task journey. Ask:
 
 ## Step 2 — Promotion candidates
 
+When promoting to vault (`~/data/knowledge-base/`), follow the frontmatter conventions in `~/.claude/rules/knowledge-base.md` (required fields: `title`, `date`, `type`, `tags`, `status`, optional `project`). Flow's templates already include these but vault writes from raw chat content must conform.
+
 For each new ADR/pattern/pitfall, also evaluate cross-project reuse:
 
 | Sign | Action |
@@ -85,7 +87,7 @@ Append to progress.md `## Sediment Notes`:
    - Next-suggested: ${USER_HINT or "none"}
    ```
 
-2. Invoke `yangpeng-claude-skills:save` skill — write breakpoint to `~/.claude/projects/.../memory/`
+2. Invoke `{{capability:session_save}}` skill — write breakpoint to `~/.claude/projects/.../memory/`
 
 3. (Optional) Update auto-memory MEMORY.md with pointer to new sediment if cross-project significance
 

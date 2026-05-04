@@ -17,11 +17,12 @@ Concrete how-to for installing and using Flow on a new machine.
 
 ### Prerequisites
 
-- Python 3.9+
+- Python 3.11+ (uses `tomllib`, modern type syntax)
 - git
 - bash
+- Claude Code CLI (`claude`) — required for plugin install
 - (optional) `gh` CLI for GitHub-related ops
-- (optional) Claude Code installed at `~/.claude/`
+- (optional) `codex` CLI for cross-model review
 
 ### Steps
 
@@ -44,15 +45,30 @@ $EDITOR ~/.flow/credentials.local
 
 ### What install.sh does
 
-- Symlinks `claude/commands/flow` → `~/.claude/commands/flow` (8 slash commands)
-- Symlinks `claude/skills/flow` → `~/.claude/skills/flow` (orchestrator + 4 phase skills)
-- Creates `~/.flow/` (chmod 700) and stub `credentials.local` (chmod 600)
-- Creates `~/.local/bin/flow` CLI dispatcher
+Driven by `dependencies.json` — declarative manifest of marketplaces, plugins, and system commands.
+
+1. **System command checks** — fail-loud if `git` / `python3` / `bash` / `claude` missing; warn for optional `gh` / `codex` / `jq`
+2. **Marketplace registration** — `claude plugin marketplace add <repo>` for each declared marketplace (idempotent)
+3. **Plugin install** — `claude plugin install <plugin>@<marketplace>` for required + optional plugins
+4. **Hook install** — merges `claude/hooks/settings.template.json` (with `{{REPO_ROOT}}` substituted) into `~/.claude/settings.json`; backs up existing settings; each flow hook in its own matcher entry (Issue #415 mitigation)
+5. **Symlinks** — `claude/commands/flow` and `claude/skills/flow` → `~/.claude/`
+6. **CLI shim** — `~/.local/bin/flow`
 
 ### What install.sh does NOT do
 
-- **Does not modify `~/.claude/settings.json`** — hooks are opt-in (see [Section 4](#4-hook-installation-optional))
 - **Does not write any credentials** — you fill them in manually
+- **Does not delete user's existing hooks** — only appends flow's entries; user's hooks are preserved
+
+Use `./install.sh --dry-run` to preview without executing.
+Use `./install.sh --skip-plugins` / `--skip-hooks` to skip those phases (debugging).
+
+### Verify install
+
+```bash
+flow doctor
+```
+
+Outputs a capability matrix: ✅/❌ for each system command + plugin + hook isolation check.
 
 ### Uninstall
 
@@ -201,37 +217,30 @@ Use when phase 3 didn't auto-trigger but you want a cross-model second opinion.
 
 ---
 
-## 4. Hook installation (optional)
+## 4. Hook installation
 
-Hooks add automation:
+Hooks are auto-installed by `install.sh` (since v0.4). Each lives in its own matcher entry:
 
-| Hook | Adds |
-|------|------|
-| `session-start.py` | Quick Read Guide + active task auto-loaded each session |
-| `user-prompt-submit.py` | Detect "走 Flow" / "flow:" keywords without explicit slash command |
-| `post-tool-bash.py` | Credential grep self-check after `git commit` |
-| `stop.py` | Auto-save current task progress on session end |
+| Hook | Trigger | Adds |
+|------|---------|------|
+| `session-start.py` | startup / clear / compact | Quick Read Guide + active task auto-loaded |
+| `user-prompt-submit.py` | each user message | Detect "走 Flow" / "flow:" keywords |
+| `pre-tool-task.py` | before `Task` / `Agent` tool | Inject jsonl-declared spec context into sub-agent |
+| `post-tool-bash.py` | after `Bash` (git commit) | Credential grep self-check |
+| `stop.py` | session end | Auto-save current task progress |
 
-### Install
+### Re-install / repair
 
-1. Open `~/.claude/settings.json`
-2. **If you don't have a `hooks` section**: append the contents of `claude/hooks/settings.json.snippet`
-3. **If you have hooks already**: merge carefully — preserve existing handlers
-
-Example merge for SessionStart:
-
-```json
-"SessionStart": [
-  { "matcher": "startup", "hooks": [
-    { "type": "command", "command": "your-existing-hook.sh" },
-    { "type": "command", "command": "python3 ~/projects/flow-framework/claude/hooks/session-start.py", "timeout": 10 }
-  ]}
-]
+```bash
+./install.sh --skip-plugins   # only re-merges hooks
+flow doctor                   # verify isolation
 ```
+
+`flow doctor` checks **Issue #415 mitigation**: each flow hook must live in its own matcher entry, never sharing a matcher group with non-flow commands. If `flow doctor` reports a violation, manually edit `~/.claude/settings.json` to extract the flow command into its own entry.
 
 ### Disable
 
-Remove the relevant entries from `settings.json`. Or use `~/.claude/settings.local.json` to override.
+Remove the relevant entries from `~/.claude/settings.json`. Or use `~/.claude/settings.local.json` to override.
 
 ---
 
