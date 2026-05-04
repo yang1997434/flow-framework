@@ -28,7 +28,7 @@ If duplicate found: ask user — update existing or create new?
 
 ## Step 3 — Fill template
 
-Use `~/projects/flow-framework/templates/pitfall.md.template`. Substitute:
+Use `{{REPO_ROOT}}/templates/pitfall.md.template`. Substitute:
 - `{{SLUG}}` = user-provided or auto-derived
 - `{{DATE}}` = today
 - `{{PROJECT_OR_CROSS}}` = current project name or "cross"

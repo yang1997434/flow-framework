@@ -260,7 +260,7 @@ def check_plugins_actually_listed() -> None:
 # --- 5. rendered prompt files have no leftover placeholders ----------------
 
 def check_rendered_prompts() -> None:
-    section("Rendered prompts (no leftover {{capability:X}} / {{model:Y}})")
+    section("Rendered prompts (no leftover {{capability:X}} / {{model:Y}} / {{REPO_ROOT}} or stale ~/projects/flow-framework)")
     user_claude = Path.home() / ".claude"
     targets = [user_claude / "commands" / "flow", user_claude / "skills" / "flow"]
 
@@ -278,7 +278,11 @@ def check_rendered_prompts() -> None:
             found_any = True
             text = f.read_text(encoding="utf-8", errors="ignore")
             if "{{capability:" in text or "{{model:" in text:
-                fail(str(f.relative_to(Path.home())), "leftover placeholder")
+                fail(str(f.relative_to(Path.home())), "leftover capability/model placeholder")
+            elif "{{REPO_ROOT}}" in text:
+                fail(str(f.relative_to(Path.home())), "leftover {{REPO_ROOT}} placeholder — render didn't substitute")
+            elif "projects/flow-framework" in text:
+                fail(str(f.relative_to(Path.home())), "stale ~/projects/flow-framework path — source file should use {{REPO_ROOT}}")
             else:
                 ok(str(f.relative_to(Path.home())))
     if not found_any:

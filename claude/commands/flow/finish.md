@@ -54,7 +54,7 @@ Also append to `.flow/workspace/${USER}/journal.md`:
 - Next: <user-suggested or "none">
 ```
 
-If `~/projects/flow-framework/scripts/flow_save.py` available, run it for automation.
+If `{{REPO_ROOT}}/scripts/flow_save.py` available, run it for automation.
 
 ## Step 5 — Archive
 

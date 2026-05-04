@@ -91,9 +91,9 @@ Append to progress.md `## Sediment Notes`:
 
 3. (Optional) Update auto-memory MEMORY.md with pointer to new sediment if cross-project significance
 
-If `~/projects/flow-framework/scripts/flow_save.py` exists, run it for automation:
+If `{{REPO_ROOT}}/scripts/flow_save.py` exists, run it for automation:
 ```bash
-python3 ~/projects/flow-framework/scripts/flow_save.py --task "${CURRENT}"
+python3 {{REPO_ROOT}}/scripts/flow_save.py --task "${CURRENT}"
 ```
 
 ## Step 6 — Archive

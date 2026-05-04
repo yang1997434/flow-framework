@@ -41,18 +41,18 @@ sed -e "s/{{TASK_TITLE}}/${TASK_TITLE}/g" \
     -e "s/{{SLUG}}/${SLUG}/g" \
     -e "s/{{TASK_TYPE}}/${TASK_TYPE}/g" \
     -e "s/{{COMPLEXITY}}/${COMPLEXITY}/g" \
-    ~/projects/flow-framework/templates/prd.md.template > "${TASK_DIR}/prd.md"
+    {{REPO_ROOT}}/templates/prd.md.template > "${TASK_DIR}/prd.md"
 
 sed -e "s/{{SLUG}}/${SLUG}/g" \
-    ~/projects/flow-framework/templates/progress.md.template > "${TASK_DIR}/progress.md"
+    {{REPO_ROOT}}/templates/progress.md.template > "${TASK_DIR}/progress.md"
 
 # Mark as active
 echo "${TASK_DIR}" > .flow/.current-task
 ```
 
-If `~/projects/flow-framework/scripts/flow_task.py` is available, prefer:
+If `{{REPO_ROOT}}/scripts/flow_task.py` is available, prefer:
 ```bash
-python3 ~/projects/flow-framework/scripts/flow_task.py create "${TASK_TITLE}" --slug "${SLUG}" --type "${TASK_TYPE}" --complexity "${COMPLEXITY}"
+python3 {{REPO_ROOT}}/scripts/flow_task.py create "${TASK_TITLE}" --slug "${SLUG}" --type "${TASK_TYPE}" --complexity "${COMPLEXITY}"
 ```
 
 ## Step 4 — Run Phase 1 (Plan)
