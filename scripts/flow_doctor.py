@@ -211,24 +211,50 @@ def check_user_local_overrides(deps: dict) -> None:
         line("·", DIM, ".flow/config.local.yaml", "(none — using built-in defaults)")
 
 
+def _context_mode_plugin_enabled() -> bool:
+    """Read ~/.claude/settings.json safely and return True iff
+    enabledPlugins["context-mode@context-mode"] is truthy.
+
+    context-mode ships as a Claude Code plugin (no `context-mode` CLI on PATH,
+    no `~/.context-mode/content/` directory until first hook fire), so we
+    treat the settings.json entry as the authoritative "installed" signal.
+    """
+    settings = Path.home() / ".claude" / "settings.json"
+    if not settings.is_file():
+        return False
+    try:
+        data = json.loads(settings.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    plugins = data.get("enabledPlugins") if isinstance(data, dict) else None
+    if not isinstance(plugins, dict):
+        return False
+    return bool(plugins.get("context-mode@context-mode"))
+
+
 def check_context_mode_running() -> None:
     """Non-blocking heuristic: is context-mode (Layer 1 raw persistence) live?
 
-    Two signals (either is "good enough" — context-mode self-installs its
-    own state on first run):
-      1. The `context-mode` CLI is on PATH.
-      2. `~/.context-mode/content/` directory exists (content store created).
+    Three signals (any one is "good enough" — context-mode self-installs its
+    own state on first hook fire):
+      1. enabledPlugins["context-mode@context-mode"] in ~/.claude/settings.json
+         (authoritative — context-mode is a Claude Code plugin).
+      2. The `context-mode` CLI is on PATH.
+      3. `~/.context-mode/content/` directory exists (content store created).
 
     This is a non-blocking warning, not a fail. If Layer 1 is missing, flow's
     Layer 2 still works (we just won't have raw transcripts to feed a future
     LLM distill).
     """
     section("Context-mode (Layer 1 raw persistence)")
+    plugin_enabled = _context_mode_plugin_enabled()
     cli_present = shutil.which("context-mode") is not None
     content_dir = Path.home() / ".context-mode" / "content"
     content_present = content_dir.is_dir()
 
-    if cli_present and content_present:
+    if plugin_enabled:
+        ok("context-mode", "Claude Code plugin installed (enabledPlugins)")
+    elif cli_present and content_present:
         ok("context-mode", "CLI on PATH + content store present")
     elif cli_present:
         warn("context-mode", "CLI present but ~/.context-mode/content/ not yet created")
