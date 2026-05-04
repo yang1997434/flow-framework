@@ -221,3 +221,5 @@ _Updated 2026-05-04 11:02 (last 20 unique edits)_:
 - [2026-05-04 10:57] `8c0b2f2` fix(v0.5.1): add selftest fixtures for new v0.5 hooks
 
 - [2026-05-04 10:57] `62cb629` chore: bump VERSION 0.5.0 → 0.5.1 + CHANGELOG
+
+- [2026-05-04 11:03] `f485348` flow: finalize ctxmode-and-autosave Verify Report + v0.5 postscript

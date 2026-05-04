@@ -29,7 +29,7 @@ tests/temp/
 !.flow/workspace/.gitkeep
 .flow/**/*.tmp
 .flow/**/.backup-*
-.flow/tasks/*/.checkpoint/
+.flow/tasks/**/.checkpoint/
 
 # Claude Agent SDK local scratch (ephemeral worktrees, etc.)
 .claude/
