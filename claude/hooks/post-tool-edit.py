@@ -31,6 +31,14 @@ SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parent.parent.parent
 FLOW_AUTOSAVE = REPO_ROOT / "scripts" / "flow_autosave.py"
 
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+from common.context_estimator import estimate_context_pct
+from common.nudge import maybe_nudge_text, derive_window_id
+from common.checkpoint_paths import mechanical_path, history_path
+from common.mechanical import build_payload
+from common.safe_io import atomic_write_json, append_jsonl_locked
+from typing import Optional
+
 FLUSH_AFTER_SECONDS = 60
 FLUSH_AFTER_COUNT = 10
 LAST_N_FILES_IN_PROGRESS = 20  # how many recent unique files to surface
@@ -224,6 +232,54 @@ def bump_heartbeat(cwd: Path) -> None:
         pass
 
 
+def _maybe_nudge_and_update_mechanical(
+    project_root: Path,
+    task_dir: Path,
+    transcript_path: str,
+) -> Optional[str]:
+    """v0.5 PostToolUse extension. See post-tool-bash.py for prose."""
+    try:
+        pct, conf = estimate_context_pct(transcript_path)
+        if pct is None:
+            return None
+
+        window_id = derive_window_id(task_dir.name)
+        nudge_text = maybe_nudge_text(
+            task_slug=task_dir.name, pct=pct, confidence=conf,
+            window_id=window_id, min_seconds_between=60,
+        )
+
+        mech = mechanical_path(task_dir)
+        now_epoch = time.time()
+        write_mech = True
+        if mech.is_file():
+            try:
+                if now_epoch - mech.stat().st_mtime < 60:
+                    write_mech = False
+            except OSError:
+                pass
+        if write_mech:
+            payload = build_payload(
+                project_root=project_root, task_dir=task_dir,
+                trigger="post-tool", transcript_path=transcript_path,
+            )
+            atomic_write_json(mech, payload)
+
+        if nudge_text:
+            append_jsonl_locked(history_path(task_dir), {
+                "schema_version": 1,
+                "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "event": "nudge_emitted",
+                "ctx_pct": pct,
+                "estimator_confidence": conf,
+                "window_id": window_id,
+            })
+            return nudge_text
+        return None
+    except Exception:
+        return None
+
+
 def main():
     try:
         hook_input = json.loads(sys.stdin.read() or "{}")
@@ -235,6 +291,18 @@ def main():
     cwd = Path(hook_input.get("cwd", os.getcwd())).resolve()
 
     bump_heartbeat(cwd)
+
+    transcript_path = hook_input.get("transcript_path")
+    nudge_text: Optional[str] = None
+    project_root_v05 = find_project_root(cwd)
+    if project_root_v05 is not None:
+        task_dir_v05 = find_active_task(project_root_v05)
+        if task_dir_v05 is not None and transcript_path:
+            nudge_text = _maybe_nudge_and_update_mechanical(
+                project_root=project_root_v05,
+                task_dir=task_dir_v05,
+                transcript_path=transcript_path,
+            )
 
     file_path = extract_file_path(tool_name, tool_input)
     if not file_path:
@@ -269,6 +337,15 @@ def main():
         state["unflushed_count"] = 0
 
     write_flush_state(state_path, state)
+
+    if nudge_text:
+        output = {
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": nudge_text,
+            }
+        }
+        print(json.dumps(output, ensure_ascii=False), flush=True)
     sys.exit(0)
 
 
