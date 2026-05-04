@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.5.5 (2026-05-04)
+
+Patch release — fix #7: `dependencies.json` referenced a nonexistent
+`andrejkarpathy/karpathy-skills` GitHub repo. Discovered by v0.5.4's
+cleaner SSH→HTTPS error path, which removed the SSH failure that had
+been masking the underlying 404.
+
+### Fixed
+
+- **#7 nonexistent karpathy-skills repo** — changed marketplace source
+  from `andrejkarpathy/karpathy-skills` (404) to `forrestchang/andrej-karpathy-skills`
+  (the actual fork). Local marketplace identifier `karpathy-skills` is
+  unchanged so existing installs aren't disturbed.
+
 ## v0.5.4 (2026-05-04)
 
 Patch release — single-fix for the SSH-only marketplace clone failure

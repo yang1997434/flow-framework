@@ -22,7 +22,7 @@
     {"name": "context-mode",            "source": "mksglu/context-mode",                "purpose": "Session persistence + tool output sandboxing (P0 dep for flow v0.4)"},
     {"name": "impeccable",              "source": "pbakaus/impeccable",                 "purpose": "UI design skills (frontend-design, audit, polish)"},
     {"name": "planning-with-files",     "source": "OthmanAdi/planning-with-files",      "purpose": "Manus-style file-based planning (runtime files protocol)"},
-    {"name": "karpathy-skills",         "source": "andrejkarpathy/karpathy-skills",     "purpose": "Behavioral guidelines (surgical changes, define success criteria, etc.)"}
+    {"name": "karpathy-skills",         "source": "forrestchang/andrej-karpathy-skills", "purpose": "Behavioral guidelines (surgical changes, define success criteria, etc.)"}
   ],
 
   "plugins": {
