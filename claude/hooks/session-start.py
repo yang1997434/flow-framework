@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -17,6 +18,11 @@ from pathlib import Path
 SCRIPT_PATH = Path(__file__).resolve()
 # If installed as symlink, resolve original location
 REPO_ROOT = SCRIPT_PATH.parent.parent.parent  # claude/hooks/<this> → flow-framework/
+
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+from common.checkpoint_paths import intent_path, mechanical_path, history_path
+from common.safe_io import append_jsonl_locked
+from common.nudge import rotate_window
 
 
 def find_project_flow(start: Path) -> Path | None:
@@ -103,6 +109,77 @@ Don't read full design doc unless user asks "explain the framework".
 Available slash commands: /flow:start /flow:continue /flow:resume /flow:finish /flow:pitfall /flow:promote /flow:codex-review /flow:pause"""
 
 
+def build_compact_resume_block(task_dir: Path) -> str | None:
+    """If .checkpoint/ exists, build the <flow-resumed-from-compact> block.
+    Returns None if no checkpoint files present (fall back to startup behavior)."""
+    intent = intent_path(task_dir)
+    mech = mechanical_path(task_dir)
+    if not intent.is_file() and not mech.is_file():
+        return None
+
+    parts = ["<flow-resumed-from-compact>"]
+
+    if intent.is_file():
+        text = intent.read_text(encoding="utf-8", errors="replace")
+        # Truncate body to ~1500 tokens (roughly 6000 chars) if huge
+        if len(text) > 6000:
+            text = text[:6000] + "\n\n[... truncated, see full file at " + str(intent) + "]"
+        parts.append("## Last Intent")
+        parts.append(text.rstrip())
+
+    intent_ts = None
+    mech_ts = None
+    if mech.is_file():
+        try:
+            data = json.loads(mech.read_text(encoding="utf-8"))
+            mech_ts = data.get("ts")
+            git_info = data.get("git", {})
+            files = data.get("files_touched_recent", [])
+            parts.append("\n## Latest Mechanical State")
+            parts.append(f"- Snapshot ts: {mech_ts}")
+            parts.append(f"- Branch: {git_info.get('branch', '?')} @ {git_info.get('head', '?')}")
+            commits = git_info.get("recent_commits", [])
+            if commits:
+                parts.append("- Recent commits:")
+                for c in commits[:5]:
+                    parts.append(f"  - {c.get('hash', '?')} {c.get('subject', '')}")
+            if files:
+                parts.append(f"- Files touched recent: {', '.join(files[:10])}")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    if intent.is_file():
+        try:
+            head = intent.read_text(encoding="utf-8", errors="replace").splitlines()
+            for line in head[:20]:
+                if line.startswith("ts:"):
+                    intent_ts = line.split(":", 1)[1].strip()
+                    break
+        except OSError:
+            pass
+
+    parts.append("\n## Resume Mode")
+    parts.append("MANUAL — present the briefing above to the user, then await their direction.")
+    parts.append("Do NOT auto-execute next actions.")
+
+    if intent_ts and mech_ts:
+        try:
+            ti = datetime.fromisoformat(intent_ts)
+            tm = datetime.fromisoformat(mech_ts)
+            if tm - ti > timedelta(minutes=5):
+                delta_min = round((tm - ti).total_seconds() / 60)
+                parts.append("\n## Staleness")
+                parts.append(
+                    f"⚠️ Mechanical state is {delta_min} minutes newer than intent. "
+                    f"Review commits + file edits before assuming intent is still fresh."
+                )
+        except ValueError:
+            pass
+
+    parts.append("</flow-resumed-from-compact>")
+    return "\n".join(parts)
+
+
 def main():
     try:
         hook_input = json.loads(sys.stdin.read() or "{}")
@@ -145,6 +222,27 @@ def main():
         parts.append("\n## Skill Compatibility Diff (pending)")
         parts.append(skill_diff.rstrip())
         parts.append("\nIf no action needed, dismiss with: `flow skill-diff clear`")
+
+    # v0.5: SessionStart(compact) → re-inject latest checkpoint state
+    matcher = hook_input.get("trigger") or hook_input.get("hook_event_matcher") or ""
+    if matcher == "compact" and flow:
+        active = load_active_task(flow)
+        if active and not active.get("stale"):
+            task_dir = Path(active["path"])
+            block = build_compact_resume_block(task_dir)
+            if block:
+                parts.append("\n" + block)
+                # Append history event + roll over nudge window
+                try:
+                    append_jsonl_locked(history_path(task_dir), {
+                        "schema_version": 1,
+                        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+                        "event": "resumed_from_compact",
+                        "mode": "manual",
+                    })
+                    rotate_window(task_dir.name)
+                except Exception:
+                    pass
 
     parts.append("</flow-context>")
 
