@@ -318,19 +318,35 @@ def cmd_current(args):
 
 
 def cmd_finish(args):
+    """Mark the active task as finished WITHOUT clearing .current-task.
+
+    Rationale (Issue #3): the natural sequence is `finish` → `archive`,
+    but archive needs to read .current-task to find the task to move.
+    Pre-v0.5.3 finish unlinked the pointer, breaking that sequence.
+    archive (or `/flow:finish`) is now responsible for clearing the
+    pointer after a successful mv.
+    """
     flow = get_flow_dir()
     pointer = flow / ".current-task"
     if not pointer.is_file():
         print("(no active task)", file=sys.stderr)
         sys.exit(1)
-    pointer.unlink()
-    print("Cleared current-task pointer.")
+    print("Marked task as finished. Run `flow task archive <slug>` next.")
 
 
 def cmd_archive(args):
     flow = get_flow_dir()
     project_root = flow.parent
-    candidates = list((flow / "tasks").glob(f"*-{args.slug}"))
+    # Issue #3: strip MM-DD- prefix so both forms work — `flow task list`
+    # prints the full dir name (e.g. "05-04-foo"), so `archive 05-04-foo`
+    # is the natural copy-paste. The original glob `*-{slug}` only matched
+    # bare slugs (`archive foo`) because the MM-DD prefix re-anchored the
+    # match (`*-05-04-foo` → `*-foo` only via fluke).
+    slug = args.slug
+    m = re.match(r"^\d{2}-\d{2}-(.+)$", slug)
+    if m:
+        slug = m.group(1)
+    candidates = list((flow / "tasks").glob(f"*-{slug}"))
     candidates = [c for c in candidates if c.is_dir() and "archive" not in c.parts]
     if not candidates:
         print(f"ERROR: no active task matching '{args.slug}'", file=sys.stderr)
