@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.5.0 (2026-05-04)
+
+Foundation for **auto-resume on context pressure**. Manual flow hardening
++ infra for v0.6.0 autopilot. Spec at `docs/specs/2026-05-04-auto-resume-design.md`.
+
+### Highlights
+
+- **PreCompact hook** — writes mechanical snapshot before Claude Code auto-compacts.
+- **Per-task `.checkpoint/`** — `intent.md` + `mechanical.json` + `history.jsonl`
+  capture in-flight state. `.gitignored` by default.
+- **Atomic writes + fcntl.flock** — all v0.5+ state files go through `safe_io.py`.
+  Concurrent appends to `history.jsonl` proven race-free under 8 threads.
+- **Append-only hint outbox** — replaces single-file cascade hint that codex
+  pre-merge review flagged as lossy.
+- **Context-pressure nudge** — PostToolUse hook estimates context % from
+  `transcript_path`, suggests `/flow:pause` once per compact cycle when ≥50%.
+  Best-effort: model relays text, user sees in conversation.
+- **Enhanced `/flow:pause`** — writes intent.md snapshot + cascade hint.
+- **Enhanced `/flow:resume`** — reads checkpoint, surfaces Next Action,
+  warns on staleness.
+- **SessionStart on `compact`** — restores intent + mechanical context after
+  auto-compact, model awaits user signal (no auto-execute).
+
+### Added
+
+- `scripts/common/safe_io.py` — atomic_write_text / atomic_write_json /
+  append_jsonl_locked
+- `scripts/common/hint_outbox.py` — write_hint / list_pending / mark_processed
+- `scripts/common/context_estimator.py` — estimate_context_pct
+- `scripts/common/checkpoint_paths.py` — per-task path helpers
+- `scripts/common/mechanical.py` — build_payload (mechanical.json schema)
+- `scripts/common/nudge.py` — maybe_nudge_text / acknowledge / rotate_window
+- `claude/hooks/pre-compact.py` — PreCompact hook
+- `tests/smoke/test_v05_*.py` — 8 new test modules including
+  `test_v05_postool_integration.py` (subprocess-driven hook integration).
+  Suite total: 73 → 133 cases.
+
+### Changed
+
+- `claude/hooks/post-tool-bash.py` — adds nudge + throttled mechanical update
+- `claude/hooks/post-tool-edit.py` — adds nudge + throttled mechanical update
+- `claude/hooks/session-start.py` — compact-matcher branch reads checkpoint
+- `claude/commands/flow/pause.md` — Steps 6-8 (intent.md + hint + ack)
+- `claude/commands/flow/resume.md` — Step 0 (personal /resume hint) + 1.5
+- `scripts/flow_install.py` — `pre-compact.py` added to FLOW_OWNED_MARKERS
+- `scripts/flow_init.py` — propagates `.checkpoint/` to project `.gitignore`
+- `claude/hooks/settings.template.json` — PreCompact entry
+
+### Not yet shipped (deferred to v0.6.0)
+
+- `/flow:start --autopilot` and autopilot state machine
+- R5 sanity check via external evidence (downgrade-only)
+- Hard budgets (tool calls / files / time)
+- Destructive-command denylist
+- Explicit `done_when` checklist replacing completion-promise
+
+These are designed in the spec but require dogfooding v0.5.0 first.
+
 ## v0.4.0 (2026-05-04)
 
 Major v0.4 release. Addresses 9 sub-projects identified in the v0.3.1 audit
