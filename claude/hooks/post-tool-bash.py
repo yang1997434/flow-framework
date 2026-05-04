@@ -27,11 +27,19 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 
 SCRIPT_PATH = Path(__file__).resolve()
 REPO_ROOT = SCRIPT_PATH.parent.parent.parent
 FLOW_AUTOSAVE = REPO_ROOT / "scripts" / "flow_autosave.py"
+
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+from common.context_estimator import estimate_context_pct
+from common.nudge import maybe_nudge_text, derive_window_id
+from common.checkpoint_paths import mechanical_path, history_path
+from common.mechanical import build_payload
+from common.safe_io import atomic_write_json, append_jsonl_locked
 
 CREDENTIAL_PATTERN = (
     r"(?i)(password|secret|api[_-]?key|token|bearer).*[:=]\s*['\"][^'\"]{4,}['\"]"
@@ -256,6 +264,66 @@ def credential_grep(project_root: Path) -> str | None:
     return matches or None
 
 
+def _maybe_nudge_and_update_mechanical(
+    project_root: Path,
+    task_dir: Path,
+    transcript_path: str,
+) -> Optional[str]:
+    """v0.5 PostToolUse extension: emit nudge if ctx >= threshold AND not
+    acknowledged this window; throttle mechanical.json writes to once per 60s.
+
+    Returns the nudge text (to be merged into a single hookSpecificOutput
+    by the caller) or None.
+    """
+    try:
+        pct, conf = estimate_context_pct(transcript_path)
+        if pct is None:
+            return None
+
+        window_id = derive_window_id(task_dir.name)
+        nudge_text = maybe_nudge_text(
+            task_slug=task_dir.name,
+            pct=pct,
+            confidence=conf,
+            window_id=window_id,
+            min_seconds_between=60,
+        )
+
+        # Throttled mechanical update — only if last write > 60s ago
+        mech = mechanical_path(task_dir)
+        now_epoch = time.time()
+        write_mech = True
+        if mech.is_file():
+            try:
+                if now_epoch - mech.stat().st_mtime < 60:
+                    write_mech = False
+            except OSError:
+                pass
+        if write_mech:
+            payload = build_payload(
+                project_root=project_root,
+                task_dir=task_dir,
+                trigger="post-tool",
+                transcript_path=transcript_path,
+            )
+            atomic_write_json(mech, payload)
+
+        if nudge_text:
+            append_jsonl_locked(history_path(task_dir), {
+                "schema_version": 1,
+                "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "event": "nudge_emitted",
+                "ctx_pct": pct,
+                "estimator_confidence": conf,
+                "window_id": window_id,
+            })
+            return nudge_text
+        return None
+    except Exception:
+        # Fail-closed; never break the hook chain.
+        return None
+
+
 def main():
     try:
         hook_input = json.loads(sys.stdin.read() or "{}")
@@ -269,12 +337,38 @@ def main():
     # Heartbeat bump on every Bash invocation (cheap; bounded).
     bump_heartbeat(cwd)
 
+    # v0.5: context-pressure nudge + throttled mechanical update.
+    transcript_path = hook_input.get("transcript_path")
+    nudge_text: Optional[str] = None
+    project_root = find_project_root(cwd)
+    if project_root is not None:
+        task_dir = find_active_task(project_root)
+        if task_dir is not None and transcript_path:
+            nudge_text = _maybe_nudge_and_update_mechanical(
+                project_root=project_root,
+                task_dir=task_dir,
+                transcript_path=transcript_path,
+            )
+
     # Only the rest of the work is for git-commit events.
     if not is_git_commit_command(command):
+        if nudge_text:
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": nudge_text,
+                }
+            }, ensure_ascii=False), flush=True)
         sys.exit(0)
 
-    project_root = find_project_root(cwd)
     if project_root is None:
+        if nudge_text:
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": nudge_text,
+                }
+            }, ensure_ascii=False), flush=True)
         sys.exit(0)
 
     # Lv1 trickle — append commit to progress.md (best-effort, never blocks).
@@ -289,23 +383,27 @@ def main():
 
     # Credential grep (existing behavior).
     matches = credential_grep(project_root)
-    if not matches:
+    if not matches and not nudge_text:
         sys.exit(0)
 
-    warning = (
-        "<flow-credential-warning>\n"
-        "POSSIBLE credential leak detected after git commit. Review:\n"
-        f"{matches}\n\n"
-        "If real credentials: rotate immediately, remove from history (git filter-repo), "
-        "and move to ~/.flow/credentials.local. If false positive (e.g., template / docs example), "
-        "rename the matched key to avoid future false alarms.\n"
-        "</flow-credential-warning>"
-    )
+    parts = []
+    if nudge_text:
+        parts.append(nudge_text)
+    if matches:
+        parts.append(
+            "<flow-credential-warning>\n"
+            "POSSIBLE credential leak detected after git commit. Review:\n"
+            f"{matches}\n\n"
+            "If real credentials: rotate immediately, remove from history (git filter-repo), "
+            "and move to ~/.flow/credentials.local. If false positive (e.g., template / docs example), "
+            "rename the matched key to avoid future false alarms.\n"
+            "</flow-credential-warning>"
+        )
 
     output = {
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": warning,
+            "additionalContext": "\n\n".join(parts),
         }
     }
     print(json.dumps(output, ensure_ascii=False), flush=True)
