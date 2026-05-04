@@ -20,6 +20,7 @@ HOOK_PATH = REPO_ROOT / "claude" / "hooks" / "session-start.py"
 class E2EPauseCompactResume(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="flow-e2e-")).resolve()
+        self.runtime = Path(tempfile.mkdtemp(prefix="flow-rt-")).resolve()
         # init project
         if shutil.which("git"):
             subprocess.run(["git", "init", "-q", "-b", "main", str(self.tmp)], check=True)
@@ -35,6 +36,14 @@ class E2EPauseCompactResume(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
+        shutil.rmtree(self.runtime, ignore_errors=True)
+
+    def _isolated_env(self) -> dict:
+        """Pin FLOW_HOME so hook reads/writes hint outbox + nudge state in
+        tempdir, not the user's real ~/.flow."""
+        env = os.environ.copy()
+        env["FLOW_HOME"] = str(self.runtime)
+        return env
 
     def test_pause_writes_then_sessionstart_compact_reads(self):
         # Simulate /flow:pause Step 6: write intent.md
@@ -55,32 +64,35 @@ class E2EPauseCompactResume(unittest.TestCase):
         )
         atomic_write_text(intent_path(self.task), intent_body)
 
-        # Simulate /flow:pause Step 7: write hint (using FLOW_HOME isolation)
-        with tempfile.TemporaryDirectory() as flow_home:
-            os.environ["FLOW_HOME"] = flow_home
-            try:
-                from common.hint_outbox import write_hint, list_pending
-                # Re-import after FLOW_HOME set
-                for m in [m for m in list(sys.modules) if "hint_outbox" in m or "nudge" in m]:
-                    del sys.modules[m]
-                from common.hint_outbox import write_hint, list_pending
-                write_hint({
-                    "task_slug": "01-01-e2e",
-                    "task_path": str(self.task),
-                    "phase": "phase-2-execute",
-                    "last_action": "wrote intent.md",
-                    "next_action": "verify SessionStart sees it",
-                    "pause_trigger": "manual",
-                })
-                self.assertEqual(len(list_pending()), 1)
-            finally:
-                os.environ.pop("FLOW_HOME", None)
+        # Simulate /flow:pause Step 7: write hint (using FLOW_HOME isolation).
+        # Use the same self.runtime as the subprocess below so the hint
+        # persists from the in-process write to the hook's read.
+        os.environ["FLOW_HOME"] = str(self.runtime)
+        try:
+            # Force re-import so module-level FLOW_HOME pickup uses our value
+            for m in [m for m in list(sys.modules) if "hint_outbox" in m or "nudge" in m]:
+                del sys.modules[m]
+            from common.hint_outbox import write_hint, list_pending
+            write_hint({
+                "task_slug": "01-01-e2e",
+                "task_path": str(self.task),
+                "phase": "phase-2-execute",
+                "last_action": "wrote intent.md",
+                "next_action": "verify SessionStart sees it",
+                "pause_trigger": "manual",
+            })
+            self.assertEqual(len(list_pending()), 1)
+        finally:
+            os.environ.pop("FLOW_HOME", None)
 
-        # Now simulate SessionStart with compact matcher
+        # Now simulate SessionStart with compact matcher.
+        # FLOW_HOME pinned to self.runtime so the hook reads the hint we
+        # just wrote AND any nudge-state writes stay in tempdir (not real ~/.flow).
         result = subprocess.run(
             ["python3", str(HOOK_PATH)],
             input=json.dumps({"cwd": str(self.tmp), "trigger": "compact"}),
             capture_output=True, text=True, timeout=10,
+            env=self._isolated_env(),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         out = json.loads(result.stdout)

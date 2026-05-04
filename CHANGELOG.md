@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.5.2 (2026-05-04)
+
+Patch release fixing a test-isolation bug.
+
+### Fixed
+
+- **Hook integration tests leaked state into real `~/.flow/.runtime/`** — 3 of
+  the 4 v0.5 tests (`test_v05_precompact_hook.py`, `test_v05_e2e.py`,
+  `test_v05_sessionstart_compact.py`) invoked hook scripts via
+  `subprocess.run` without an `env=` override, so the hook scripts read
+  `FLOW_HOME` from the parent process and wrote test-task nudge-state
+  files (`nudge-state-01-01-demo.json`, `nudge-state-01-01-e2e.json`) into
+  the user's actual runtime dir. Discovered during v0.5.1 framework
+  validation. Fix: pin `FLOW_HOME` to a per-test tempdir in each
+  `subprocess.run` `env=` arg, mirroring `test_v05_postool_integration.py`'s
+  `_isolated_runtime_env` pattern.
+
+### Tests
+
+- All 3 fixed tests now create a `runtime` tempdir in setUp and pass it via
+  `env=` to subprocess hook invocations. tearDown cleans up.
+- Suite total still 135 (no test added; isolation is internal).
+
 ## v0.5.1 (2026-05-04)
 
 Patch release covering two bugs found during v0.5.0 final validation

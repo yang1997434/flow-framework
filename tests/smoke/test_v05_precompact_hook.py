@@ -23,6 +23,7 @@ def _has_git() -> bool:
 class PreCompactHook(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="flow-pre-")).resolve()
+        self.runtime = Path(tempfile.mkdtemp(prefix="flow-rt-")).resolve()
         # Init project + git
         subprocess.run(["git", "init", "-q", "-b", "main", str(self.tmp)], check=True)
         env = os.environ.copy()
@@ -47,6 +48,13 @@ class PreCompactHook(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
+        shutil.rmtree(self.runtime, ignore_errors=True)
+
+    def _isolated_env(self) -> dict:
+        """Pin FLOW_HOME so hook nudge state stays in tempdir, not real ~/.flow."""
+        env = os.environ.copy()
+        env["FLOW_HOME"] = str(self.runtime)
+        return env
 
     def _run_hook(self, hook_input: dict) -> int:
         result = subprocess.run(
@@ -55,6 +63,7 @@ class PreCompactHook(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=10,
+            env=self._isolated_env(),
         )
         return result.returncode
 

@@ -18,6 +18,7 @@ HOOK_PATH = REPO_ROOT / "claude" / "hooks" / "session-start.py"
 class SessionStartCompact(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="flow-ss-")).resolve()
+        self.runtime = Path(tempfile.mkdtemp(prefix="flow-rt-")).resolve()
         flow = self.tmp / ".flow"
         task = flow / "tasks" / "01-01-demo"
         task.mkdir(parents=True)
@@ -53,6 +54,13 @@ class SessionStartCompact(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
+        shutil.rmtree(self.runtime, ignore_errors=True)
+
+    def _isolated_env(self) -> dict:
+        """Pin FLOW_HOME so hook nudge state stays in tempdir, not real ~/.flow."""
+        env = os.environ.copy()
+        env["FLOW_HOME"] = str(self.runtime)
+        return env
 
     def _run_hook(self, matcher: str) -> dict:
         return self._run_hook_with_field("trigger", matcher)
@@ -65,6 +73,7 @@ class SessionStartCompact(unittest.TestCase):
             ["python3", str(HOOK_PATH)],
             input=json.dumps({"cwd": str(self.tmp), field: value}),
             capture_output=True, text=True, timeout=10,
+            env=self._isolated_env(),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
