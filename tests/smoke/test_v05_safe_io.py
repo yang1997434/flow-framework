@@ -62,7 +62,10 @@ class AppendJsonlLocked(unittest.TestCase):
             self.assertEqual(json.loads(lines[0]), {"a": 1})
             self.assertEqual(json.loads(lines[1]), {"a": 2})
 
-    def test_concurrent_appends_no_interleave(self):
+    # NOTE: this validates concurrent THREAD appends only (GIL-serialized);
+    # cross-process safety from fcntl.flock is not exercised here. v0.6 may
+    # add a multiprocessing test if cross-process audit becomes load-bearing.
+    def test_concurrent_thread_appends_complete(self):
         from common.safe_io import append_jsonl_locked
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "log.jsonl"

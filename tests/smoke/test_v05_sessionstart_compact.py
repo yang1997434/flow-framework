@@ -55,9 +55,15 @@ class SessionStartCompact(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _run_hook(self, matcher: str) -> dict:
+        return self._run_hook_with_field("trigger", matcher)
+
+    def _run_hook_with_field(self, field: str, value: str) -> dict:
+        """Invoke session-start.py with the matcher under either the canonical
+        `trigger` field or its alias `hook_event_matcher` — the hook accepts
+        both per Claude Code docs."""
         result = subprocess.run(
             ["python3", str(HOOK_PATH)],
-            input=json.dumps({"cwd": str(self.tmp), "trigger": matcher}),
+            input=json.dumps({"cwd": str(self.tmp), field: value}),
             capture_output=True, text=True, timeout=10,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -85,6 +91,22 @@ class SessionStartCompact(unittest.TestCase):
         self.assertNotIn("flow-resumed-from-compact", ctx)
         # but should still have active task in standard quick-guide
         self.assertIn("Active Task", ctx)
+
+    def test_compact_with_stale_mechanical_emits_staleness_warning(self):
+        # Bump mechanical ts to 30 min after intent (15:30:00) → 16:00:00.
+        mech = self.task / ".checkpoint" / "mechanical.json"
+        data = json.loads(mech.read_text(encoding="utf-8"))
+        data["ts"] = "2026-05-04T16:00:00+08:00"
+        mech.write_text(json.dumps(data), encoding="utf-8")
+        out = self._run_hook("compact")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Staleness", ctx)
+        self.assertIn("minutes newer", ctx)
+
+    def test_compact_via_hook_event_matcher_field_also_works(self):
+        out = self._run_hook_with_field("hook_event_matcher", "compact")
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("flow-resumed-from-compact", ctx)
 
 
 if __name__ == "__main__":
