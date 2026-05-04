@@ -361,6 +361,13 @@ def cmd_render_prompts(args) -> int:
                 )
 
             text = src_file.read_text(encoding="utf-8")
+            # Substitute {{REPO_ROOT}} BEFORE delegating to flow_capability.render(),
+            # which only handles {{capability:...}} and {{model:...}} placeholders.
+            # Slash command prompts (e.g. flow/pause.md Steps 6-8) embed the repo
+            # path into Python `sys.path.insert` lines so helpers under scripts/
+            # can be imported at runtime; without this substitution the literal
+            # token would land in ~/.claude/commands/... and the import would fail.
+            text = text.replace("{{REPO_ROOT}}", str(repo_abs))
             rendered, errors = render(text, registry)
 
             if errors:

@@ -194,6 +194,71 @@ class MergeHooksIsolation(unittest.TestCase):
         self.assertIn("hooks", result)
 
 
+class PromptRendererSubstitutesRepoRoot(unittest.TestCase):
+    """Slash command and skill prompts embed {{REPO_ROOT}} so the model can
+    `sys.path.insert` to import helpers under scripts/ at runtime. The
+    flow_capability.render() pipeline only matches {{capability:...}} and
+    {{model:...}} — so cmd_render_prompts MUST substitute {{REPO_ROOT}} itself
+    before delegating, otherwise the literal token lands in the user's
+    ~/.claude/commands/flow/pause.md and Steps 6-8 silently no-op.
+    """
+
+    def test_pause_md_repo_root_is_substituted(self):
+        """Render pause.md the same way cmd_render_prompts does and verify
+        no {{REPO_ROOT}} survives + the absolute repo path is present."""
+        sys.modules.pop("flow_capability", None)
+        from flow_capability import load_registry, render
+
+        repo_abs = REPO_ROOT.resolve()
+        src = REPO_ROOT / "claude" / "commands" / "flow" / "pause.md"
+        self.assertTrue(src.is_file(), f"missing prompt source: {src}")
+
+        text = src.read_text(encoding="utf-8")
+        # Sanity: the source DOES contain the placeholder (otherwise this
+        # test is vacuous; if Task 11's pause.md changes, update this).
+        self.assertIn("{{REPO_ROOT}}", text,
+                      "pause.md is expected to contain {{REPO_ROOT}} as a substitution target")
+
+        # Mirror the install-time render path
+        text = text.replace("{{REPO_ROOT}}", str(repo_abs))
+        rendered, errors = render(text, load_registry())
+
+        self.assertEqual(errors, [], f"unexpected render errors: {errors}")
+        self.assertNotIn("{{REPO_ROOT}}", rendered,
+                         "{{REPO_ROOT}} must be fully substituted before write")
+        # The injected sys.path line must point at our absolute scripts dir
+        self.assertIn(f'sys.path.insert(0, "{repo_abs}/scripts")', rendered,
+                      "rendered pause.md must contain the absolute scripts path")
+
+    def test_no_unsubstituted_repo_root_in_any_rendered_prompt(self):
+        """Walk the same RENDER_TARGETS that cmd_render_prompts walks and
+        verify NO rendered output contains the literal {{REPO_ROOT}} token."""
+        sys.modules.pop("flow_install", None)
+        sys.modules.pop("flow_capability", None)
+        from flow_install import RENDER_TARGETS  # noqa: WPS433
+        from flow_capability import load_registry, render
+
+        repo_abs = REPO_ROOT.resolve()
+        registry = load_registry()
+
+        for src_rel, _dst in RENDER_TARGETS:
+            src_root = REPO_ROOT / src_rel
+            if not src_root.is_dir():
+                continue
+            for src_file in src_root.rglob("*"):
+                if not src_file.is_file():
+                    continue
+                if src_file.suffix not in (".md", ".yaml", ".yml", ".json"):
+                    continue
+                text = src_file.read_text(encoding="utf-8")
+                text = text.replace("{{REPO_ROOT}}", str(repo_abs))
+                rendered, _errors = render(text, registry)
+                self.assertNotIn(
+                    "{{REPO_ROOT}}", rendered,
+                    f"unsubstituted {{{{REPO_ROOT}}}} in rendered {src_file.relative_to(REPO_ROOT)}",
+                )
+
+
 class FlowInstallSubcommandsImportable(unittest.TestCase):
     """flow_install.py must expose all subcommands documented in the docstring."""
 
