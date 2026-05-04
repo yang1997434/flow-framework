@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.5.6 (2026-05-04)
+
+Two new CLI surfaces resolving GitHub issues #4 and #5. Both were
+deferred from v0.5.3 as feature additions.
+
+### Added
+
+- **`flow task phase <name>`** (#4) — advance the current task's phase
+  field via CLI instead of hand-editing frontmatter. Validates against
+  the enum (triage|research|implement|check|verify|sediment), atomic-writes
+  via `safe_io.locked_text_rmw`, appends an Execute Log entry, and
+  records a `phase_transition` event in `history.jsonl` when
+  `.checkpoint/` exists. Accepts `--slug` for non-active tasks.
+- **`flow sediment <type> <slug>`** (#5) — render a pitfall/pattern/ADR
+  from `templates/`, write to `.flow/{pitfalls,patterns,ADRs}/`, and
+  link from the active task's progress.md `## Sediment Notes`. ADRs
+  auto-number (`0001-`, `0002-`, ...) by scanning existing files;
+  explicit `0042-` prefix in slug is respected. Per-type flags:
+  `--severity` (pitfall), `--tier` (pattern). Eliminates Phase 4's
+  manual boilerplate (template select → substitute → write → link).
+
+### Tests
+
+- Suite: 143 → 155 (+12 across `test_flow_task_cli.py` extension and
+  new `test_flow_sediment.py`).
+
 ## v0.5.5 (2026-05-04)
 
 Patch release — fix #7: `dependencies.json` referenced a nonexistent
