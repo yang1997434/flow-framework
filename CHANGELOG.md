@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.5.1 (2026-05-04)
+
+Patch release covering two bugs found during v0.5.0 final validation
+that were deferred to a follow-up.
+
+### Fixed
+
+- **`credential_grep` `(?i)` regex prefix** — GNU `grep -E` treats `(?i)` as
+  a literal optional group, breaking the intended case-insensitive scan.
+  The `-i` flag (already passed) provides case-insensitivity correctly.
+  Local dev environments with `ugrep` aliased as `grep` masked the bug.
+- **Selftest dry-fire fixtures** for `pre-compact.py` and `post-tool-edit.py`
+  — these v0.5 hooks were validated by `flow doctor` isolation check +
+  live invocation, but absent from `flow_selftest.py::HOOK_FIXTURES`.
+
+### Tests
+
+- Restored the credential-leak integration test case in
+  `test_v05_postool_integration.py` that v0.5.0's polish work had to
+  substitute due to the credential_grep regex bug.
+- Smoke suite total: 134 → 135.
+- Selftest hook dry-fire count: 5 → 7.
+
 ## v0.5.0 (2026-05-04)
 
 Foundation for **auto-resume on context pressure**. Manual flow hardening
