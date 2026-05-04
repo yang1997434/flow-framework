@@ -42,7 +42,10 @@ from common.mechanical import build_payload
 from common.safe_io import atomic_write_json, append_jsonl_locked
 
 CREDENTIAL_PATTERN = (
-    r"(?i)(password|secret|api[_-]?key|token|bearer).*[:=]\s*['\"][^'\"]{4,}['\"]"
+    # Note: case-insensitivity is provided by `grep -i` below. Do NOT prepend
+    # `(?i)` — GNU grep -E treats it as a literal optional group, breaking
+    # the intent. (Local dev with ugrep aliased as grep masked this.)
+    r"(password|secret|api[_-]?key|token|bearer).*[:=]\s*['\"][^'\"]{4,}['\"]"
 )
 
 

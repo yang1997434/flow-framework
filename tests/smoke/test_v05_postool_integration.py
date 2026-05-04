@@ -153,6 +153,39 @@ class PostToolBashEmits(unittest.TestCase):
         self.assertIn("flow-checkpoint-suggested", ctx)
         self.assertNotIn("flow-credential-warning", ctx)
 
+    def test_git_commit_credential_leak_emits_nudge_and_warning(self):
+        # Restored in v0.5.1: was previously substituted by the no-match case
+        # because the credential_grep `(?i)` regex bug made matches
+        # nondeterministic on stock GNU grep. Pattern now fixed (see
+        # post-tool-bash.py CREDENTIAL_PATTERN comment).
+        #
+        # Place a credential-shaped string inside .flow/ so credential_grep's
+        # `--include=*.md` filter finds it. The hook must merge BOTH the
+        # checkpoint nudge AND the credential warning into additionalContext,
+        # separated by a blank line.
+        leaky = self.task / "leak.md"
+        leaky.write_text(
+            "# leak fixture\nPASSWORD = \"hunter2hunter2\"\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env.update({
+            "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "t@t",
+        })
+        subprocess.run(["git", "-C", str(self.tmp), "add", "."], check=True,
+                       env=env, stdout=subprocess.DEVNULL)
+        subprocess.run(["git", "-C", str(self.tmp), "commit", "-q", "-m", "+leak"],
+                       check=True, env=env, stdout=subprocess.DEVNULL)
+        out = self._run("git commit -m +leak")
+        self.assertIsNotNone(out)
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        # Both envelopes must be present.
+        self.assertIn("flow-checkpoint-suggested", ctx)
+        self.assertIn("flow-credential-warning", ctx)
+        # Merged with a blank-line separator (per post-tool-bash.py merge logic).
+        self.assertIn("\n\n", ctx)
+
 
 @unittest.skipUnless(_has_git(), "git not available")
 class PostToolHooksSymmetry(unittest.TestCase):
