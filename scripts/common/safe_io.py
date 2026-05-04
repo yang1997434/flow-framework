@@ -13,7 +13,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 def atomic_write_text(path: Path, content: str, mode: int = 0o644) -> None:
@@ -70,6 +70,43 @@ def append_jsonl_locked(path: Path, record: dict, timeout_s: float = 2.0) -> boo
                 time.sleep(0.05)
         try:
             f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    return True
+
+
+def locked_text_rmw(path: Path, transform: Callable[[str], str], timeout_s: float = 2.0) -> bool:
+    """Read-modify-write text file under fcntl.LOCK_EX. Returns True on write,
+    False if lock could not be acquired within timeout_s OR if transform
+    returned the original text unchanged.
+
+    Concurrency contract: two callers racing on this on the same path will
+    serialize; second caller observes first caller's write.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return False
+    deadline = time.monotonic() + timeout_s
+    with open(path, "r+", encoding="utf-8") as f:
+        while True:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.05)
+        try:
+            f.seek(0)
+            old_text = f.read()
+            new_text = transform(old_text)
+            if new_text == old_text:
+                return False
+            f.seek(0)
+            f.truncate()
+            f.write(new_text)
             f.flush()
             os.fsync(f.fileno())
         finally:

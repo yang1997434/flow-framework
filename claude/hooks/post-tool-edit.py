@@ -36,7 +36,7 @@ from common.context_estimator import estimate_context_pct
 from common.nudge import maybe_nudge_text, derive_window_id
 from common.checkpoint_paths import mechanical_path, history_path
 from common.mechanical import build_payload
-from common.safe_io import atomic_write_json, append_jsonl_locked
+from common.safe_io import atomic_write_json, append_jsonl_locked, locked_text_rmw
 from typing import Optional
 
 FLUSH_AFTER_SECONDS = 60
@@ -170,15 +170,16 @@ def render_files_block(paths: list[str]) -> str:
 
 def upsert_files_section(progress: Path, block: str) -> bool:
     """Replace the body of `## Files Touched` (or create it) with `block`.
-    Returns True if file was updated, False on no-op."""
+
+    Concurrency: serialized via fcntl.LOCK_EX so a racing post-tool-bash
+    `## Commits` append can't clobber our `## Files Touched` upsert.
+    Returns True if file was updated, False on no-op/lock-timeout/no-file."""
     if not progress.is_file():
         return False
-    text = progress.read_text(encoding="utf-8")
-    new_text = _replace_section_body(text, "## Files Touched", block)
-    if new_text == text:
-        return False
-    progress.write_text(new_text, encoding="utf-8")
-    return True
+    return locked_text_rmw(
+        progress,
+        lambda text: _replace_section_body(text, "## Files Touched", block),
+    )
 
 
 def _replace_section_body(text: str, heading: str, body: str) -> str:

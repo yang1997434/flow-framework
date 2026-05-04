@@ -90,5 +90,55 @@ class AppendJsonlLocked(unittest.TestCase):
                 self.assertIn("i", obj)
 
 
+class LockedTextRmw(unittest.TestCase):
+    def test_simple_rmw(self):
+        from common.safe_io import locked_text_rmw
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "f.txt"
+            p.write_text("hello\n")
+            ok = locked_text_rmw(p, lambda t: t + "world\n")
+            self.assertTrue(ok)
+            self.assertEqual(p.read_text(), "hello\nworld\n")
+
+    def test_no_change_returns_false(self):
+        from common.safe_io import locked_text_rmw
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "f.txt"
+            p.write_text("x")
+            self.assertFalse(locked_text_rmw(p, lambda t: t))
+
+    def test_missing_file_returns_false(self):
+        from common.safe_io import locked_text_rmw
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "missing.txt"
+            self.assertFalse(locked_text_rmw(p, lambda t: t + "x"))
+
+    def test_concurrent_threads_no_lost_update(self):
+        from common.safe_io import locked_text_rmw
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "f.txt"
+            p.write_text("[]\n")
+            N_THREADS = 8
+            N_PER = 25
+
+            def append_marker(tid: int):
+                for i in range(N_PER):
+                    locked_text_rmw(p, lambda t, tid=tid, i=i: t.rstrip() + f"\n{tid}-{i}")
+
+            threads = [threading.Thread(target=append_marker, args=(t,)) for t in range(N_THREADS)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            lines = p.read_text().splitlines()
+            # Expect 1 (initial) + 200 (8*25 markers) = 201 lines
+            self.assertEqual(len(lines), 1 + N_THREADS * N_PER)
+            # Every (tid,i) pair appears exactly once
+            seen = {ln for ln in lines if "-" in ln}
+            expected = {f"{t}-{i}" for t in range(N_THREADS) for i in range(N_PER)}
+            self.assertEqual(seen, expected)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

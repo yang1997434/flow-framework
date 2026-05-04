@@ -39,7 +39,7 @@ from common.context_estimator import estimate_context_pct
 from common.nudge import maybe_nudge_text, derive_window_id
 from common.checkpoint_paths import mechanical_path, history_path
 from common.mechanical import build_payload
-from common.safe_io import atomic_write_json, append_jsonl_locked
+from common.safe_io import atomic_write_json, append_jsonl_locked, locked_text_rmw
 
 CREDENTIAL_PATTERN = (
     # Note: case-insensitivity is provided by `grep -i` below. Do NOT prepend
@@ -97,43 +97,29 @@ def get_head_short_hash_and_subject(project_root: Path) -> tuple[str, str] | Non
 def append_commit_to_progress(task_dir: Path, short_hash: str, subject: str) -> bool:
     """Append a single-line commit entry to progress.md `## Commits`.
 
-    Debouncing: if mtime of progress.md is within the same minute as `now`
-    AND the file already mentions this short hash, skip. Otherwise append.
-    Returns True on append, False on debounce/skip."""
+    Idempotency: if file already mentions this short hash, skip (the
+    transform returns the original text unchanged → locked_text_rmw
+    returns False).
+
+    Concurrency: serialized via fcntl.LOCK_EX so a racing post-tool-edit
+    `## Files Touched` write can't clobber our `## Commits` append.
+    Returns True on append, False on skip/lock-timeout/no-file."""
     progress = task_dir / "progress.md"
     if not progress.is_file():
         return False
 
-    text = progress.read_text(encoding="utf-8")
-    if short_hash in text:
-        return False  # already recorded — idempotent
-
-    # Minute-bucket debounce: if mtime is within the current minute and
-    # there is at least one commit line already added in this minute, skip.
-    try:
-        mtime = progress.stat().st_mtime
-    except OSError:
-        mtime = 0
-    now_epoch = time.time()
-    same_minute = int(mtime) // 60 == int(now_epoch) // 60
-
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     line = f"- [{timestamp}] `{short_hash}` {subject}"
 
-    if "## Commits" in text:
-        if same_minute:
-            # Be conservative: a same-minute write already happened. We still
-            # allow new hashes (different commits within one minute should be
-            # logged), so we keep going. The hash-uniqueness check above
-            # already filters redundant writes.
-            pass
-        new_text = _append_under_heading(text, "## Commits", line)
-    else:
+    def _transform(text: str) -> str:
+        if short_hash in text:
+            return text  # already recorded — idempotent (no-op)
+        if "## Commits" in text:
+            return _append_under_heading(text, "## Commits", line)
         sep = "" if text.endswith("\n") else "\n"
-        new_text = text + f"{sep}\n## Commits\n\n{line}\n"
+        return text + f"{sep}\n## Commits\n\n{line}\n"
 
-    progress.write_text(new_text, encoding="utf-8")
-    return True
+    return locked_text_rmw(progress, _transform)
 
 
 def _append_under_heading(text: str, heading: str, line: str) -> str:
