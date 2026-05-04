@@ -6,6 +6,16 @@ description: "Resume Flow work after a session break — load state + run stalen
 
 User is returning after a break. Restore context from breakpoint + verify nothing is stale.
 
+## Step 0 — (v0.5) Personal /resume coordination
+
+If the user has not yet run their personal `/resume` skill in this session,
+suggest running it first for cross-conversation global state. After they do
+(or if they say skip), continue with this command.
+
+> "Have you run personal /resume yet? It loads MEMORY.md + session_latest.md.
+> If not, run it first; then re-invoke /flow:resume for task-depth state.
+> If you'd rather skip, say 'skip' and I'll proceed."
+
 ## Step 1 — Load active task
 
 ```bash
@@ -15,6 +25,21 @@ CURRENT=$(cat .flow/.current-task 2>/dev/null)
 If empty: tell user "No active task. Run /flow:start <task> to begin."
 
 If exists: read `${CURRENT}/prd.md` + `${CURRENT}/progress.md`.
+
+## Step 1.5 — (v0.5) Load checkpoint files
+
+If `${CURRENT}/.checkpoint/intent.md` exists:
+- Read it. Surface the **Next Action** and **Mental Model** sections to the user.
+- Note its `trigger` field — `manual` is highest fidelity, `auto-checkpoint`
+  was written by autopilot (v0.6+), `autopilot-bail` means autopilot exited
+  with concern.
+
+If `${CURRENT}/.checkpoint/mechanical.json` exists:
+- Compare its `ts` against intent.md's `ts`.
+- If mechanical is > 5 min newer than intent, surface a staleness notice:
+  *"Intent was last updated N minutes ago. Mechanical state shows M commits
+  + K files touched since then. Review carefully before assuming intent is
+  still fresh."*
 
 ## Step 2 — Read journal for context
 
@@ -41,12 +66,9 @@ If staleness found:
 
 ## Step 4 — Determine current phase + next step
 
-Same as `/flow:continue`. Tell user:
-- Current task: `<title>`
-- Current phase: `<X>`
-- Last activity: `<from journal>`
-- Next step: `<concrete action>`
-- Stale items found: `<count>` (if any)
+Combine intent.md's Next Action (Step 1.5) with progress.md state.
+If they agree → present concrete next step.
+If they conflict → ask the user which is authoritative.
 
 ## Step 5 — Wait for user input
 
