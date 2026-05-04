@@ -3,12 +3,13 @@
 
 Usage:
   flow init              -- bootstrap .flow/ in current project
-  flow task <subcmd>     -- task lifecycle (create / start / current / finish / archive / list)
+  flow task <subcmd>     -- task lifecycle (create / start / current / finish / archive / list / phase)
   flow save              -- save current task progress
   flow triage <desc>     -- heuristic classify a task
   flow staleness         -- check stale memory references
   flow conflict          -- detect rule/ADR conflicts (heuristic)
   flow promote           -- promote knowledge between tiers
+  flow sediment <type>   -- render pitfall/pattern/ADR template + link to active task
   flow install <subcmd>  -- declarative install (check-system / register-marketplaces / install-plugins / install-hooks / all)
   flow doctor            -- environment consistency diagnostic (static)
   flow selftest [scope]  -- functional verification (dynamic; scope: hooks/init/task/plugins/doctor/all)
@@ -55,6 +56,7 @@ def main():
         "staleness": "flow_staleness.py",
         "conflict": "flow_conflict.py",
         "promote": "flow_promote.py",
+        "sediment": "flow_sediment.py",
         "install": "flow_install.py",
         "doctor": "flow_doctor.py",
         "selftest": "flow_selftest.py",
