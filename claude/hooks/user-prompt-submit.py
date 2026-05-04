@@ -41,25 +41,54 @@ def find_project_flow(start: Path) -> Path | None:
     return None
 
 
+SECTION_NAMES = ["Plan", "Execute Log", "Verify Report", "Sediment Notes"]
+
+
+def extract_section(text: str, name: str) -> str:
+    """Return content of `## <name>` section (between this header and next ## or EOF)."""
+    pattern = rf"^##\s+{re.escape(name)}\s*\n(.*?)(?=^##\s|\Z)"
+    m = re.search(pattern, text, re.DOTALL | re.MULTILINE)
+    return m.group(1) if m else ""
+
+
+def is_section_filled(content: str) -> bool:
+    """A section is 'filled' iff it has non-template, non-comment content.
+
+    Strategy:
+      1. Strip HTML comments
+      2. Strip blank lines
+      3. Check remaining content has any non-trivial text
+    """
+    # Remove HTML comments (including the TEMPLATE: marker block)
+    no_comments = re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL)
+    # Remove blank-only lines
+    lines = [line.rstrip() for line in no_comments.splitlines() if line.strip()]
+    return len(lines) > 0
+
+
 def determine_phase(progress_md: Path) -> str:
-    """Heuristic detection of current phase from progress.md state."""
+    """Detect current phase by checking which sections have user-filled content.
+
+    Phase mapping:
+      - Plan empty               → phase1-plan
+      - Plan filled, Execute empty → phase2-execute
+      - Execute filled, Verify empty → phase3-finish
+      - Verify filled, Sediment empty → phase4-sediment
+      - All four filled          → done
+    """
     if not progress_md.is_file():
         return "phase1-plan"
     text = progress_md.read_text(encoding="utf-8", errors="replace")
 
-    # Find each section + check if it has content beyond the comment placeholder
-    has_plan = bool(re.search(r"##\s+Plan\s*\n.*?(?=##|\Z)", text, re.DOTALL)) and "main session" in text or "sub-agent" in text
-    has_execute = "Execute Log" in text and re.search(r"\|\s*\d{4}", text)  # has date in table
-    has_verify = re.search(r"##\s+Verify Report.*?(pass|fail|pending)", text, re.DOTALL | re.IGNORECASE)
-    has_sediment = "Sediment Notes" in text and ("promoted" in text.lower() or "no new" in text.lower())
+    sections = {name: is_section_filled(extract_section(text, name)) for name in SECTION_NAMES}
 
-    if has_sediment:
+    if sections["Sediment Notes"]:
         return "done"
-    if has_verify and "pending" not in str(has_verify):
+    if sections["Verify Report"]:
         return "phase4-sediment"
-    if has_execute:
+    if sections["Execute Log"]:
         return "phase3-finish"
-    if has_plan:
+    if sections["Plan"]:
         return "phase2-execute"
     return "phase1-plan"
 

@@ -6,8 +6,9 @@ Usage:
   flow task <subcmd>     -- task lifecycle (create / start / current / finish / archive / list)
   flow save              -- save current task progress
   flow triage <desc>     -- heuristic classify a task
-  flow staleness         -- (stub) check stale memory
-  flow promote           -- (stub) promote knowledge between tiers
+  flow staleness         -- check stale memory references
+  flow conflict          -- detect rule/ADR conflicts (heuristic)
+  flow promote           -- promote knowledge between tiers
   flow version           -- show version
 """
 from __future__ import annotations
@@ -48,6 +49,7 @@ def main():
         "save": "flow_save.py",
         "triage": "flow_triage.py",
         "staleness": "flow_staleness.py",
+        "conflict": "flow_conflict.py",
         "promote": "flow_promote.py",
     }
 

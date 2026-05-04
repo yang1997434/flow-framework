@@ -2,43 +2,25 @@
 
 ## Plan
 
-<!-- Phase 1 末写。含 sub-agent scope 划分（必须互不重叠） -->
-
-Sub-agent scope plan:
-- (single agent, no parallel) — main session implements
-<!-- 或 -->
-<!-- - sub-agent A → scope: <path>, modify: <files> -->
-<!-- - sub-agent B → scope: <path>, modify: <files> -->
+<!-- TEMPLATE: 未填写。Phase 1 末由主 session 写入：sub-agent scope 划分（互不重叠）或 "(single, main session implements)"。 -->
 
 ## Execute Log
 
-<!-- Phase 2 渐进 append。一个 sub-agent 完成一行 -->
+<!-- TEMPLATE: 未填写。Phase 2 渐进 append。每个 sub-agent / 主 session 完成一段工作时追加一行。 -->
 
-| 时间 | Agent | Scope | Outcome |
+<!-- 表格示例（首行为表头，自动生效）：
+| 时间 (YYYY-MM-DD HH:MM) | Agent | Scope | Outcome |
 |------|-------|-------|---------|
-| (none yet) | | | |
+-->
 
 ## Verify Report
 
-<!-- Phase 3 末写 -->
-
-- Self-check (fresh-context Sonnet): pending
-- Cross-model review (Codex GPT-5.5): pending / N/A (reason)
-- Lint / typecheck / tests: pending
-- Credential grep self-check: pending
-- Acceptance Criteria all checked: pending
-- Commit hash: pending
+<!-- TEMPLATE: 未填写。Phase 3 末写。各项必须有具体值（pass / fail / 跳过原因），不能留 pending。 -->
 
 ## Sediment Notes
 
-<!-- Phase 4 末写。即使没新东西也写一行"no new sediment"——强制思考 -->
-
-- ADR promoted: (none yet)
-- Pattern promoted: (none yet)
-- Pitfall captured: (none yet)
-- vault candidate: pending
-- Auto-saved to: <auto-memory file or journal>
+<!-- TEMPLATE: 未填写。Phase 4 末写。强制写一段——即使"no new sediment"也要明确写。 -->
 
 ## Retro (optional)
 
-<!-- 自由格式回顾——什么 worked / didn't / 框架反馈 -->
+<!-- TEMPLATE: 自由格式回顾——什么 worked / didn't / 框架反馈。可省略。 -->
