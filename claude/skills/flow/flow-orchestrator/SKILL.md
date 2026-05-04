@@ -61,7 +61,7 @@ If `flow init` is available, prefer it.
 
 ## Step 4 — Create task
 
-Use templates from `~/projects/flow-framework/templates/`:
+Use templates from `{{REPO_ROOT}}/templates/`:
 
 ```bash
 SLUG=<derived-from-task-title>
@@ -85,14 +85,14 @@ After phase 1 completes, prompt user: `"Phase 1 done. Reply '/flow:continue' to 
 - **Always create task structure** before any real work — even for simple tasks
 - **Honor user override** (skip / 别走) — but **note in retro** that this task bypassed framework
 - **Don't load all 4 phase skills at once** — load each on demand to avoid context bloat
-- **Read** `~/projects/flow-framework/docs/编码框架.md` only when uncertain — don't read full doc on every invocation
+- **Read** `{{REPO_ROOT}}/docs/编码框架.md` only when uncertain — don't read full doc on every invocation
 
 ## Quick Read Guide
 
 When you (the orchestrator) need framework reference:
 - Triage criteria: read this file's Step 2
 - Phase X behavior: read `flow-phaseX-plan/SKILL.md`
-- Specific skill chain: read `~/projects/flow-framework/docs/Skills-Phase映射.md` (only the relevant task type section)
+- Specific skill chain: read `{{REPO_ROOT}}/docs/Skills-Phase映射.md` (only the relevant task type section)
 - Pitfall trigger_paths: read `.flow/pitfalls/` and `~/data/knowledge-base/pitfalls/` matching current files
 
 **Don't** read full design doc unless user asks "explain the framework".
