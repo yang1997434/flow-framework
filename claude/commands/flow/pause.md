@@ -97,8 +97,10 @@ from common.checkpoint_paths import intent_path, history_path
 from common.context_estimator import estimate_context_pct
 
 # Resolve task_path once for all helpers.
-task_path = (
-    Path(".flow/tasks") / Path(".flow/.current-task").read_text(encoding="utf-8").strip()
+# .flow/.current-task contains the full relative path (e.g. ".flow/tasks/05-04-foo"),
+# so DO NOT prepend ".flow/tasks" again — that would yield ".flow/tasks/.flow/tasks/...".
+task_path = Path(
+    Path(".flow/.current-task").read_text(encoding="utf-8").strip()
 ).resolve()
 
 # Best-effort context estimate. Slash commands typically don't have
