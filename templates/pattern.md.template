@@ -1,0 +1,37 @@
+---
+name: {{SLUG}}
+date: {{DATE}}
+project: {{PROJECT_OR_CROSS}}
+tier: project   # project (Lv1) | personal (Lv2 / vault) | global (Lv3 / rules)
+status: active   # active | superseded
+last_verified: {{DATE}}
+---
+
+# Pattern: {{TITLE}}
+
+## When to use
+
+<触发条件 / 适用场景>
+
+## What it is
+
+<模式描述>
+
+## Implementation
+
+```<lang>
+<代码 / 配置示例>
+```
+
+## Why this works
+
+<原理 + 别的方案为什么不好>
+
+## When NOT to use
+
+<反场景 / 不适用条件>
+
+## References
+
+- First emerged in: <task slug or commit>
+- Promoted from: <previous tier file path>

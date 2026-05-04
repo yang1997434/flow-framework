@@ -1,0 +1,16 @@
+# Flow Framework — append to project .gitignore
+
+# Per-session runtime state
+.flow/.runtime/
+.flow/.current-task
+
+# Machine-local config (credentials, remote targets)
+.flow/config.local.yaml
+
+# Per-developer workspace (default; team_mode=true 时可改 committed)
+.flow/workspace/*
+!.flow/workspace/.gitkeep
+
+# Atomic temp files
+.flow/**/*.tmp
+.flow/**/.backup-*

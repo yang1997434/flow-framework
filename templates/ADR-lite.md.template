@@ -1,0 +1,34 @@
+---
+name: {{SLUG}}
+date: {{DATE}}
+project: {{PROJECT}}
+status: active   # active | superseded | reverted
+---
+
+# ADR-lite: {{TITLE}}
+
+## Context
+
+<背景 + 触发事件 + 已有的限制>
+
+## Decision
+
+<选了什么 + 拒绝了什么 + 关键考虑>
+
+## Consequences
+
+- **短期代价**: <如：迁移期 X 周 / 学习曲线>
+- **长期收益**: <如：解决 Y 问题 / 后续可扩展>
+- **反悔成本**: <如：N 周可回滚 / 不可逆>
+
+## Revisit triggers
+
+什么情况下重新评估这个决策：
+
+- [ ] <条件>
+
+## References
+
+- Related task: <task slug>
+- Related pattern: <pattern slug>
+- Related pitfall: <pitfall slug>

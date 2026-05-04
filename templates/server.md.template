@@ -1,0 +1,29 @@
+---
+name: {{SLUG}}
+host: <ip 或 hostname>
+ssh:
+  user: <ssh 用户>
+  key_path: <key 路径，不含内容>
+location: <地理位置 / 云厂商>
+purpose: <一句话用途>
+last_verified: {{DATE}}
+credentials_ref: <凭据真实位置，如 ~/.flow/credentials.local#section:NAME>
+status: active   # active | decommissioned | mirror | testing
+---
+
+# {{SLUG}}
+
+## Roles
+- <角色 / 用途>
+
+## Currently runs
+- <当前运行的服务 + 版本>
+
+## Coordination
+- <和其他机器的关系>
+
+## Notes
+- ⚠️ <注意事项 / 坑 / 已知 issue>
+
+## History
+- {{DATE}}: <变更描述>

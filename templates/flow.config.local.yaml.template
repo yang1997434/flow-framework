@@ -1,0 +1,24 @@
+# ~/.flow/credentials.local — machine-local credentials + remote targets
+# chmod 600 + gitignored. NEVER commit this file or copy contents into vault.
+
+machine_id: <fill in: e.g., ccs-maruiao / storage-azure / target-coolify>
+
+# 远程部署目标（被 sub-agent 引用，按 name lookup）
+remote_targets:
+  # prod-dev:
+  #   host: <ip>
+  #   user: <ssh user>
+  #   key_path: ~/.ssh/<key>
+  #   docker_root: /opt/projects/<name>
+  #   notes: <one-liner>
+
+# API tokens / 第三方密钥
+secrets:
+  # OPENAI_API_KEY: <token>
+  # ANTHROPIC_API_KEY: <token>
+  # github_pat: <token>
+
+# Per-machine flow runtime overrides
+runtime:
+  # claude_default_model: claude-opus-4-7
+  # codex_cli_path: /usr/local/bin/codex

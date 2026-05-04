@@ -1,0 +1,33 @@
+---
+name: {{SLUG}}
+servers: [<server1>, <server2>, ...]
+purpose: <一句话>
+last_verified: {{DATE}}
+status: active   # active | obsolete
+---
+
+# {{SLUG}}
+
+## Overview
+
+<部署 / 拓扑概览>
+
+## How traffic flows
+
+```
+<ASCII 流量图或步骤>
+```
+
+## How to add a new component
+
+<操作步骤>
+
+## Critical constraints
+
+| 不能动 | 为什么 |
+|-------|-------|
+| <constraint> | <reason> |
+
+## History
+
+- {{DATE}}: <变更描述>

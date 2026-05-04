@@ -1,0 +1,44 @@
+# progress.md — {{SLUG}}
+
+## Plan
+
+<!-- Phase 1 末写。含 sub-agent scope 划分（必须互不重叠） -->
+
+Sub-agent scope plan:
+- (single agent, no parallel) — main session implements
+<!-- 或 -->
+<!-- - sub-agent A → scope: <path>, modify: <files> -->
+<!-- - sub-agent B → scope: <path>, modify: <files> -->
+
+## Execute Log
+
+<!-- Phase 2 渐进 append。一个 sub-agent 完成一行 -->
+
+| 时间 | Agent | Scope | Outcome |
+|------|-------|-------|---------|
+| (none yet) | | | |
+
+## Verify Report
+
+<!-- Phase 3 末写 -->
+
+- Self-check (fresh-context Sonnet): pending
+- Cross-model review (Codex GPT-5.5): pending / N/A (reason)
+- Lint / typecheck / tests: pending
+- Credential grep self-check: pending
+- Acceptance Criteria all checked: pending
+- Commit hash: pending
+
+## Sediment Notes
+
+<!-- Phase 4 末写。即使没新东西也写一行"no new sediment"——强制思考 -->
+
+- ADR promoted: (none yet)
+- Pattern promoted: (none yet)
+- Pitfall captured: (none yet)
+- vault candidate: pending
+- Auto-saved to: <auto-memory file or journal>
+
+## Retro (optional)
+
+<!-- 自由格式回顾——什么 worked / didn't / 框架反馈 -->

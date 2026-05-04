@@ -1,0 +1,39 @@
+---
+name: {{SLUG}}
+date: {{DATE}}
+project: {{PROJECT_OR_CROSS}}
+severity: medium      # low / medium / high (重犯代价)
+status: active        # active / obsolete (留 history 不删)
+trigger_paths:
+  - <path glob 或 library 名 — 任务启动时按此匹配自动加载>
+last_verified: {{DATE}}
+---
+
+# {{SLUG}}
+
+## Symptom（看到什么）
+
+<具体症状描述。一段话 + 可运行的复现命令>
+
+## Root cause（实际原因）
+
+<根因。指向具体代码 / 配置 / 行为>
+
+## Fix（这次怎么解决的）
+
+<采用的修复方案。提供具体命令 / 代码片段 / commit 链接>
+
+## Prevention（下次怎么避免）
+
+<可执行的 prevention checklist。next time 应该 grep 什么、检查什么、怎么避免重蹈>
+
+## Why it matters
+
+<重犯代价。多少时间损失 / 多少次 incident / 长期问题>
+
+## References
+
+- Commit: <hash>
+- PR: <url>
+- Related ADR: <link>
+- Related pitfall: <link>
