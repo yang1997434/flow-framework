@@ -93,10 +93,12 @@ flow-framework/
 
 ## Documentation
 
+- **[`docs/USAGE.md`](docs/USAGE.md)** — Step-by-step usage guide (install / first-time setup / daily workflow / troubleshooting / cross-machine sync) ← **start here**
 - [`docs/编码框架.md`](docs/编码框架.md) — Full design (4 phases, 3 tiers, model routing, pitfalls, SSH adaptation)
 - [`docs/Skills-Phase映射.md`](docs/Skills-Phase映射.md) — Complete skill × phase trigger map
 - [`docs/框架对比.md`](docs/框架对比.md) — Flow vs Trellis / Cursor / Devin / CrewAI / Aider comparison
 - [`docs/调研方法论.md`](docs/调研方法论.md) — Research methodology (sub-agent isolation + file persistence)
+- [`docs/Trellis调研.md`](docs/Trellis调研.md) — Trellis architecture deep dive (inspiration source)
 
 ## License
 

@@ -93,10 +93,12 @@ flow-framework/
 
 ## 文档
 
+- **[`docs/USAGE.md`](docs/USAGE.md)** — 步骤化使用指南（安装 / 首次项目配置 / 日常流程 / 故障排查 / 跨机器同步）← **从这里开始**
 - [`docs/编码框架.md`](docs/编码框架.md) — 完整设计
 - [`docs/Skills-Phase映射.md`](docs/Skills-Phase映射.md) — Skill × Phase trigger 全表
 - [`docs/框架对比.md`](docs/框架对比.md) — Flow vs Trellis / Cursor / Devin / CrewAI / Aider 横向对比
 - [`docs/调研方法论.md`](docs/调研方法论.md) — 调研方法论
+- [`docs/Trellis调研.md`](docs/Trellis调研.md) — Trellis 架构深度调研（灵感来源）
 
 ## License
 
