@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -71,11 +72,29 @@ def fail(label: str, detail: str = "") -> None:
     print(f"   {RED}✗{RESET} {_format(label, detail)}")
 
 
-def run(cmd: list[str], dry_run: bool, check: bool = True) -> subprocess.CompletedProcess | None:
+def run(cmd: list[str], dry_run: bool, check: bool = True,
+        env: dict[str, str] | None = None) -> subprocess.CompletedProcess | None:
     if dry_run:
         info(f"{DIM}[dry-run]{RESET} {' '.join(cmd)}")
         return None
-    return subprocess.run(cmd, check=check, capture_output=True, text=True)
+    return subprocess.run(cmd, check=check, capture_output=True, text=True, env=env)
+
+
+def _https_only_env() -> dict[str, str]:
+    """Return os.environ + GIT_CONFIG_* vars that force git to rewrite
+    git@github.com: → https://github.com/ for the subprocess only.
+
+    Some `claude plugin marketplace add` invocations end up shelling to
+    git with an SSH-form URL even when the user passed `owner/repo`
+    shortcut. On machines without SSH keys (or strict known_hosts), the
+    clone fails. GIT_CONFIG_COUNT/KEY/VALUE injects an `insteadOf` rule
+    scoped to this subprocess — git 2.31+ supports it. Zero side effects
+    on working installs (rewrite is a no-op when URL already HTTPS)."""
+    env = os.environ.copy()
+    env["GIT_CONFIG_COUNT"] = "1"
+    env["GIT_CONFIG_KEY_0"] = "url.https://github.com/.insteadOf"
+    env["GIT_CONFIG_VALUE_0"] = "git@github.com:"
+    return env
 
 
 def cmd_check_system(args) -> int:
@@ -130,7 +149,7 @@ def cmd_register_marketplaces(args) -> int:
             continue
         result = run(
             ["claude", "plugin", "marketplace", "add", source],
-            dry_run=args.dry_run, check=False,
+            dry_run=args.dry_run, check=False, env=_https_only_env(),
         )
         if args.dry_run:
             continue
@@ -171,7 +190,7 @@ def cmd_install_plugins(args) -> int:
                 continue
             result = run(
                 ["claude", "plugin", "install", spec],
-                dry_run=args.dry_run, check=False,
+                dry_run=args.dry_run, check=False, env=_https_only_env(),
             )
             if args.dry_run:
                 continue

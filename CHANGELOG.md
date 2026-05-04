@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.5.4 (2026-05-04)
+
+Patch release — single-fix for the SSH-only marketplace clone failure
+flagged in PR #1's "Notes for reviewer" and reproduced on this machine
+during v0.5.3 selftest.
+
+### Fixed
+
+- **`flow install` SSH→HTTPS fallback** — `cmd_register_marketplaces` and
+  `cmd_install_plugins` now inject `GIT_CONFIG_COUNT/KEY/VALUE` env vars
+  into their `claude plugin` subprocess calls, telling git (2.31+) to
+  rewrite `git@github.com:` to `https://github.com/` for the duration
+  of that subprocess only. Eliminates the "SSH host key not in
+  known_hosts" failure path on machines without SSH keys configured.
+  Zero impact on installs that already worked (the rewrite is a no-op
+  when the URL is already HTTPS).
+
 ## v0.5.3 (2026-05-04)
 
 Patch release with 6 fixes — 2 local L3-dogfood findings + PR #1 (path
