@@ -87,6 +87,21 @@ HOOK_FIXTURES: dict[str, dict] = {
         },
         "timeout": 15,
     },
+    "post-tool-edit.py": {
+        "stdin": {
+            "tool_name": "Edit",
+            # Non-existent path — hook bails early but exits 0 (fail-closed).
+            "tool_input": {"file_path": "/tmp/flow-selftest-nonexistent.txt"},
+            "cwd": "/tmp",
+        },
+        "timeout": 10,
+    },
+    "pre-compact.py": {
+        # Hook expects cwd + transcript_path; minimal stdin → no active task
+        # found → noop and exit 0 (fail-closed).
+        "stdin": {"cwd": "/tmp"},
+        "timeout": 10,
+    },
     "stop.py": {
         "stdin": {"event": "stop", "cwd": "/tmp"},
         "timeout": 15,
