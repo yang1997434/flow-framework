@@ -111,5 +111,79 @@ class FinishLeavesCurrentTaskIntact(unittest.TestCase):
                              "archive should clear .current-task after a successful mv")
 
 
+class TaskPhaseAdvance(unittest.TestCase):
+    """Issue #4: `flow task phase <name>` should advance the phase
+    frontmatter field, append an Execute Log row, and validate input."""
+
+    def _create_task(self, cwd: Path) -> Path:
+        _init(cwd)
+        r = _run(cwd, "create", "smoke", "--slug", "smoke",
+                 "--type", "backend", "--complexity", "simple")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        tasks = [p for p in (cwd / ".flow" / "tasks").iterdir()
+                 if p.is_dir() and p.name != "archive"]
+        self.assertEqual(len(tasks), 1)
+        return tasks[0]
+
+    def test_phase_valid_transition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            task_dir = self._create_task(cwd)
+            r = _run(cwd, "phase", "implement")
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+            text = (task_dir / "progress.md").read_text(encoding="utf-8")
+            # Frontmatter `phase:` field updated
+            self.assertRegex(text, r"(?m)^phase:\s+implement\b")
+            # Execute Log got the transition row
+            self.assertIn("flow task phase", text)
+            self.assertIn("triage", text)  # old phase referenced
+            self.assertIn("implement", text)  # new phase referenced
+
+    def test_phase_unknown_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            self._create_task(cwd)
+            r = _run(cwd, "phase", "bogus-phase-name")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("unknown phase", r.stderr.lower())
+
+    def test_phase_no_active_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            _init(cwd)
+            # No task created → no .current-task pointer
+            r = _run(cwd, "phase", "implement")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("no active task", r.stderr.lower())
+
+    def test_phase_idempotent_same_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            task_dir = self._create_task(cwd)
+            # Default is `triage` per template
+            before = (task_dir / "progress.md").read_text(encoding="utf-8")
+            r = _run(cwd, "phase", "triage")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("phase already triage", r.stdout)
+            after = (task_dir / "progress.md").read_text(encoding="utf-8")
+            self.assertEqual(before, after,
+                             "no-op phase should not modify progress.md")
+
+    def test_phase_history_jsonl_event_when_checkpoint_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            task_dir = self._create_task(cwd)
+            # Pre-create .checkpoint/ so phase command logs to history.jsonl.
+            (task_dir / ".checkpoint").mkdir()
+            r = _run(cwd, "phase", "research")
+            self.assertEqual(r.returncode, 0, r.stderr)
+            hist = task_dir / ".checkpoint" / "history.jsonl"
+            self.assertTrue(hist.is_file())
+            content = hist.read_text(encoding="utf-8")
+            self.assertIn("phase_transition", content)
+            self.assertIn("research", content)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

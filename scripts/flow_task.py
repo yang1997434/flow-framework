@@ -10,6 +10,7 @@ Usage:
   flow_task.py list [--archive]
   flow_task.py status
   flow_task.py switch <slug>
+  flow_task.py phase <name> [--slug SLUG]
 """
 from __future__ import annotations
 
@@ -27,6 +28,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common.paths import REPO_ROOT, get_flow_dir, get_current_task_path, get_project_root
 from common.config import load_config
+from common import safe_io
+from common.checkpoint_paths import history_path
 
 
 def slugify(text: str) -> str:
@@ -590,6 +593,158 @@ def cmd_switch(args):
     print(f"cd {shlex.quote(str(target))}")
 
 
+VALID_PHASES = ("triage", "research", "implement", "check", "verify", "sediment")
+
+# Match a frontmatter `phase:` line, capturing the value and any trailing comment.
+# Conservative: only matches inside the frontmatter block (we operate on first match only).
+_PHASE_LINE_RE = re.compile(r"^(phase:\s+)(\S+)(\s*#.*)?$", re.MULTILINE)
+
+
+def _resolve_task_dir_for_phase(slug: str | None) -> Path:
+    """Resolve the target task dir for `flow task phase`.
+
+    If `slug` given, glob `*-{slug}` in active tasks. Else read .current-task.
+    Errors and exits 1 if neither resolves to a single active task.
+    """
+    flow = get_flow_dir()
+    if slug:
+        candidates = list((flow / "tasks").glob(f"*-{slug}"))
+        candidates = [c for c in candidates if c.is_dir() and "archive" not in c.parts]
+        if not candidates:
+            print(f"ERROR: no active task matching slug '{slug}'", file=sys.stderr)
+            sys.exit(1)
+        if len(candidates) > 1:
+            print(f"ERROR: multiple matches: {candidates}", file=sys.stderr)
+            sys.exit(1)
+        return candidates[0]
+    cur = get_current_task_path()
+    if cur is None:
+        print(
+            "ERROR: no active task. Pass --slug <name> or set "
+            ".current-task via `flow task start`.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return cur
+
+
+def cmd_phase(args):
+    """Advance a task's `phase:` frontmatter field.
+
+    Validates against VALID_PHASES, atomic-writes via safe_io.locked_text_rmw,
+    appends a single Execute Log row, and (if .checkpoint/ exists) records a
+    `phase_transition` event in history.jsonl.
+    """
+    new_phase = args.name
+    if new_phase not in VALID_PHASES:
+        print(
+            f"ERROR: unknown phase '{new_phase}'. "
+            f"Valid: {'|'.join(VALID_PHASES)}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    task_dir = _resolve_task_dir_for_phase(args.slug)
+    progress = task_dir / "progress.md"
+    if not progress.is_file():
+        print(f"ERROR: {progress} not found", file=sys.stderr)
+        sys.exit(1)
+
+    # Read current phase to detect no-op + log the transition.
+    fm = _parse_progress_frontmatter(task_dir)
+    old_phase = fm.get("phase") or ""
+    if isinstance(old_phase, list):
+        old_phase = old_phase[0] if old_phase else ""
+    # The existing parser preserves trailing `# comment` text; strip it.
+    if isinstance(old_phase, str) and "#" in old_phase:
+        old_phase = old_phase.split("#", 1)[0].strip()
+    old_phase = (old_phase or "").strip()
+
+    if old_phase == new_phase:
+        print(f"phase already {new_phase}")
+        sys.exit(0)
+
+    # Transform 1: rewrite the frontmatter `phase:` line (first match only).
+    def _rewrite_phase(text: str) -> str:
+        # Operate only inside the frontmatter block — match `^---\n...\n---\n`.
+        m = _FRONTMATTER_RE.match(text)
+        if not m:
+            return text
+        head = text[: m.start()]
+        block = text[m.start():m.end()]
+        tail = text[m.end():]
+        # Replace only the first phase: line within block.
+        new_block, n = _PHASE_LINE_RE.subn(
+            lambda mm: f"{mm.group(1)}{new_phase}{mm.group(3) or ''}",
+            block,
+            count=1,
+        )
+        if n == 0:
+            return text
+        return head + new_block + tail
+
+    wrote = safe_io.locked_text_rmw(progress, _rewrite_phase)
+    if not wrote:
+        # Either lock contention, no-op, or transform returned identical text
+        # (e.g. malformed frontmatter). Re-read to disambiguate.
+        cur_text = progress.read_text(encoding="utf-8")
+        if _rewrite_phase(cur_text) == cur_text:
+            print(
+                f"WARN: could not update phase line in {progress} "
+                f"(missing or malformed frontmatter)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(
+            f"WARN: progress.md is locked or no change; phase update may have raced.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Transform 2: append an Execute Log row.
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    log_row = f"| {ts} | flow task phase | transition: {old_phase or '-'} → {new_phase} | |\n"
+
+    def _append_log(text: str) -> str:
+        # Find `## Execute Log` header. If absent, append a new section.
+        marker = "## Execute Log"
+        idx = text.find(marker)
+        if idx < 0:
+            sep = "" if text.endswith("\n") else "\n"
+            return text + f"{sep}\n{marker}\n\n{log_row}"
+        # Find the next `## ` (start of next section), or EOF.
+        next_idx = text.find("\n## ", idx + len(marker))
+        if next_idx < 0:
+            sep = "" if text.endswith("\n") else "\n"
+            return text + (sep if not text.endswith("\n\n") else "") + log_row
+        # Insert just before next section header. Trim a trailing blank if any.
+        before = text[:next_idx].rstrip() + "\n"
+        after = text[next_idx:]
+        return before + log_row + after
+
+    safe_io.locked_text_rmw(progress, _append_log)
+
+    # Optional: append phase_transition event to history.jsonl.
+    cp = task_dir / ".checkpoint"
+    if cp.is_dir():
+        ok = safe_io.append_jsonl_locked(
+            history_path(task_dir),
+            {
+                "event": "phase_transition",
+                "from": old_phase or None,
+                "to": new_phase,
+                "ts": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+        if not ok:
+            print(
+                f"WARN: history.jsonl lock contention; phase_transition not recorded",
+                file=sys.stderr,
+            )
+
+    print(f"phase: {old_phase or '-'} → {new_phase}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Flow task lifecycle")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -625,6 +780,11 @@ def main():
     p_switch = sub.add_parser("switch")
     p_switch.add_argument("slug")
     p_switch.set_defaults(func=cmd_switch)
+
+    p_phase = sub.add_parser("phase", help="advance task phase")
+    p_phase.add_argument("name", help=f"new phase ({'|'.join(VALID_PHASES)})")
+    p_phase.add_argument("--slug", help="target task slug (default: current)")
+    p_phase.set_defaults(func=cmd_phase)
 
     args = parser.parse_args()
     args.func(args)
