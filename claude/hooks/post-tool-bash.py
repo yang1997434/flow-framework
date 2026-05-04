@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -172,17 +173,63 @@ def _append_under_heading(text: str, heading: str, line: str) -> str:
 
 
 def bump_heartbeat(cwd: Path) -> None:
-    """Best-effort heartbeat increment. Never blocks (timeout 3s, swallowed)."""
+    """Best-effort heartbeat increment. Fire-and-forget so the hook never
+    waits on the autosave subprocess (which can momentarily stall on git ops).
+
+    The child is detached via start_new_session so it survives this hook's
+    exit; stdio is redirected to DEVNULL so it can't write back into the
+    Claude Code transport.
+    """
     if not FLOW_AUTOSAVE.is_file():
         return
     try:
-        subprocess.run(
+        subprocess.Popen(
             [sys.executable, str(FLOW_AUTOSAVE), "heartbeat", "--cwd", str(cwd)],
-            capture_output=True,
-            timeout=3,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
         )
     except Exception:
         pass
+
+
+_SHELL_SEPARATORS = frozenset({
+    "&&", "||", ";", "|", "&", "(", ")", "{", "}",
+    "then", "else", "elif", "fi", "do", "done", "!",
+})
+
+
+def is_git_commit_command(command: str) -> bool:
+    """True if `command` invokes `git commit` somewhere.
+
+    Tokenizes via shlex so multi-space and quoted forms work, and so
+    `git -C path commit -m "..."` and `... && git commit` both match.
+    Requires the `git` token to sit at the start of a command segment
+    (index 0 or right after a shell separator like `&&`, `;`, `|`) so
+    that `echo git commit` does NOT match. Looks for a `commit` token
+    within 6 tokens of `git` — enough slack for `-C <path>`,
+    `--git-dir=...`, `-c key=val`, etc.
+    """
+    if not command:
+        return False
+    try:
+        tokens = shlex.split(command, comments=True, posix=True)
+    except ValueError:
+        # Unbalanced quotes — fall back to whitespace split.
+        tokens = command.split()
+    n = len(tokens)
+    for i, t in enumerate(tokens):
+        if not (t == "git" or t.endswith("/git")):
+            continue
+        # Segment-start guard: avoid `echo git commit`, `printf "%s" git commit`, etc.
+        if i > 0 and tokens[i - 1] not in _SHELL_SEPARATORS:
+            continue
+        for j in range(i + 1, min(i + 7, n)):
+            if tokens[j] == "commit":
+                return True
+    return False
 
 
 def credential_grep(project_root: Path) -> str | None:
@@ -223,7 +270,7 @@ def main():
     bump_heartbeat(cwd)
 
     # Only the rest of the work is for git-commit events.
-    if "git commit" not in command:
+    if not is_git_commit_command(command):
         sys.exit(0)
 
     project_root = find_project_root(cwd)

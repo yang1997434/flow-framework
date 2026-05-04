@@ -15,6 +15,7 @@ import json
 import shutil
 import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -98,10 +99,32 @@ def check_plugins(deps: dict) -> int:
     return missing_required
 
 
-def check_hook_isolation() -> int:
-    """Check that flow hooks are in their own matcher entries (Issue #415 risk).
+def _is_flow_command(cmd: str, repo_marker: str) -> bool:
+    """Heuristic — a hook command belongs to flow if its path is under
+    REPO_ROOT or it explicitly mentions the framework name."""
+    return repo_marker in cmd or "flow-framework" in cmd
 
-    Returns 0 if isolated, 1 if a flow hook shares a matcher entry with another command.
+
+def _entry_owners(entry: dict, repo_marker: str) -> tuple[list[str], list[str]]:
+    """Split an entry's `hooks[].command` strings into (flow_cmds, non_flow_cmds)."""
+    commands = [h.get("command", "") for h in entry.get("hooks", [])]
+    flow = [c for c in commands if _is_flow_command(c, repo_marker)]
+    non_flow = [c for c in commands if not _is_flow_command(c, repo_marker)]
+    return flow, non_flow
+
+
+def check_hook_isolation() -> int:
+    """Check that flow hooks are isolated per Issue #415.
+
+    Two violation classes are detected:
+      A. Intra-entry: a single matcher entry's `hooks` list mixes flow and
+         non-flow commands.
+      B. Cross-entry sibling: multiple entries under the same (event, matcher)
+         key — flow + non-flow co-resident under the same matcher group still
+         executes together and triggers the bug.
+
+    Returns 0 if isolated, 1 if no flow hooks found / settings missing,
+    2 if any class A or B violation was detected.
     """
     section("Hook isolation (Issue #415 mitigation)")
 
@@ -123,21 +146,53 @@ def check_hook_isolation() -> int:
     repo_marker = str(REPO_ROOT)
     violations = 0
     flow_entries_seen = 0
+
+    # --- Pass A: intra-entry mixing ---
     for event_name, entries in hooks.items():
         for entry in entries:
-            commands = [h.get("command", "") for h in entry.get("hooks", [])]
-            flow_cmds = [c for c in commands if repo_marker in c or "flow-framework" in c]
-            non_flow_cmds = [c for c in commands if c not in flow_cmds]
-            if flow_cmds:
-                flow_entries_seen += 1
-                if non_flow_cmds:
-                    fail(
-                        f"{event_name} matcher entry",
-                        f"flow hook shares with: {', '.join(non_flow_cmds[:2])}",
-                    )
-                    violations += 1
-                else:
-                    ok(f"{event_name}", f"isolated · {len(flow_cmds)} flow command(s)")
+            flow_cmds, non_flow_cmds = _entry_owners(entry, repo_marker)
+            if not flow_cmds:
+                continue
+            flow_entries_seen += 1
+            if non_flow_cmds:
+                fail(
+                    f"{event_name} matcher entry",
+                    f"flow hook shares with: {', '.join(non_flow_cmds[:2])}",
+                )
+                violations += 1
+            else:
+                ok(f"{event_name}", f"isolated · {len(flow_cmds)} flow command(s)")
+
+    # --- Pass B: cross-entry siblings under the same matcher ---
+    grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for event_name, entries in hooks.items():
+        for entry in entries:
+            matcher = entry.get("matcher", "")
+            grouped[(event_name, matcher)].append(entry)
+
+    for (event_name, matcher), entries in grouped.items():
+        if len(entries) < 2:
+            continue
+        has_flow = any(_entry_owners(e, repo_marker)[0] for e in entries)
+        has_non_flow = any(_entry_owners(e, repo_marker)[1] for e in entries)
+        if has_flow and has_non_flow:
+            disp = matcher if matcher else "<empty=all tools>"
+            non_flow_cmds = [
+                c[:60]
+                for e in entries
+                for c in _entry_owners(e, repo_marker)[1]
+            ]
+            hint = (
+                f"non-flow neighbour(s): {', '.join(non_flow_cmds[:2])}. "
+                f"Per Issue #415, move them to a different matcher (e.g. "
+                f"split 'Bash' into 'Bash|Write' for one) or drop them if unused."
+            )
+            fail(
+                f"{event_name}[{disp}] sibling entries",
+                f"{len(entries)} entries share matcher; flow + non-flow co-resident — {hint}",
+            )
+            violations += 1
+
     if not flow_entries_seen:
         warn("settings.json", "no flow hooks found — run `flow install`")
         return 1

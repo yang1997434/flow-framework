@@ -208,13 +208,17 @@ def _replace_section_body(text: str, heading: str, body: str) -> str:
 
 
 def bump_heartbeat(cwd: Path) -> None:
+    """Fire-and-forget heartbeat. See post-tool-bash.py for rationale."""
     if not FLOW_AUTOSAVE.is_file():
         return
     try:
-        subprocess.run(
+        subprocess.Popen(
             [sys.executable, str(FLOW_AUTOSAVE), "heartbeat", "--cwd", str(cwd)],
-            capture_output=True,
-            timeout=3,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
         )
     except Exception:
         pass

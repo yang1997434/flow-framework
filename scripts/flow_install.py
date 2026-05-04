@@ -283,24 +283,48 @@ def merge_hooks(existing: dict, new: dict) -> dict:
     return merged
 
 
+def _resolves_into_source(dst: Path, src_abs: Path) -> Path | None:
+    """If `dst` (existing or not) ultimately resolves to a path inside `src_abs`,
+    return the resolved location. Otherwise return None.
+
+    Both args must be absolute — Path.resolve() on a relative `dst` would
+    anchor it to cwd and silently mis-target. Walks parent dirs via
+    .resolve() so a missing dst still gets meaningful resolution based on
+    the deepest existing ancestor.
+    """
+    if not dst.is_absolute() or not src_abs.is_absolute():
+        raise ValueError(f"_resolves_into_source requires absolute paths: dst={dst} src={src_abs}")
+    try:
+        resolved = dst.resolve()
+    except (OSError, RuntimeError):
+        return None
+    if resolved == src_abs or src_abs in resolved.parents:
+        return resolved
+    return None
+
+
 def cmd_render_prompts(args) -> int:
     """Render every .md / .yaml prompt in RENDER_TARGETS through the capability
     registry, writing the rendered output to the user's ~/.claude/ tree.
 
-    Safety: refuses to write if any dst directory is a symlink whose target
-    is inside the source tree (would clobber the templates). install.sh
-    must `rm` such legacy symlinks before invoking this.
+    Safety: refuses to write any file whose resolved destination falls inside
+    the source repo (would clobber the templates). Catches three cases:
+      1. dst_root itself is a symlink into REPO_ROOT
+      2. an intermediate dir under dst_root is a symlink into REPO_ROOT
+      3. dst_file itself is a symlink into REPO_ROOT
+    install.sh removes legacy top-level symlinks before invoking this.
     """
     print(f">> Render prompt templates → ~/.claude/")
 
-    # --- Safety: reject symlink-into-source dst roots
+    repo_abs = REPO_ROOT.resolve()
+
+    # --- Safety: reject symlink-into-source dst roots (early, with clearer msg)
     for src_rel, dst_root in RENDER_TARGETS:
         if dst_root.is_symlink():
-            target = dst_root.resolve()
-            src_abs = (REPO_ROOT / src_rel).resolve()
-            if src_abs == target or src_abs in target.parents or target in src_abs.parents:
+            resolved = _resolves_into_source(dst_root, repo_abs)
+            if resolved is not None:
                 die(
-                    f"{dst_root} is a symlink to {target}, which would clobber the "
+                    f"{dst_root} is a symlink to {resolved}, which would clobber the "
                     f"source templates. Run `rm {dst_root}` first (install.sh handles this)."
                 )
 
@@ -324,6 +348,16 @@ def cmd_render_prompts(args) -> int:
                 continue
             rel_path = src_file.relative_to(src_root)
             dst_file = dst_root / rel_path
+
+            # Per-file safety: refuse if dst_file resolves into REPO_ROOT
+            # (covers nested-dir symlinks and per-file symlinks).
+            danger = _resolves_into_source(dst_file, repo_abs)
+            if danger is not None:
+                die(
+                    f"{dst_file} resolves to {danger} inside the source repo. "
+                    f"Some symlink under {dst_root} points back into the templates; "
+                    f"remove it before re-running install."
+                )
 
             text = src_file.read_text(encoding="utf-8")
             rendered, errors = render(text, registry)

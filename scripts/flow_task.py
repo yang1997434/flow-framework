@@ -110,13 +110,38 @@ def _create_worktree(project_root: Path, slug: str) -> tuple[Path | None, str | 
         return None, "git executable not found"
 
 
-def _remove_worktree(project_root: Path, wt_path: Path) -> tuple[bool, str | None]:
-    """Try to remove a git worktree. Returns (ok, err)."""
+def _worktree_is_dirty(wt_path: Path) -> bool | None:
+    """Return True if worktree has uncommitted changes or untracked files,
+    False if clean, None if status couldn't be determined."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(wt_path), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode != 0:
+            return None
+        return bool(r.stdout.strip())
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+def _remove_worktree(
+    project_root: Path, wt_path: Path, force: bool = False
+) -> tuple[bool, str | None]:
+    """Try to remove a git worktree. Returns (ok, err).
+
+    `force=False` (default) uses `git worktree remove` without --force, which
+    fails if the worktree is dirty — preserving uncommitted work. Callers
+    should detect dirtiness via `_worktree_is_dirty` and decide policy.
+    """
     if not _is_git_repo(project_root):
         return False, "not a git repo"
+    cmd = ["git", "-C", str(project_root), "worktree", "remove", str(wt_path)]
+    if force:
+        cmd.insert(-1, "--force")
     try:
         subprocess.run(
-            ["git", "-C", str(project_root), "worktree", "remove", "--force", str(wt_path)],
+            cmd,
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -336,7 +361,30 @@ def cmd_archive(args):
             worktree_to_remove = location
 
     if worktree_to_remove is not None:
-        ok, err = _remove_worktree(project_root, worktree_to_remove)
+        # Only gate on dirtiness if the worktree IS a git worktree. Otherwise
+        # (user removed .git, manual cleanup, etc.) fall through to remove.
+        if _is_git_repo(worktree_to_remove):
+            dirty = _worktree_is_dirty(worktree_to_remove)
+            force = getattr(args, "force", False)
+            if dirty is True and not force:
+                print(
+                    f"ERROR: worktree {worktree_to_remove} has uncommitted "
+                    f"changes or untracked files. Commit/stash them, or pass "
+                    f"--force to discard and archive anyway.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if dirty is None and not force:
+                print(
+                    f"WARN: could not determine cleanliness of worktree "
+                    f"{worktree_to_remove}; aborting to be safe. Pass --force "
+                    f"to override.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        ok, err = _remove_worktree(
+            project_root, worktree_to_remove, force=getattr(args, "force", False)
+        )
         if not ok:
             print(
                 f"WARN: failed to remove worktree {worktree_to_remove}: {err}; "
@@ -546,6 +594,10 @@ def main():
 
     p_archive = sub.add_parser("archive")
     p_archive.add_argument("slug")
+    p_archive.add_argument(
+        "--force", action="store_true",
+        help="Discard uncommitted changes in the task's worktree (if any) before archiving",
+    )
     p_archive.set_defaults(func=cmd_archive)
 
     p_list = sub.add_parser("list")
