@@ -1,5 +1,46 @@
 # Changelog
 
+## v0.5.3 (2026-05-04)
+
+Patch release with 6 fixes — 2 local L3-dogfood findings + PR #1 (path
+placeholder fix from yang1997434) + 3 GitHub issues from other-machine
+smoke testing.
+
+### Fixed
+
+- **PR #1** (path placeholders) — replaced 11 hardcoded `~/projects/flow-framework/`
+  occurrences across 5 source files with `{{REPO_ROOT}}/` so the renderer
+  in `flow_install.py` substitutes the real install path on every machine.
+  Plus 2 regression checks in `flow_selftest.py`.
+- **L-1 progress.md write race** — `post-tool-bash.append_commit_to_progress`
+  and `post-tool-edit.upsert_files_section` both did unsync'd RMW on
+  `progress.md`; concurrent fires could lose one section's update. Fix:
+  added `safe_io.locked_text_rmw()` helper using fcntl.LOCK_EX; both
+  hooks routed through it. New unit test verifies 8 threads × 25
+  appends produce 200 distinct entries with no loss.
+- **L-2 `/flow:pause` Step 6 task_path bug** — prompt did
+  `Path(".flow/tasks") / Path(.current-task content)` but `.current-task`
+  already contains the full relative path. Fixed to read directly.
+- **Issue #6 `flow doctor` context-mode false-negative** — added a third
+  positive signal: read `~/.claude/settings.json` `enabledPlugins` and
+  match `context-mode@context-mode`. Doctor no longer warns on green
+  installs.
+- **Issue #3 `flow task archive` slug + finish ordering** — `archive`
+  now strips `^\d{2}-\d{2}-` prefix so both dated and bare-slug forms
+  work. `finish` no longer clears `.current-task` (leaves it for
+  `archive`). The natural copy-paste from `flow task list` now works.
+- **Issue #2 `/flow:codex-review` non-git fallback** — detects whether
+  cwd is a git repo and falls back to `codex exec --skip-git-repo-check -`
+  with a content-built prompt when not. Restores the "any project" promise.
+
+### Tests
+
+- Suite: 135 → 143 (+4 from `LockedTextRmw` test class, +4 from new
+  `test_flow_task_cli.py` covering Issue #3 archive slug + finish
+  ordering).
+- Selftest now rejects rendered files containing `{{REPO_ROOT}}` or
+  `projects/flow-framework` — regression guard from PR #1.
+
 ## v0.5.2 (2026-05-04)
 
 Patch release fixing a test-isolation bug.
