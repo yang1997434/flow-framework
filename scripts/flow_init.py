@@ -29,8 +29,8 @@ SUBDIRS = [
 ]
 
 
-GITIGNORE_BLOCK = """
-# Flow Framework — runtime + machine-local + per-user workspace
+GITIGNORE_FLOW_BLOCK = """\
+# Flow Framework runtime + per-task checkpoint
 .flow/.runtime/
 .flow/.current-task
 .flow/config.local.yaml
@@ -38,7 +38,22 @@ GITIGNORE_BLOCK = """
 !.flow/workspace/.gitkeep
 .flow/**/*.tmp
 .flow/**/.backup-*
+.flow/tasks/*/.checkpoint/
 """
+
+
+def ensure_gitignore_block(project_root: Path) -> bool:
+    """Idempotently add the flow .gitignore block to project .gitignore.
+    Returns True if the file was modified, False if no change needed."""
+    gi = project_root / ".gitignore"
+    existing = gi.read_text(encoding="utf-8") if gi.is_file() else ""
+    if ".flow/tasks/*/.checkpoint/" in existing:
+        return False  # already there
+    new_block = GITIGNORE_FLOW_BLOCK
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    gi.write_text(existing + "\n" + new_block, encoding="utf-8")
+    return True
 
 
 def main():
@@ -80,11 +95,7 @@ def main():
         print(f"   [write] {cfg_target.relative_to(project_root)}")
 
     # 3. Append .gitignore block (if .gitignore exists, append; else create)
-    gitignore = project_root / ".gitignore"
-    existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
-    if "Flow Framework" not in existing:
-        with gitignore.open("a", encoding="utf-8") as f:
-            f.write(GITIGNORE_BLOCK)
+    if ensure_gitignore_block(project_root):
         print(f"   [append] .gitignore")
     else:
         print(f"   [skip] .gitignore (already has Flow block)")
