@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -112,6 +113,12 @@ Available slash commands: /flow:start /flow:continue /flow:resume /flow:finish /
 def build_compact_resume_block(task_dir: Path) -> str | None:
     """If .checkpoint/ exists, build the <flow-resumed-from-compact> block.
     Returns None if no checkpoint files present (fall back to startup behavior)."""
+    # Guard BEFORE calling intent_path/mechanical_path — those helpers create
+    # .checkpoint/ via mkdir(parents=True, exist_ok=True), which would have a
+    # read-side side effect of polluting the task dir on a no-checkpoint read.
+    cp = task_dir / ".checkpoint"
+    if not cp.is_dir():
+        return None
     intent = intent_path(task_dir)
     mech = mechanical_path(task_dir)
     if not intent.is_file() and not mech.is_file():
@@ -121,9 +128,10 @@ def build_compact_resume_block(task_dir: Path) -> str | None:
 
     if intent.is_file():
         text = intent.read_text(encoding="utf-8", errors="replace")
-        # Truncate body to ~1500 tokens (roughly 6000 chars) if huge
+        # Truncate body to ~1500 tokens (roughly 6000 chars) if huge.
+        # Clip at the last full line break so we never cut mid-line.
         if len(text) > 6000:
-            text = text[:6000] + "\n\n[... truncated, see full file at " + str(intent) + "]"
+            text = text[:6000].rsplit("\n", 1)[0] + "\n\n[... truncated, see full file at " + str(intent) + "]"
         parts.append("## Last Intent")
         parts.append(text.rstrip())
 
@@ -150,17 +158,21 @@ def build_compact_resume_block(task_dir: Path) -> str | None:
 
     if intent.is_file():
         try:
-            head = intent.read_text(encoding="utf-8", errors="replace").splitlines()
-            for line in head[:20]:
-                if line.startswith("ts:"):
-                    intent_ts = line.split(":", 1)[1].strip()
-                    break
+            text_head = intent.read_text(encoding="utf-8", errors="replace")
+            m = re.match(r"\A---\s*\n(.*?)\n---\s*\n", text_head, re.DOTALL)
+            if m:
+                # No PyYAML in this project — use a tolerant regex over the
+                # frontmatter block. Handles `ts: 2026-...`, `ts: '2026-...'`,
+                # `ts: "2026-..."` (single line, no nested mapping).
+                ts_match = re.search(
+                    r"^\s*ts:\s*['\"]?([^'\"\n]+?)['\"]?\s*$",
+                    m.group(1),
+                    re.MULTILINE,
+                )
+                if ts_match:
+                    intent_ts = ts_match.group(1).strip()
         except OSError:
             pass
-
-    parts.append("\n## Resume Mode")
-    parts.append("MANUAL — present the briefing above to the user, then await their direction.")
-    parts.append("Do NOT auto-execute next actions.")
 
     if intent_ts and mech_ts:
         try:
@@ -175,6 +187,11 @@ def build_compact_resume_block(task_dir: Path) -> str | None:
                 )
         except ValueError:
             pass
+
+    # Resume Mode last — directive should be the final thing the model reads.
+    parts.append("\n## Resume Mode")
+    parts.append("MANUAL — present the briefing above to the user, then await their direction.")
+    parts.append("Do NOT auto-execute next actions.")
 
     parts.append("</flow-resumed-from-compact>")
     return "\n".join(parts)
@@ -232,7 +249,10 @@ def main():
             block = build_compact_resume_block(task_dir)
             if block:
                 parts.append("\n" + block)
-                # Append history event + roll over nudge window
+                # Append history event + roll over nudge window.
+                # Narrow except: tolerate filesystem / encoding / lock-timeout
+                # issues but let truly unexpected errors propagate (consistent
+                # with run_skill_diff_silently above).
                 try:
                     append_jsonl_locked(history_path(task_dir), {
                         "schema_version": 1,
@@ -241,7 +261,7 @@ def main():
                         "mode": "manual",
                     })
                     rotate_window(task_dir.name)
-                except Exception:
+                except (OSError, json.JSONDecodeError, ValueError):
                     pass
 
     parts.append("</flow-context>")

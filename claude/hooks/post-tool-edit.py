@@ -306,14 +306,35 @@ def main():
 
     file_path = extract_file_path(tool_name, tool_input)
     if not file_path:
+        if nudge_text:
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": nudge_text,
+                }
+            }, ensure_ascii=False), flush=True)
         sys.exit(0)
 
     project_root = find_project_root(cwd)
     if project_root is None:
+        if nudge_text:
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": nudge_text,
+                }
+            }, ensure_ascii=False), flush=True)
         sys.exit(0)
 
     task = find_active_task(project_root)
     if task is None:
+        if nudge_text:
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": nudge_text,
+                }
+            }, ensure_ascii=False), flush=True)
         sys.exit(0)
 
     log = touched_log_path(cwd)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -78,6 +79,5 @@ def append_jsonl_locked(path: Path, record: dict, timeout_s: float = 2.0) -> boo
 
 def _mkstemp_in(dir_: Path, prefix: str, suffix: str) -> tuple[int, str]:
     """Wrapper around tempfile.mkstemp pinned to a specific dir."""
-    import tempfile
     fd, name = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=str(dir_))
     return fd, name

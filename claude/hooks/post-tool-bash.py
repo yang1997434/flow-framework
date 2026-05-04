@@ -324,6 +324,16 @@ def _maybe_nudge_and_update_mechanical(
         return None
 
 
+def _emit_post_tool_output(additional_context: str) -> None:
+    """Emit the single allowed PostToolUse JSON output."""
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": additional_context,
+        }
+    }, ensure_ascii=False), flush=True)
+
+
 def main():
     try:
         hook_input = json.loads(sys.stdin.read() or "{}")
@@ -353,22 +363,12 @@ def main():
     # Only the rest of the work is for git-commit events.
     if not is_git_commit_command(command):
         if nudge_text:
-            print(json.dumps({
-                "hookSpecificOutput": {
-                    "hookEventName": "PostToolUse",
-                    "additionalContext": nudge_text,
-                }
-            }, ensure_ascii=False), flush=True)
+            _emit_post_tool_output(nudge_text)
         sys.exit(0)
 
     if project_root is None:
         if nudge_text:
-            print(json.dumps({
-                "hookSpecificOutput": {
-                    "hookEventName": "PostToolUse",
-                    "additionalContext": nudge_text,
-                }
-            }, ensure_ascii=False), flush=True)
+            _emit_post_tool_output(nudge_text)
         sys.exit(0)
 
     # Lv1 trickle — append commit to progress.md (best-effort, never blocks).
@@ -400,13 +400,7 @@ def main():
             "</flow-credential-warning>"
         )
 
-    output = {
-        "hookSpecificOutput": {
-            "hookEventName": "PostToolUse",
-            "additionalContext": "\n\n".join(parts),
-        }
-    }
-    print(json.dumps(output, ensure_ascii=False), flush=True)
+    _emit_post_tool_output("\n\n".join(parts))
 
 
 if __name__ == "__main__":

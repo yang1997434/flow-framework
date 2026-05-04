@@ -3,6 +3,14 @@
 Decides whether to inject a 'consider /flow:pause' reminder into the model's
 next turn. State per task slug (not per cwd) so multi-task projects don't
 collide. State at ~/.flow/.runtime/nudge-state-<task_slug>.json.
+
+v0.5 assumes a single Claude Code session per FLOW_HOME. State writes are
+last-writer-wins (atomic_write_json); concurrent multi-session writes are
+not protected. v0.6 multi-session may need fcntl.flock around _write_state.
+
+acknowledge() / maybe_nudge_text() rely on rotate_window() being called by
+session-start.py compact-matcher (Task 10). If that wiring breaks, ack from
+window N silences window N+1 forever — fixable by deleting the state file.
 """
 from __future__ import annotations
 
@@ -111,9 +119,21 @@ def acknowledge(task_slug: str, via: str) -> None:
 
 def derive_window_id(task_slug: str) -> str:
     """Produce a stable cycle id for the current window. Caller (SessionStart
-    on `compact`) is expected to roll over by calling rotate_window."""
+    on `compact`) is expected to roll over by calling rotate_window.
+
+    Persists the freshly-minted id on first call so subsequent invocations
+    return the same value until rotate_window mints a new one. Without this,
+    every PostToolUse hook would mint a fresh ts-based id, defeating the
+    per-window throttle in maybe_nudge_text.
+    """
     state = _read_state(task_slug)
-    return state.get("current_window_id") or f"cycle-{datetime.now().astimezone().isoformat(timespec='seconds')}"
+    existing = state.get("current_window_id")
+    if existing:
+        return existing
+    new_id = f"cycle-{datetime.now().astimezone().isoformat(timespec='seconds')}"
+    state["current_window_id"] = new_id
+    _write_state(task_slug, state)
+    return new_id
 
 
 def rotate_window(task_slug: str) -> str:
