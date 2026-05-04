@@ -100,6 +100,18 @@
           }
         ]
       }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 {{REPO_ROOT}}/claude/hooks/pre-compact.py",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

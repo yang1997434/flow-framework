@@ -76,9 +76,9 @@ class HookTemplateRendersValidJson(unittest.TestCase):
                 for h in entry.get("hooks", []):
                     if h.get("command"):
                         all_commands.append(h["command"])
-        self.assertEqual(len(all_commands), 9,
-                         "expect 9 commands: 3x SessionStart + 1 UserPromptSubmit + 1 PreToolUse(Task) "
-                         "+ 3 PostToolUse(Bash/Edit/Write) + 1 Stop")
+        self.assertEqual(len(all_commands), 10,
+                         "expect 10 commands: 3x SessionStart + 1 UserPromptSubmit + 1 PreToolUse(Task) "
+                         "+ 3 PostToolUse(Bash/Edit/Write) + 1 Stop + 1 PreCompact")
         for cmd in all_commands:
             self.assertIn("/data/Claude/flow-framework", cmd)
             self.assertNotIn("{{REPO_ROOT}}", cmd, "all placeholders must be replaced")

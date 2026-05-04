@@ -237,6 +237,7 @@ FLOW_OWNED_MARKERS = (
     "claude/hooks/pre-tool-task.py",
     "claude/hooks/post-tool-bash.py",
     "claude/hooks/post-tool-edit.py",
+    "claude/hooks/pre-compact.py",
     "claude/hooks/stop.py",
 )
 
