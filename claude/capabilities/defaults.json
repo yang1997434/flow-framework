@@ -190,6 +190,18 @@
       "description": "Cross-cutting — cross-task weekly review (commits / work patterns / quality trends). User-triggered or scheduled via /loop weekly. Fills the per-task-vs-cross-task gap (Phase 4 sediment is per-task; retro is per-week)",
       "requires_cli": "gstack",
       "skip_if_not_available": true
+    },
+
+    "_v0_7_phase2_additions": "Phase 2 capabilities added in v0.7.0 (wave dispatch)",
+    "wave_planning": {
+      "default": "flow:flow-wave-planner",
+      "description": "Phase 2 — decompose plan into waves (mechanical disjointness + LLM concept-veto + cache)",
+      "fallback_to": "subagent_dispatch"
+    },
+    "wave_dispatch": {
+      "default": "flow:flow-wave-runner",
+      "description": "Phase 2 — execute one wave: paired implementer/spec-reviewer in parallel, sequential merge with FILES_CHANGED verification, code-quality reviewer at wave end",
+      "fallback_to": "subagent_dispatch"
     }
   },
 

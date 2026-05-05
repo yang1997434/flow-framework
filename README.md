@@ -6,7 +6,7 @@
 
 A composable framework that wraps your existing skill ecosystem (superpowers / impeccable / gstack / pr-review-toolkit / planning-with-files / Trellis-style file persistence) into a coherent 4-phase workflow with automatic memory promotion and pitfall capture.
 
-**Status**: v0.3.0-alpha. Foundation laid; expect iteration as real projects expose gaps.
+**Status**: v0.7.0. Production-ready core: 4-phase workflow, capability registry, and dependency-aware parallel subagent dispatch.
 
 ## What it does
 
@@ -20,6 +20,10 @@ A composable framework that wraps your existing skill ecosystem (superpowers / i
 | **Pitfall library** | Standalone `pitfalls/` tree + `trigger_paths` auto-loading |
 | **Credential safety** | Vault never holds secrets; `~/.flow/credentials.local` + grep self-check |
 | **Remote SSH ready** | Relative paths, no GUI deps, machine-id-keyed runtime |
+
+**v0.7+ feature highlights**:
+
+- **v0.7+: dependency-aware parallel subagent dispatch** — declare per-task `writes:` glob in plans; framework verifies disjointness, runs independent tasks in parallel waves with sequential cross-wave integration. See `docs/superpowers/specs/2026-05-05-v0.7-parallel-dispatch-design.md`.
 
 ## Quick start
 
@@ -107,5 +111,4 @@ MIT (this framework). Underlying tools have their own licenses.
 
 ## Status
 
-v0.3.0-alpha. Designed, partially implemented, not yet tested on a real coding project.
-Real-project shakedown will produce v0.3.1.
+v0.7.0. Capability registry stable (35 caps); v0.6.x phase orchestration battle-tested; v0.7 wave-dispatch landed for parallel implementer dispatch with disjointness verification. See `CHANGELOG.md` for release history.

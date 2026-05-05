@@ -15,7 +15,20 @@ blocked_by: []
 
 ## Plan
 
-<!-- TEMPLATE: 未填写。Phase 1 末由主 session 写入：sub-agent scope 划分（互不重叠）或 "(single, main session implements)"。 -->
+<!-- TEMPLATE: 未填写。Phase 1 末由主 session 写入：sub-agent scope 划分（互不重叠）或 "(single, main session implements)"。
+
+OPTIONAL v0.7 wave-dispatch — 添加结构化 task 块：
+
+### Tasks
+```yaml
+tasks:
+  - id: task-1-foo
+    writes: [src/foo.py]
+  - id: task-2-bar
+    writes: [src/bar.py]
+```
+
+Phase 2 会自动调 wave_planning 切并行 wave。details: docs/superpowers/specs/2026-05-05-v0.7-parallel-dispatch-design.md -->
 
 ## Execute Log
 

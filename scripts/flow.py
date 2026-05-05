@@ -14,6 +14,8 @@ Usage:
   flow doctor            -- environment consistency diagnostic (static)
   flow selftest [scope]  -- functional verification (dynamic; scope: hooks/init/task/plugins/doctor/all)
   flow skill-diff <sub>  -- compare new plugins against capability registry (snapshot/diff/show/clear/reset-cache)
+  flow waves <subcmd>    -- preview/inspect wave decomposition
+                            (--preview / --show / --invalidate <slug>)
   flow version           -- show version
 """
 from __future__ import annotations
@@ -61,6 +63,7 @@ def main():
         "doctor": "flow_doctor.py",
         "selftest": "flow_selftest.py",
         "skill-diff": "flow_skill_diff.py",
+        "waves": "flow_waves.py",
     }
 
     if cmd in ("version", "--version", "-v"):
