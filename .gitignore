@@ -29,3 +29,6 @@ tests/temp/
 
 # Claude Agent SDK local scratch (ephemeral worktrees, etc.)
 .claude/
+
+# Worktrees (subagent-driven feature isolation)
+.worktrees/
