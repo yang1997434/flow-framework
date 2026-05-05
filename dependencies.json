@@ -55,5 +55,28 @@
         "capabilities": ["behavioral_guidelines"]
       }
     ]
+  },
+
+  "external_skills": {
+    "_comment": "Skill bundles that are NOT distributed via the Claude plugin marketplace system. They install as loose skill directories under ~/.claude/skills/<bundle>/ and are auto-discovered. Capability mappings in claude/capabilities/defaults.json reference them (e.g. gstack:codex for cross_model_*).",
+    "optional": [
+      {
+        "name": "gstack",
+        "source": "https://github.com/garrytan/gstack.git",
+        "install_path": "~/.claude/skills/gstack",
+        "install": "git clone https://github.com/garrytan/gstack.git ~/.claude/skills/gstack && cd ~/.claude/skills/gstack && bun install && bun run build",
+        "requires_cli": ["bun", "codex"],
+        "capabilities": [
+          "cross_model_consult",
+          "cross_model_review",
+          "cross_model_challenge",
+          "ui_visual_review",
+          "deploy_chain",
+          "browser_qa"
+        ],
+        "provides_slash_commands": ["/codex", "/review", "/browse", "/qa", "/ship", "/canary", "/design-review"],
+        "note": "defaults.json model_roles.research.fallback and several capabilities.cross_model_* assume gstack:codex availability. Without gstack, those capabilities silently degrade to the codex CLI directly (still works for review, but loses the prompt scaffolding for review/challenge/consult modes)."
+      }
+    ]
   }
 }

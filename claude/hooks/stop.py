@@ -5,8 +5,9 @@ v0.4 change: raw session persistence is delegated to the context-mode plugin
 (Layer 1). flow's stop.py no longer writes a raw journal entry. Instead it
 queues an Lv3 semantic distill via scripts/flow_autosave.py — which itself
 does NOT call an LLM (hook timeout / cost risk). The orchestrator only writes
-a "distill queued" marker to the active task's progress.md `## Sediment Notes`
-section and appends a record to ~/.flow/.runtime/distill-queue.jsonl. A later
+a "distill queued" breadcrumb to ~/.flow/.runtime/autosave-log-<cwd>.md
+(out-of-band of progress.md so it doesn't fool phase determination) and
+appends a record to ~/.flow/.runtime/distill-queue.jsonl. A later
 SessionStart / explicit slash command can drive the actual LLM distillation.
 
 Best-effort: if anything fails, exit silently (don't block session close).

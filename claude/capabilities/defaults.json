@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "version": 1,
-  "_comment": "Built-in defaults for capability → concrete skill mapping AND model role → concrete model id. Override at: ~/.flow/config.yaml (user global) → <project>/.flow/config.yaml (project) → <project>/.flow/config.local.yaml (project local). install-time render substitutes {{capability:X}} and {{model:X}} placeholders in prompt files (claude/{commands,skills}/flow/*.md) using this resolution chain.",
+  "_comment": "Built-in defaults for capability → concrete skill mapping AND model role → model alias (sonnet/opus/haiku). Override at: ~/.flow/config.yaml (user global) → <project>/.flow/config.yaml (project) → <project>/.flow/config.local.yaml (project local). install-time render substitutes {{capability:X}} and {{model:X}} placeholders in prompt files (claude/{commands,skills}/flow/*.md). model_roles.*.default holds the alias (Agent tool's `model` param is enum-restricted) — concrete IDs (and 1M-context variants) are picked at runtime via ANTHROPIC_DEFAULT_*_MODEL env vars in ~/.claude/settings.json. Per-role `fallback` field documents the retry alias when primary dispatch fails (consumed by start.md / SKILL.md protocol text, not by resolve_model itself).",
 
   "capabilities": {
     "brainstorm": {
@@ -81,24 +81,27 @@
 
   "model_roles": {
     "triage": {
-      "default": "claude-haiku-4-5",
-      "description": "Cheap classification (task complexity, keyword detection)"
+      "default": "haiku",
+      "description": "Cheap classification (task complexity, keyword detection). Alias resolves via ANTHROPIC_DEFAULT_HAIKU_MODEL env var."
     },
     "research": {
-      "default": "claude-sonnet-4-6",
-      "description": "Sub-agent research / scanning / cross-file inspection"
+      "default": "sonnet",
+      "fallback": "opus",
+      "description": "Sub-agent research / scanning / cross-file inspection. Alias resolves via ANTHROPIC_DEFAULT_SONNET_MODEL (1M variant recommended). On dispatch failure (model unavailable), retry with `opus` — never downgrade to `haiku`."
     },
     "plan": {
-      "default": "claude-sonnet-4-6",
-      "description": "Plan writing + ADR drafting"
+      "default": "sonnet",
+      "fallback": "opus",
+      "description": "Plan writing + ADR drafting. Alias resolves via env var. On failure, fall back to opus."
     },
     "implement": {
-      "default": "claude-opus-4-7",
-      "description": "Code generation / refactoring / debugging"
+      "default": "opus",
+      "description": "Code generation / refactoring / debugging. Alias resolves via ANTHROPIC_DEFAULT_OPUS_MODEL env var."
     },
     "review": {
-      "default": "claude-sonnet-4-6",
-      "description": "Self-review of diffs (when cross_model_review skipped)"
+      "default": "sonnet",
+      "fallback": "opus",
+      "description": "Self-review of diffs (when cross_model_review skipped). Alias resolves via env var. On failure, fall back to opus."
     }
   }
 }

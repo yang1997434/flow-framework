@@ -99,6 +99,47 @@ def check_plugins(deps: dict) -> int:
     return missing_required
 
 
+def check_external_skills(deps: dict) -> int:
+    """Diagnose external skill bundles (loose-skill installs not in the
+    marketplace+plugin system). Reports presence of install_path and
+    availability of each required CLI declared on the entry.
+
+    Returns count of REQUIRED entries missing.
+    """
+    external = deps.get("external_skills", {})
+    if not external:
+        return 0  # silent — nothing declared
+    section("External skills (loose-skill bundles)")
+    missing_required = 0
+    for tier_name, required in (("required", True), ("optional", False)):
+        for entry in external.get(tier_name, []):
+            name = entry["name"]
+            install_path = Path(entry["install_path"]).expanduser()
+            present = install_path.is_dir()
+
+            cli_missing = [c for c in entry.get("requires_cli", []) if not shutil.which(c)]
+            caps = ", ".join(entry.get("capabilities", []))
+            tier_label = "" if required else " (optional)"
+
+            if present and not cli_missing:
+                ok(f"{name}{tier_label}", f"path: {install_path} · capabilities: {caps}")
+            elif present and cli_missing:
+                msg = f"path present but missing CLI: {', '.join(cli_missing)}"
+                if required:
+                    fail(f"{name}", msg)
+                    missing_required += 1
+                else:
+                    warn(f"{name}{tier_label}", msg)
+            else:
+                hint = f"not at {install_path} — `flow install install-external-skills` (or see dependencies.json)"
+                if required:
+                    fail(f"{name}", hint)
+                    missing_required += 1
+                else:
+                    warn(f"{name}{tier_label}", hint)
+    return missing_required
+
+
 def _is_flow_command(cmd: str, repo_marker: str) -> bool:
     """Heuristic — a hook command belongs to flow if its path is under
     REPO_ROOT or it explicitly mentions the framework name."""
@@ -279,19 +320,21 @@ def main():
 
     missing_cmds = check_system_commands(deps)
     missing_plugins = check_plugins(deps)
+    missing_external = check_external_skills(deps)
     iso_status = check_hook_isolation()
     check_user_local_overrides(deps)
     check_context_mode_running()
 
+    total_missing = missing_cmds + missing_plugins + missing_external
     print()
-    if missing_cmds == 0 and missing_plugins == 0 and iso_status == 0:
+    if total_missing == 0 and iso_status == 0:
         print(f"{GREEN}>> All checks passed.{RESET}")
         sys.exit(0)
     if iso_status == 2:
         print(f"{RED}>> Hook isolation FAILED (Issue #415 risk).{RESET}")
         sys.exit(2)
-    if missing_cmds + missing_plugins > 0:
-        print(f"{RED}>> {missing_cmds + missing_plugins} required dep(s) missing.{RESET}")
+    if total_missing > 0:
+        print(f"{RED}>> {total_missing} required dep(s) missing.{RESET}")
         sys.exit(1)
     print(f"{YELLOW}>> Some optional checks emitted warnings.{RESET}")
     sys.exit(0)

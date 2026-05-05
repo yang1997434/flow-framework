@@ -61,7 +61,12 @@ Now invoke the **flow-phase1-plan** skill (if loaded) or run inline:
 
 1. **Brainstorm** — Use `{{capability:brainstorm}}` skill. One question at a time, fill prd.md.
 2. **(UI tasks)** — Also invoke `{{capability:ux_brief}}` for UX brief.
-3. **(Research needed)** — Dispatch parallel `general-purpose` sub-agents (model: `{{model:research}}`) to write to `${TASK_DIR}/research/<topic>.md`. Return only summaries to main session.
+3. **(Research needed)** — Dispatch parallel `general-purpose` sub-agents to write to `${TASK_DIR}/research/<topic>.md`. Return only summaries to main session.
+
+   **Sub-agent dispatch protocol (CRITICAL)**: the Agent tool's `model` parameter is enum-restricted (only accepts `sonnet|opus|haiku` aliases — NOT full model IDs). Aliases resolve to concrete IDs via `ANTHROPIC_DEFAULT_*_MODEL` env vars in `~/.claude/settings.json` (1M-context variants recommended).
+   - **Primary**: pass alias `{{model:research}}`.
+   - **Fallback**: if a sub-agent dispatch returns "model not found / no access", retry that single sub-agent ONCE with the alias `opus` (defined as `model_roles.research.fallback` in `claude/capabilities/defaults.json`). Opus alias also resolves to a 1M-context variant.
+   - **Never** route research sub-agents to the haiku alias — research depth requires Sonnet+ class.
 4. **ADR-lite** — When a major decision is made, fill the Decision section in prd.md with Context / Decision / Consequences / Revisit triggers.
 5. **(High-reversal-cost decision)** — Invoke `{{capability:cross_model_consult}}` (mode={{capability:cross_model_consult.args.mode}}) for cross-model second opinion.
 

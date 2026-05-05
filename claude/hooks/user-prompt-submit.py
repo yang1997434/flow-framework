@@ -43,6 +43,20 @@ def find_project_flow(start: Path) -> Path | None:
 
 SECTION_NAMES = ["Plan", "Execute Log", "Verify Report", "Sediment Notes"]
 
+# Match old-format autosave breadcrumbs that may linger in pre-fix progress.md
+# files. Pattern variants observed in pre-fix files:
+#   - [YYYY-MM-DD HH:MM] distill queued
+#   - [YYYY-MM-DD HH:MM] distill queued (trigger=stop)
+#   - [YYYY-MM-DD HH:MM] distill queued (trigger=heartbeat) — after 70 tool calls
+# The trailing `.*$` consumes the entire line up to the newline so the section
+# is fully erased from the "filled" check (otherwise residual trigger/note text
+# remained, fooling is_section_filled). Post-fix, autosave writes to
+# ~/.flow/.runtime/autosave-log-<hash>.md instead, but old files may persist.
+AUTOSAVE_BREADCRUMB_RE = re.compile(
+    r"^- \[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\] distill queued.*$",
+    re.MULTILINE,
+)
+
 
 def extract_section(text: str, name: str) -> str:
     """Return content of `## <name>` section (between this header and next ## or EOF)."""
@@ -52,29 +66,40 @@ def extract_section(text: str, name: str) -> str:
 
 
 def is_section_filled(content: str) -> bool:
-    """A section is 'filled' iff it has non-template, non-comment content.
+    """A section is 'filled' iff it has non-template, non-comment, non-autosave content.
 
     Strategy:
-      1. Strip HTML comments
-      2. Strip blank lines
-      3. Check remaining content has any non-trivial text
+      1. Strip HTML comments (incl. <!-- TEMPLATE: ... --> blocks)
+      2. Strip autosave breadcrumb lines (defense-in-depth — autosave now writes
+         to ~/.flow/.runtime/, but pre-fix progress.md files may still contain
+         "distill queued" lines that would otherwise look like real content)
+      3. Strip blank lines
+      4. Check remaining content has any non-trivial text
     """
-    # Remove HTML comments (including the TEMPLATE: marker block)
     no_comments = re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL)
-    # Remove blank-only lines
-    lines = [line.rstrip() for line in no_comments.splitlines() if line.strip()]
+    no_autosave = AUTOSAVE_BREADCRUMB_RE.sub("", no_comments)
+    lines = [line.rstrip() for line in no_autosave.splitlines() if line.strip()]
     return len(lines) > 0
 
 
 def determine_phase(progress_md: Path) -> str:
     """Detect current phase by checking which sections have user-filled content.
 
-    Phase mapping:
-      - Plan empty               → phase1-plan
-      - Plan filled, Execute empty → phase2-execute
-      - Execute filled, Verify empty → phase3-finish
-      - Verify filled, Sediment empty → phase4-sediment
-      - All four filled          → done
+    Phase mapping (REQUIRES sequential filling — a later section being filled
+    no longer skips ahead past empty earlier sections):
+      - Plan empty                                   → phase1-plan
+      - Plan filled, Execute empty                    → phase2-execute
+      - Plan + Execute filled, Verify empty           → phase3-finish
+      - Plan + Execute + Verify filled, Sediment empty → phase4-sediment
+      - All four filled                              → done
+
+    Why sequential: prior version returned `done` whenever Sediment Notes had
+    *any* non-template content, even if Plan was empty. That allowed
+    automated breadcrumbs (or stray writes) to a downstream section to fool
+    the phase determination. Sequential AND-chain blocks that.
+
+    Future enhancement: optional `<!-- phaseN-approved -->` markers for
+    explicit user-gating. Currently relies on sequential filling alone.
     """
     if not progress_md.is_file():
         return "phase1-plan"
@@ -82,13 +107,18 @@ def determine_phase(progress_md: Path) -> str:
 
     sections = {name: is_section_filled(extract_section(text, name)) for name in SECTION_NAMES}
 
-    if sections["Sediment Notes"]:
+    plan_filled     = sections["Plan"]
+    execute_filled  = plan_filled and sections["Execute Log"]
+    verify_filled   = execute_filled and sections["Verify Report"]
+    sediment_filled = verify_filled and sections["Sediment Notes"]
+
+    if sediment_filled:
         return "done"
-    if sections["Verify Report"]:
+    if verify_filled:
         return "phase4-sediment"
-    if sections["Execute Log"]:
+    if execute_filled:
         return "phase3-finish"
-    if sections["Plan"]:
+    if plan_filled:
         return "phase2-execute"
     return "phase1-plan"
 

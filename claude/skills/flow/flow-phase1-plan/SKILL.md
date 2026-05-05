@@ -45,13 +45,18 @@ Trigger conditions:
 For each topic:
   Agent(
     subagent_type: "general-purpose",
-    model: "{{model:research}}",
+    model: "{{model:research}}",                  # primary alias
     description: "Research <topic>",
     prompt: "Research <specific question>; persist findings to {TASK_DIR}/research/<topic-slug>.md. Return only 1-line summary + file path."
   )
 ```
 
 Multiple sub-agents in **one tool message** to run in parallel.
+
+**Dispatch protocol (CRITICAL)**: Agent tool's `model` parameter is **enum-restricted** (only `sonnet|opus|haiku` aliases, no full IDs). Aliases resolve via `ANTHROPIC_DEFAULT_*_MODEL` env vars in `~/.claude/settings.json` — point them at the 1M-context variant for long-research depth.
+- **Fallback chain**: if a dispatch returns "model not found / no access" error (e.g. env var pinned to a stale ID), retry that single sub-agent ONCE with the alias `opus` (recorded as `model_roles.research.fallback` in `defaults.json`). Opus alias also resolves to a 1M-context variant.
+- **Never** route research sub-agents to the haiku alias — research depth requires Sonnet+ class.
+- **Anti-regression**: this protocol replaces the older "render full ID into `model:`" approach which was incompatible with the enum-restricted tool param.
 
 After sub-agents return:
 - Read each `research/*.md` (or just the summary)
