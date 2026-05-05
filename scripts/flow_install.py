@@ -409,6 +409,86 @@ def cmd_render_prompts(args) -> int:
     return 0
 
 
+def cmd_install_external_skills(args) -> int:
+    """Install loose-skill bundles declared under deps['external_skills'].
+
+    These are NOT marketplace plugins — they install by cloning a git repo
+    into ~/.claude/skills/<name>/ and (optionally) running a build command.
+    Required CLIs (e.g. bun) are checked first and treated as a hard skip
+    if missing. Idempotent: skip if install_path already exists.
+    """
+    deps = load_deps()
+    print(f">> Install external skill bundles")
+
+    external = deps.get("external_skills", {})
+    if not external:
+        ok("external_skills", f"({DIM}none declared{RESET})")
+        return 0
+
+    failed = 0
+    for tier_name, required in (("required", True), ("optional", False)):
+        for entry in external.get(tier_name, []):
+            name = entry["name"]
+            install_path = Path(entry["install_path"]).expanduser()
+
+            if install_path.is_dir():
+                ok(f"{name}", f"({DIM}already installed at {install_path}{RESET})")
+                continue
+
+            install_cmd = entry.get("install", "")
+            if not install_cmd:
+                msg = "no install command specified in dependencies.json"
+                if required:
+                    fail(f"{name}", msg)
+                    failed += 1
+                else:
+                    warn(f"{name}", msg)
+                continue
+
+            # Verify required CLIs before attempting install.
+            cli_missing = [c for c in entry.get("requires_cli", []) if not shutil.which(c)]
+            if cli_missing:
+                msg = f"missing CLI: {', '.join(cli_missing)}"
+                if required:
+                    fail(f"{name}", msg)
+                    failed += 1
+                else:
+                    warn(f"{name} (optional)", f"skipping — {msg}")
+                continue
+
+            print(f"   {DIM}running:{RESET} {install_cmd}")
+            if args.dry_run:
+                ok(f"{name}", f"{DIM}(dry-run){RESET}")
+                continue
+
+            try:
+                result = subprocess.run(
+                    install_cmd, shell=True, capture_output=True, text=True, timeout=900,
+                )
+            except subprocess.TimeoutExpired:
+                if required:
+                    fail(f"{name}", "install timed out (>15min)")
+                    failed += 1
+                else:
+                    warn(f"{name} (optional)", "install timed out")
+                continue
+
+            if result.returncode == 0:
+                ok(f"{name}", f"installed at {install_path}")
+            else:
+                stderr = (result.stderr or "").strip().splitlines()
+                detail = stderr[-1] if stderr else f"exit {result.returncode}"
+                if required:
+                    fail(f"{name}", f"install failed: {detail[:200]}")
+                    failed += 1
+                else:
+                    warn(f"{name} (optional)", f"install failed: {detail[:200]}")
+
+    if failed:
+        die(f"{failed} required external skill(s) failed to install")
+    return 0
+
+
 def cmd_all(args) -> int:
     print(f">> Flow Framework full install")
     print(f"   source: {REPO_ROOT}")
@@ -419,6 +499,8 @@ def cmd_all(args) -> int:
     cmd_register_marketplaces(args)
     print()
     cmd_install_plugins(args)
+    print()
+    cmd_install_external_skills(args)
     print()
     cmd_install_hooks(args)
     print()
@@ -438,6 +520,7 @@ def main():
     sub.add_parser("check-system", parents=[common]).set_defaults(func=cmd_check_system)
     sub.add_parser("register-marketplaces", parents=[common]).set_defaults(func=cmd_register_marketplaces)
     sub.add_parser("install-plugins", parents=[common]).set_defaults(func=cmd_install_plugins)
+    sub.add_parser("install-external-skills", parents=[common]).set_defaults(func=cmd_install_external_skills)
     sub.add_parser("install-hooks", parents=[common]).set_defaults(func=cmd_install_hooks)
     sub.add_parser("render-prompts", parents=[common]).set_defaults(func=cmd_render_prompts)
     sub.add_parser("all", parents=[common]).set_defaults(func=cmd_all)

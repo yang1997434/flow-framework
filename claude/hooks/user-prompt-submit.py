@@ -44,11 +44,16 @@ def find_project_flow(start: Path) -> Path | None:
 SECTION_NAMES = ["Plan", "Execute Log", "Verify Report", "Sediment Notes"]
 
 # Match old-format autosave breadcrumbs that may linger in pre-fix progress.md
-# files. Pattern: "- [YYYY-MM-DD HH:MM] distill queued (trigger=stop)" — written
-# by flow_autosave.py < v0.5 into `## Sediment Notes`. Post-fix, autosave writes
-# to ~/.flow/.runtime/autosave-log-<hash>.md instead, but old files may persist.
+# files. Pattern variants observed in pre-fix files:
+#   - [YYYY-MM-DD HH:MM] distill queued
+#   - [YYYY-MM-DD HH:MM] distill queued (trigger=stop)
+#   - [YYYY-MM-DD HH:MM] distill queued (trigger=heartbeat) — after 70 tool calls
+# The trailing `.*$` consumes the entire line up to the newline so the section
+# is fully erased from the "filled" check (otherwise residual trigger/note text
+# remained, fooling is_section_filled). Post-fix, autosave writes to
+# ~/.flow/.runtime/autosave-log-<hash>.md instead, but old files may persist.
 AUTOSAVE_BREADCRUMB_RE = re.compile(
-    r"^- \[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\] distill queued",
+    r"^- \[\d{4}-\d{2}-\d{2} \d{2}:\d{2}\] distill queued.*$",
     re.MULTILINE,
 )
 
