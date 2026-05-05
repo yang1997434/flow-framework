@@ -11,7 +11,16 @@ Capture learnings before moving on. Forced phase even if "nothing to sediment".
 
 Human instinct after task = "done, move on". Folding sediment into Phase 3 = it gets skipped. Independent Phase 4 forces conscious thought.
 
-## Step 1 — Identify candidates
+## Step 1 — Decide what to do with the development branch
+
+Before sediment writing, invoke `{{capability:branch_finish}}` for structured options:
+- **Merge to base** (default for completed features)
+- **Create PR** (requires team review)
+- **Cleanup** (abandoned exploration)
+
+This decision shapes downstream sediment scope (e.g. ADR-worthy decisions only when merging).
+
+## Step 2 — Identify candidates
 
 Review task journey. Ask:
 
@@ -32,7 +41,7 @@ Review task journey. Ask:
    → Write to `.flow/pitfalls/<slug>.md` from `templates/pitfall.md.template`
    - **Critical**: fill `trigger_paths` field (so future tasks auto-load this)
 
-## Step 2 — Promotion candidates
+## Step 3 — Promotion candidates
 
 When promoting to vault (`~/data/knowledge-base/`), follow the frontmatter conventions in `~/.claude/rules/knowledge-base.md` (required fields: `title`, `date`, `type`, `tags`, `status`, optional `project`). Flow's templates already include these but vault writes from raw chat content must conform.
 
@@ -46,7 +55,7 @@ For each new ADR/pattern/pitfall, also evaluate cross-project reuse:
 
 Don't auto-promote — user decides via `/flow:promote`.
 
-## Step 3 — Char cap check
+## Step 4 — Char cap check
 
 Letta-anchored caps:
 
@@ -57,7 +66,7 @@ Letta-anchored caps:
 | `.flow/pitfalls/<slug>.md` body | <800 chars | Tighten |
 | `~/.claude/rules/<topic>.md` | <200 lines | Split topics or demote items |
 
-## Step 4 — Write Sediment Notes
+## Step 5 — Write Sediment Notes
 
 Append to progress.md `## Sediment Notes`:
 
@@ -72,7 +81,7 @@ Append to progress.md `## Sediment Notes`:
 
 **If nothing to sediment**: write one line "no new ADR/pattern/pitfall — task was routine for this project". Even this conscious "nothing" is a recorded thought.
 
-## Step 5 — Auto-save
+## Step 6 — Auto-save
 
 **Critical step — this is the user's preserved-memory requirement.**
 
@@ -96,7 +105,7 @@ If `{{REPO_ROOT}}/scripts/flow_save.py` exists, run it for automation:
 python3 {{REPO_ROOT}}/scripts/flow_save.py --task "${CURRENT}"
 ```
 
-## Step 6 — Archive
+## Step 7 — Archive
 
 ```bash
 YEAR_MONTH=$(date +%Y-%m)
@@ -105,7 +114,11 @@ mv "${CURRENT}" .flow/tasks/archive/${YEAR_MONTH}/
 rm .flow/.current-task
 ```
 
-## Step 7 — Confirm to user
+## Step 8 — After ship — auto-generate changelog
+
+If the task culminated in a ship (new commits to base branch + version bump), invoke `{{capability:changelog_gen}}` to generate a user-facing changelog entry from the commit history. Validate output before committing — the underlying changelog-generator skill may overwrite or append to existing CHANGELOG.md depending on its detection heuristics.
+
+## Step 9 — Confirm to user
 
 ```
 Task ${TASK_SLUG} archived.
