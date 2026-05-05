@@ -44,6 +44,8 @@ REQUIRED_CAPS = {
     "branch_finish", "changelog_gen",
     # v0.6.0 additions — Cross-cutting (2)
     "safety_guardrails", "weekly_retro",
+    # v0.7.0 additions — Phase 2 wave dispatch (2)
+    "wave_planning", "wave_dispatch",
 }
 REQUIRED_ROLES = {"triage", "research", "plan", "implement", "review"}
 
@@ -88,7 +90,7 @@ class RegistryDefaults(unittest.TestCase):
             "ui_implement", "ui_audit", "ui_visual_review",
             "session_save", "deploy_chain", "behavioral_guidelines",
         }
-        v06_caps = REQUIRED_CAPS - baseline_caps
+        v06_caps = REQUIRED_CAPS - baseline_caps - {"wave_planning", "wave_dispatch"}
         self.assertEqual(len(v06_caps), 19, "v0.6.0 should add exactly 19 caps")
         for name in v06_caps:
             cap = self.reg.resolve_capability(name)
