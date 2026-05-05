@@ -6,7 +6,7 @@
 
 一个组合式框架——把你现有的 skill 生态（superpowers / impeccable / gstack / pr-review-toolkit / planning-with-files / Trellis 风格文件持久化）整合进 4-phase 工作流，加自动记忆 promotion 和踩坑捕获。
 
-**状态**：v0.3.0-alpha。基础铺好；真实项目会暴露 gap，迭代到 v0.3.1。
+**状态**：v0.7.0。生产可用核心: 4-phase 工作流、capability registry、依赖感知的并行 subagent 调度。
 
 ## 解决什么
 

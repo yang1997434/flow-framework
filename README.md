@@ -6,7 +6,7 @@
 
 A composable framework that wraps your existing skill ecosystem (superpowers / impeccable / gstack / pr-review-toolkit / planning-with-files / Trellis-style file persistence) into a coherent 4-phase workflow with automatic memory promotion and pitfall capture.
 
-**Status**: v0.3.0-alpha. Foundation laid; expect iteration as real projects expose gaps.
+**Status**: v0.7.0. Production-ready core: 4-phase workflow, capability registry, and dependency-aware parallel subagent dispatch.
 
 ## What it does
 
@@ -111,5 +111,4 @@ MIT (this framework). Underlying tools have their own licenses.
 
 ## Status
 
-v0.3.0-alpha. Designed, partially implemented, not yet tested on a real coding project.
-Real-project shakedown will produce v0.3.1.
+v0.7.0. Capability registry stable (35 caps); v0.6.x phase orchestration battle-tested; v0.7 wave-dispatch landed for parallel implementer dispatch with disjointness verification. See `CHANGELOG.md` for release history.
