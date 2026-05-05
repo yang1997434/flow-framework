@@ -120,7 +120,12 @@ def load_registry(project_root: Path | None = None) -> CapabilityRegistry:
             model_roles = _deep_merge(model_roles, cfg.get("model_roles", {}))
             sources.append(str(local_cfg))
 
-    return CapabilityRegistry(capabilities, model_roles, sources=sources)
+    # Strip marker/annotation keys (any key starting with "_") so consumers
+    # never see them — prevents AttributeError in flow_skill_diff.py and
+    # noise in cmd_list output.
+    merged_capabilities = {k: v for k, v in capabilities.items() if not k.startswith("_")}
+    merged_model_roles = {k: v for k, v in model_roles.items() if not k.startswith("_")}
+    return CapabilityRegistry(merged_capabilities, merged_model_roles, sources=sources)
 
 
 def _resolve_path(obj: dict, dotted: str | None):
