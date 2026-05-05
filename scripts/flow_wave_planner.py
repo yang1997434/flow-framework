@@ -11,14 +11,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-# Optional PyYAML support — used when available, falls back to regex parser
-try:
-    import yaml as _yaml_mod  # type: ignore
-
-    _HAS_YAML = True
-except ImportError:
-    _HAS_YAML = False
-
 
 class PlanError(ValueError):
     """Raised when progress.md `### Tasks` YAML block is malformed."""
@@ -217,7 +209,9 @@ def load_shared_artifacts() -> list[str]:
 
 def wave_touches_shared(tasks: list[Task]) -> bool:
     """Return True if any task's writes overlaps SHARED_ARTIFACTS globs."""
-    sys.path.insert(0, str(REPO_ROOT / "scripts" / "common"))
+    _common = str(REPO_ROOT / "scripts" / "common")
+    if _common not in sys.path:
+        sys.path.insert(0, _common)
     from glob_overlap import globs_overlap  # type: ignore  # noqa: PLC0415
 
     shared = load_shared_artifacts()
