@@ -37,16 +37,16 @@ flow Phase 2 supports three execution modes. Pick one based on the task profile 
 
 | Mode | When to use | How it runs |
 |------|-------------|-------------|
-| `interactive` (default) | Most tasks. Main session orchestrates: writes Plan, dispatches sub-agents, integrates, decides when to stop. Human-in-the-loop friendly. | Steps 2–8 below, with you as the conductor. |
-| `parallel-subagents` | ≥3 independent modules / breadth-first scopes that don't share contracts. Currently the dominant flow Phase 2 mode. | Same as interactive but with N sub-agents in parallel; each in its own worktree. Use `{{capability:parallel_dispatch}}` for orchestration discipline. |
+| `interactive` (default) | Most tasks. Main session orchestrates. | Steps 2-8 below |
+| `wave-dispatch` | progress.md has `### Tasks` block with writes: declared per task. | Steps 1.6-1.9 below replace 2-6 |
+| `parallel-subagents` | Legacy: ≥3 independent breadth-first scopes without writes: declarations | Same as v0.6 |
+| `ralph-loop` | Long autonomous runs against well-specified PRD checklist | scripts/flow_ralph.sh |
 
 When dispatching sub-agents, **also** invoke `{{capability:subagent_discipline}}` for prompt + return-contract conventions (parallel_dispatch handles the orchestration; subagent_discipline handles the per-agent contract).
 
 When an implementation plan exists (from `{{capability:multi_step_plan}}` in Phase 1), invoke `{{capability:execute_plan_discipline}}` to follow it task-by-task with checkpoint commits.
 
-| `ralph-loop` | Long autonomous runs against a well-specified PRD checklist (every Acceptance Criterion is independently testable). Useful overnight / when you want to walk away. | Shell out to `scripts/flow_ralph.sh <task-slug>`. The script repeatedly invokes `claude --print` headlessly with fresh context per iteration; it picks the next `- [ ]` from prd.md, implements it, ticks the box, and exits when either the completion-promise string appears or `--max-iterations` (default 20) is hit. Logs land in `~/.flow/.runtime/ralph-<slug>.log`. |
-
-**Why bash, not the official ralph-wiggum plugin?** Anthropic's plugin loops via an in-session Stop hook, which (a) collides with flow's own `stop.py` and (b) cannot be cleanly nested inside a sub-agent — see `.flow/tasks/05-04-audit-flow-issues/research/B-context-mode-ralph-loop.md`. The bash wrapper sidesteps both issues by running each iteration as a fresh `claude --print` process.
+**Why bash for ralph-loop, not the official ralph-wiggum plugin?** Anthropic's plugin loops via an in-session Stop hook, which (a) collides with flow's own `stop.py` and (b) cannot be cleanly nested inside a sub-agent — see `.flow/tasks/05-04-audit-flow-issues/research/B-context-mode-ralph-loop.md`. The bash wrapper sidesteps both issues by running each iteration as a fresh `claude --print` process.
 
 **Rules for `ralph-loop` mode**:
 - The PRD's Acceptance Criteria checklist is load-bearing; vague items will produce vague iterations.
@@ -55,6 +55,49 @@ When an implementation plan exists (from `{{capability:multi_step_plan}}` in Pha
 - For dry-runs / CI, pass `--dry-run` to print the planned prompt without spending tokens.
 
 If `phase2_mode` is `interactive` or `parallel-subagents`, continue to Step 2. If it is `ralph-loop`, hand off to `scripts/flow_ralph.sh` and skip directly to Step 8 (Phase 2 done check) once the script exits.
+
+## Step 1.6 — wave-dispatch mode: invoke wave planner
+
+Detect `### Tasks` block in progress.md. If present:
+
+1. Resolve cap from project config (`.flow/config.yaml` → `phase2.parallel_dispatch.cap`, default 3)
+2. Invoke `{{capability:wave_planning}}` skill, passing task_slug, controller_model, cap
+3. Receive ordered waves[]
+
+If `wave_planning` capability is unavailable:
+- Log `[wave-dispatch] capability unavailable, falling back to all-serial via subagent_dispatch`
+- Treat all tasks as size-1 waves and proceed via Step 3 (legacy single-implementer dispatch)
+
+## Step 1.7 — wave-dispatch mode: per-wave dispatch
+
+For each wave in waves[]:
+
+```
+if wave.size == 1:
+    dispatch via {{capability:parallel_dispatch}} (existing path, Step 3)
+else:
+    dispatch via {{capability:wave_dispatch}} (new flow-wave-runner)
+```
+
+If `wave_dispatch` capability is unavailable but `wave_planning` succeeded:
+- Log fallback
+- Decompose for preview but execute serially via subagent_dispatch
+
+## Step 1.8 — wave-dispatch mode: wave barrier
+
+After each wave runs:
+- Collect terminal states from runner
+- Apply default-block-on-failure policy:
+  - `failed_blocking` → MUST FIX (cannot waive); dispatch fix subagent or escalate user
+  - `blocked` / `timed_out` / `cancelled` → ask controller for explicit waive with logged rationale
+  - `wave_verdict=critical_blocking` → fix before advancing
+- All clean → next wave
+
+## Step 1.9 — wave-dispatch mode: end of last wave
+
+When the last wave completes cleanly:
+- Skip ahead to Step 8 (Phase 2 done)
+- progress.md `## Execute Log` will have one row per task per wave
 
 ## Step 2 — Write scope plan to progress.md
 

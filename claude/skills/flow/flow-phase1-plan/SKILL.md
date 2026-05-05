@@ -148,6 +148,33 @@ User confirms → done with Phase 1.
 
 After done, mark progress.md `## Plan` section with the agreed plan and tell user: "`/flow:continue` to start Phase 2."
 
+### Optional: structured `### Tasks` block for v0.7 wave dispatch
+
+If you can confidently scope each sub-agent's writes, write a structured task block:
+
+````markdown
+## Plan
+
+(introductory prose about strategy, integration role)
+
+### Tasks
+```yaml
+tasks:
+  - id: task-1-update-foo
+    writes: [src/foo.py, tests/test_foo.py]
+    description: "Update foo handler"
+  - id: task-2-update-bar
+    writes: [src/bar.py, tests/test_bar.py]
+    description: "Update bar handler"
+```
+````
+
+When `### Tasks` is present, Phase 2 will invoke `{{capability:wave_planning}}` to decompose into parallel waves automatically.
+
+If you can't accurately list `writes:` for a task, omit it — the planner falls back to strict serial for any task with missing `writes`. **Do not guess** — wrong globs cause merge contamination at runtime.
+
+Generated outputs (e.g., `src/generated/**`, `*.snap`) must be declared explicitly in `writes:`.
+
 ## Constraints
 
 - **One question at a time** — don't dump 5 questions
