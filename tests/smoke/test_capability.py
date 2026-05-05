@@ -78,7 +78,10 @@ class RenderBasics(unittest.TestCase):
 
     def test_simple_model_role(self):
         out, err = render("model: {{model:research}}", self.reg)
-        self.assertIn("claude-sonnet", out)
+        # Resolves to alias (e.g. "sonnet") so Agent tool's enum-restricted
+        # `model` param accepts it. Concrete model id picked via
+        # ANTHROPIC_DEFAULT_*_MODEL env var (1M variant in settings.json).
+        self.assertEqual(out, "model: sonnet")
         self.assertEqual(err, [])
 
     def test_dotted_args_access(self):
@@ -103,7 +106,7 @@ class RenderBasics(unittest.TestCase):
         )
         self.assertIn("superpowers:brainstorming", out)
         self.assertIn("superpowers:test-driven-development", out)
-        self.assertIn("claude-opus", out)
+        self.assertIn("opus", out)
 
 
 class AllPromptFilesRenderCleanly(unittest.TestCase):

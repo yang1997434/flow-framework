@@ -17,17 +17,26 @@ Heartbeat fallback for Lv3: > 30 min since last distill AND > 50 tool calls
 since last distill -> queue lightweight distill.
 
 CRITICAL: Hooks must NOT call an LLM directly (timeout/cost risk). Instead we
-write a "distill queued" marker to the active task's progress.md
-`## Sediment Notes` section, plus a structured queue file under
-`~/.flow/.runtime/distill-queue.jsonl`. SessionStart will surface pending
-distills to Claude/the user, who can then run the actual LLM distillation
-through the appropriate slash command (/flow:pause | /flow:finish | manual).
+write a "distill queued" breadcrumb to `~/.flow/.runtime/autosave-log-<cwd>.md`
+(out-of-band of progress.md so it doesn't fool `determine_phase`), plus a
+structured queue file under `~/.flow/.runtime/distill-queue.jsonl`. SessionStart
+will surface pending distills to Claude/the user, who can then run the actual
+LLM distillation through the appropriate slash command (/flow:pause |
+/flow:finish | manual).
 
-Future LLM path (NOT done in hook): see Sediment Notes — the distill prompt
-should read the queue, look at last N events from progress.md + recent commits
-+ context-mode raw transcripts, produce a 200-400 token summary, and append to
-progress.md `## Sediment Notes`. Candidate dispatchers: /flow:save command, a
-SessionStart bootstrap action, or an explicit `flow distill --run` CLI subcommand.
+Why out-of-band: earlier versions wrote the breadcrumb into progress.md's
+`## Sediment Notes` section, which is one of the four sections that
+`is_section_filled` / `determine_phase` (in user-prompt-submit.py) consult.
+Automated autosave breadcrumbs caused the phase to falsely advance to `done`.
+The legitimate writer to `## Sediment Notes` is `flow_sediment.py` (called
+during Phase 4 promotion, after user gates the phase), not autosave.
+
+Future LLM path (NOT done in hook): the distill runner reads the queue + the
+autosave-log + recent commits + context-mode raw transcripts, produces a
+200-400 token summary, and appends to progress.md `## Sediment Notes` *only
+when running under explicit user gating*. Candidate dispatchers: /flow:save
+command, a SessionStart bootstrap action, or an explicit `flow distill --run`
+CLI subcommand.
 """
 from __future__ import annotations
 
@@ -167,89 +176,35 @@ def reset_tool_count() -> None:
         pass
 
 
-# ----- progress.md "Sediment Notes" append ---------------------------------
+# ----- autosave breadcrumb log (out-of-band of progress.md) -----------------
 
-def append_distill_marker(task_dir: Path, trigger: str, now: datetime, note: str = "") -> bool:
-    """Append a "distill queued" marker to progress.md `## Sediment Notes`.
-    Returns True on write, False on no-op (e.g., file missing)."""
-    progress = task_dir / "progress.md"
-    if not progress.is_file():
-        return False
+def autosave_log_path(cwd: Path) -> Path:
+    """Per-cwd autosave breadcrumb log at `~/.flow/.runtime/autosave-log-<hash>.md`.
 
-    text = progress.read_text(encoding="utf-8")
+    Out-of-band of any task's progress.md so automated breadcrumbs don't fool
+    `determine_phase` into reading them as user-supplied phase content.
+    Keyed by cwd hash (matches `touched_log_path` / `cwd_hash`) so multiple
+    projects on one machine don't cross-pollute.
+    """
+    return runtime_dir() / f"autosave-log-{cwd_hash(cwd)}.md"
+
+
+def append_distill_marker(task_dir: Path, cwd: Path, trigger: str, now: datetime, note: str = "") -> bool:
+    """Append a "distill queued" breadcrumb to the per-cwd autosave log.
+    Returns True on write, False on OSError."""
+    log = autosave_log_path(cwd)
     timestamp = now.strftime("%Y-%m-%d %H:%M")
-    marker = (
-        f"- [{timestamp}] distill queued (trigger={trigger})"
+    line = (
+        f"- [{timestamp}] task={task_dir.name} trigger={trigger}"
         + (f" — {note}" if note else "")
+        + "\n"
     )
-
-    if "## Sediment Notes" in text:
-        # Insert after the Sediment Notes heading, preserving the rest.
-        new_text = _append_under_heading(text, "## Sediment Notes", marker)
-    else:
-        # Append a fresh section at end.
-        sep = "" if text.endswith("\n") else "\n"
-        new_text = text + f"{sep}\n## Sediment Notes\n\n{marker}\n"
-
-    progress.write_text(new_text, encoding="utf-8")
-    return True
-
-
-def _append_under_heading(text: str, heading: str, line: str) -> str:
-    """Append `line` to the section started by `heading`, just before the next
-    heading-of-equal-or-higher-level (or EOF). Strips placeholder template
-    comments so we don't double-write under the noise."""
-    lines = text.splitlines(keepends=False)
-    out: list[str] = []
-    i = 0
-    found = False
-    inserted = False
-    heading_level = heading.count("#")
-    while i < len(lines):
-        out.append(lines[i])
-        if not found and lines[i].strip() == heading:
-            found = True
-            i += 1
-            # Collect section body until the next heading of same/higher level
-            section: list[str] = []
-            while i < len(lines):
-                nxt = lines[i]
-                stripped = nxt.lstrip()
-                if stripped.startswith("#"):
-                    n_hash = len(stripped) - len(stripped.lstrip("#"))
-                    if n_hash <= heading_level:
-                        break
-                section.append(nxt)
-                i += 1
-            # Drop placeholder template comments
-            cleaned = [
-                ln for ln in section
-                if not ln.strip().startswith("<!-- TEMPLATE")
-            ]
-            # Trim trailing blanks for tidy append
-            while cleaned and not cleaned[-1].strip():
-                cleaned.pop()
-            # Trim leading blanks for cleanliness
-            while cleaned and not cleaned[0].strip():
-                cleaned.pop(0)
-            # Compose: heading already in `out`, then blank, then cleaned, then new line, then blank
-            if cleaned:
-                out.append("")
-                out.extend(cleaned)
-            out.append("")
-            out.append(line)
-            out.append("")
-            inserted = True
-            continue
-        i += 1
-    if not found:
-        # Caller should have detected this; defensive fallback.
-        sep = "" if text.endswith("\n") else "\n"
-        return text + f"{sep}\n{heading}\n\n{line}\n"
-    # Strip a trailing blank to avoid pile-up over many writes
-    while out and not out[-1].strip():
-        out.pop()
-    return "\n".join(out) + "\n"
+    try:
+        with log.open("a", encoding="utf-8") as f:
+            f.write(line)
+        return True
+    except OSError:
+        return False
 
 
 # ----- distill queue (durable, machine-readable) ---------------------------
@@ -303,7 +258,7 @@ def cmd_distill(args) -> int:
     appended = False
     if task is not None:
         appended = append_distill_marker(
-            task, trigger, now, note=args.note or ""
+            task, cwd, trigger, now, note=args.note or ""
         )
 
     enqueue_distill(trigger, task, now, extra={"appended": appended})
@@ -348,7 +303,7 @@ def cmd_heartbeat(args) -> int:
     appended = False
     if task is not None:
         appended = append_distill_marker(
-            task, "heartbeat", now, note=f"after {count} tool calls"
+            task, cwd, "heartbeat", now, note=f"after {count} tool calls"
         )
     enqueue_distill("heartbeat", task, now,
                     extra={"appended": appended, "tool_calls": count})

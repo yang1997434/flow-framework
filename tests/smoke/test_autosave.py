@@ -6,8 +6,11 @@ Covers:
   Lv1  post-tool-edit batch flush -> 60s OR 10-edit threshold
   Lv3  distill cooldown           -> 5min suppression for non-explicit triggers
   Lv3  heartbeat trigger          -> 30min + 50 tool-call AND condition
-  Lv3  distill enqueue            -> writes Sediment Notes marker only,
-                                     never invokes an LLM directly
+  Lv3  distill enqueue            -> writes ~/.flow/.runtime/autosave-log
+                                     breadcrumb only (out-of-band of
+                                     progress.md), never invokes an LLM
+                                     directly. progress.md MUST stay clean
+                                     so phase determination isn't fooled.
 
 Run:
   python3 -m unittest tests.smoke.test_autosave -v
@@ -229,8 +232,15 @@ class Lv3DistillCooldown(unittest.TestCase):
 
     def test_first_distill_writes_marker_and_queue(self):
         self._run_distill("stop")
+        # Breadcrumb lives OUT of progress.md (was the source of the
+        # phase-state false-done bug). It now lives in the per-cwd autosave-log.
         progress_text = (self.task / "progress.md").read_text(encoding="utf-8")
-        self.assertIn("distill queued (trigger=stop)", progress_text)
+        self.assertNotIn("distill queued", progress_text,
+                         "progress.md must not be polluted by autosave breadcrumbs")
+        log_files = list((self.flow_home / ".runtime").glob("autosave-log-*.md"))
+        self.assertEqual(len(log_files), 1, "expected one autosave-log per cwd")
+        log_text = log_files[0].read_text(encoding="utf-8")
+        self.assertIn("trigger=stop", log_text)
         # Queue file populated
         queue = self.flow_home / ".runtime" / "distill-queue.jsonl"
         self.assertTrue(queue.is_file())
@@ -239,11 +249,13 @@ class Lv3DistillCooldown(unittest.TestCase):
 
     def test_cooldown_suppresses_within_5min(self):
         self._run_distill("stop")
-        # Second stop trigger within 5 min should NOT add another marker
+        # Second stop trigger within 5 min should NOT add another breadcrumb
         self._run_distill("stop")
-        progress_text = (self.task / "progress.md").read_text(encoding="utf-8")
+        log_files = list((self.flow_home / ".runtime").glob("autosave-log-*.md"))
+        self.assertEqual(len(log_files), 1)
+        log_text = log_files[0].read_text(encoding="utf-8")
         self.assertEqual(
-            progress_text.count("distill queued (trigger=stop)"),
+            log_text.count("trigger=stop"),
             1,
             "cooldown must suppress redundant non-explicit distills",
         )
@@ -256,9 +268,11 @@ class Lv3DistillCooldown(unittest.TestCase):
     def test_explicit_pause_bypasses_cooldown(self):
         self._run_distill("stop")
         self._run_distill("pause")  # explicit user trigger -> bypass
-        progress_text = (self.task / "progress.md").read_text(encoding="utf-8")
-        self.assertIn("trigger=stop", progress_text)
-        self.assertIn("trigger=pause", progress_text)
+        log_files = list((self.flow_home / ".runtime").glob("autosave-log-*.md"))
+        self.assertEqual(len(log_files), 1)
+        log_text = log_files[0].read_text(encoding="utf-8")
+        self.assertIn("trigger=stop", log_text)
+        self.assertIn("trigger=pause", log_text)
 
     def test_no_active_task_still_enqueues(self):
         # Remove pointer
@@ -318,13 +332,18 @@ class Lv3Heartbeat(unittest.TestCase):
                 return int(e.code or 0)
         return 0
 
+    def _autosave_log_text(self) -> str:
+        log_files = list((self.flow_home / ".runtime").glob("autosave-log-*.md"))
+        if not log_files:
+            return ""
+        return log_files[0].read_text(encoding="utf-8")
+
     def test_heartbeat_below_thresholds_does_not_queue(self):
         # Simulate "last distill 1 minute ago" + 5 tool calls — neither met
         recent = datetime.now(timezone.utc).astimezone() - timedelta(minutes=1)
         self.mod.write_last_distill("manual", recent)
         self._run_heartbeat(increment=5)
-        progress_text = (self.task / "progress.md").read_text(encoding="utf-8")
-        self.assertNotIn("trigger=heartbeat", progress_text)
+        self.assertNotIn("trigger=heartbeat", self._autosave_log_text())
 
     def test_heartbeat_meets_both_thresholds_queues(self):
         # Last distill 35 min ago + tool count already at 60
@@ -332,8 +351,7 @@ class Lv3Heartbeat(unittest.TestCase):
         self.mod.write_last_distill("manual", old)
         self.mod.tool_count_path().write_text("59", encoding="utf-8")  # one more = 60
         self._run_heartbeat(increment=1)
-        progress_text = (self.task / "progress.md").read_text(encoding="utf-8")
-        self.assertIn("trigger=heartbeat", progress_text)
+        self.assertIn("trigger=heartbeat", self._autosave_log_text())
 
     def test_heartbeat_only_time_met_does_not_queue(self):
         # 35 min ago BUT only 5 tool calls -> AND condition fails
@@ -341,8 +359,7 @@ class Lv3Heartbeat(unittest.TestCase):
         self.mod.write_last_distill("manual", old)
         self.mod.tool_count_path().write_text("4", encoding="utf-8")
         self._run_heartbeat(increment=1)
-        progress_text = (self.task / "progress.md").read_text(encoding="utf-8")
-        self.assertNotIn("trigger=heartbeat", progress_text)
+        self.assertNotIn("trigger=heartbeat", self._autosave_log_text())
 
     def test_heartbeat_only_count_met_does_not_queue(self):
         # 60 calls BUT last distill 1 min ago -> time condition fails
@@ -350,8 +367,7 @@ class Lv3Heartbeat(unittest.TestCase):
         self.mod.write_last_distill("manual", recent)
         self.mod.tool_count_path().write_text("59", encoding="utf-8")
         self._run_heartbeat(increment=1)
-        progress_text = (self.task / "progress.md").read_text(encoding="utf-8")
-        self.assertNotIn("trigger=heartbeat", progress_text)
+        self.assertNotIn("trigger=heartbeat", self._autosave_log_text())
 
 
 # ---------------------------------------------------------------------------
@@ -376,9 +392,13 @@ class StopHookE2E(unittest.TestCase):
             input=payload, capture_output=True, text=True, timeout=15, env=env,
         )
         self.assertEqual(result.returncode, 0, f"stderr: {result.stderr}")
-        # Marker should now be in progress.md
+        # Breadcrumb should be in autosave-log, NOT progress.md
         progress_text = (self.task / "progress.md").read_text(encoding="utf-8")
-        self.assertIn("trigger=stop", progress_text)
+        self.assertNotIn("trigger=stop", progress_text,
+                         "progress.md must not be polluted by autosave breadcrumbs")
+        log_files = list((self.flow_home / ".runtime").glob("autosave-log-*.md"))
+        self.assertEqual(len(log_files), 1)
+        self.assertIn("trigger=stop", log_files[0].read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

@@ -81,24 +81,27 @@
 
   "model_roles": {
     "triage": {
-      "default": "claude-haiku-4-5",
-      "description": "Cheap classification (task complexity, keyword detection)"
+      "default": "haiku",
+      "description": "Cheap classification (task complexity, keyword detection). Alias resolves via ANTHROPIC_DEFAULT_HAIKU_MODEL env var."
     },
     "research": {
-      "default": "claude-sonnet-4-6",
-      "description": "Sub-agent research / scanning / cross-file inspection"
+      "default": "sonnet",
+      "fallback": "opus",
+      "description": "Sub-agent research / scanning / cross-file inspection. Alias resolves via ANTHROPIC_DEFAULT_SONNET_MODEL (1M variant recommended). On dispatch failure (model unavailable), retry with `opus` — never downgrade to `haiku`."
     },
     "plan": {
-      "default": "claude-sonnet-4-6",
-      "description": "Plan writing + ADR drafting"
+      "default": "sonnet",
+      "fallback": "opus",
+      "description": "Plan writing + ADR drafting. Alias resolves via env var. On failure, fall back to opus."
     },
     "implement": {
-      "default": "claude-opus-4-7",
-      "description": "Code generation / refactoring / debugging"
+      "default": "opus",
+      "description": "Code generation / refactoring / debugging. Alias resolves via ANTHROPIC_DEFAULT_OPUS_MODEL env var."
     },
     "review": {
-      "default": "claude-sonnet-4-6",
-      "description": "Self-review of diffs (when cross_model_review skipped)"
+      "default": "sonnet",
+      "fallback": "opus",
+      "description": "Self-review of diffs (when cross_model_review skipped). Alias resolves via env var. On failure, fall back to opus."
     }
   }
 }
