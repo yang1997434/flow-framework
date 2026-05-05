@@ -13,10 +13,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Flow runtime (should never appear in this repo, but defensive)
-.flow/.runtime/
-.flow/config.local.yaml
-
 # Test artifacts
 tests/output/
 tests/temp/

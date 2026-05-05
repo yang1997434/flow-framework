@@ -114,6 +114,8 @@ def main():
     # 5. Done
     print()
     print(">> flow init complete.")
+    print(f"   Stage now (recommended):")
+    print(f"     git add .gitignore .flow/config.yaml .flow/workspace/.gitkeep")
     print(f"   Next: tell Claude '/flow:start <task>' or read docs/编码框架.md")
 
 

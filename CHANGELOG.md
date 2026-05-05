@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.5.9 (2026-05-05)
+
+Cosmetic / UX cleanup. Fresh `flow init` no longer leaves the project in a
+state where `git status` perpetually flags `?? .flow/workspace/` and
+`?? .flow/config.yaml` as untracked. The `.gitignore` rules were already
+correct (`.flow/workspace/*` + `!.flow/workspace/.gitkeep`), but `flow init`
+never told the user to stage the un-ignored placeholder + project config —
+so every adopter saw the same noisy untracked entries forever.
+
+### Fixed
+
+- **`.gitignore` duplicates** (this repo): removed the orphan "defensive"
+  block (`.flow/.runtime/` + `.flow/config.local.yaml`) that duplicated
+  the canonical "Flow Framework" block lower down.
+- **Self-bootstrapping noise** (this repo): `.flow/workspace/.gitkeep`
+  and `.flow/config.yaml` are now committed, so the workspace dir
+  materializes after clone and project-level config is reproducible.
+
+### Added
+
+- **`flow init` next-step hint** (`scripts/flow_init.py`): on completion,
+  print the exact `git add` command for the un-ignored placeholders that
+  `flow init` just created. No auto-staging — the user is in control.
+
 ## v0.5.8 (2026-05-05)
 
 Phase determination now respects user's authoritative `phase:` declaration in
