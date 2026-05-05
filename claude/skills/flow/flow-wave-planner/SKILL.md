@@ -81,7 +81,7 @@ Cache lands at `.flow/tasks/<slug>/wave-decomposition.json` keyed by all 5 inval
 ## Step 5 — Return waves to Phase 2
 
 Return the wave list to Phase 2 orchestrator. It will dispatch each wave per Section 4 of the spec:
-- Wave size 1 → `{{capability:subagent_dispatch}}` (existing v0.6 path)
+- Wave size 1 → existing v0.6 dispatch path via `{{capability:parallel_dispatch}}` + `{{capability:subagent_discipline}}` (single-implementer is just N=1 of the same orchestration)
 - Wave size > 1 → `{{capability:wave_dispatch}}` (this version's runner)
 
 ## Failure modes
