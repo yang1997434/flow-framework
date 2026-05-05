@@ -1,7 +1,9 @@
 """Smoke tests for flow_wave_planner — Phase 1: parser."""
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -206,10 +208,6 @@ class TestPackIntoWaves(unittest.TestCase):
         waves = pack_into_waves(tasks, cap=4)
         # t1 broad → strict serial. t2 starts new wave.
         self.assertEqual(len(waves), 2)
-
-
-import json
-import tempfile
 
 
 class TestWaveCache(unittest.TestCase):

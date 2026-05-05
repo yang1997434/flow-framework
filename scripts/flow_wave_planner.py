@@ -318,7 +318,7 @@ def write_cache(
     planner_version: str,
     cap_used: int,
     waves: list[list[Task]],
-    rationale: list = None,
+    rationale: Optional[list] = None,
 ) -> None:
     """Write wave-decomposition.json. Atomic via tmp+rename."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
