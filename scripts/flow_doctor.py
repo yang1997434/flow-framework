@@ -4,6 +4,10 @@
 Reads dependencies.json + ~/.claude/plugins/installed_plugins.json
 + ~/.claude/settings.json and reports a capability matrix.
 
+Usage:
+  flow doctor                      — run all checks
+  flow doctor --suggest-writes <slug>  — advisory writes: suggestions for a task
+
 Exit code:
   0 = all required deps satisfied
   1 = at least one required dep missing
@@ -12,6 +16,7 @@ Exit code:
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -368,7 +373,128 @@ def check_capability_clis() -> None:
         )
 
 
+def check_wave_plans() -> int:
+    """v0.7: check progress.md files for writes: hygiene."""
+    section("Wave-dispatch plans")
+    _scripts = str(REPO_ROOT / "scripts")
+    if _scripts not in sys.path:
+        sys.path.insert(0, _scripts)
+    from flow_wave_planner import parse_plan_tasks, load_shared_artifacts  # noqa: E402
+
+    _common = str(REPO_ROOT / "scripts" / "common")
+    if _common not in sys.path:
+        sys.path.insert(0, _common)
+    from glob_overlap import is_broad_glob, validate_glob, GlobError, globs_overlap  # noqa: E402
+
+    tasks_dir = REPO_ROOT / ".flow" / "tasks"
+    if not tasks_dir.is_dir():
+        ok("no .flow/tasks/ — skipping")
+        return 0
+
+    issues = 0
+    shared = load_shared_artifacts()
+
+    for slug_dir in sorted(tasks_dir.iterdir()):
+        if not slug_dir.is_dir():
+            continue
+        progress = slug_dir / "progress.md"
+        if not progress.is_file():
+            continue
+        try:
+            tasks = parse_plan_tasks(progress.read_text(encoding="utf-8"))
+        except Exception as e:
+            warn(f"{slug_dir.name}: malformed `### Tasks` block — {e}")
+            issues += 1
+            continue
+        if not tasks:
+            continue  # legacy single-task plan, fine
+
+        for t in tasks:
+            if t.writes is None:
+                warn(f"{slug_dir.name}/{t.id}: missing `writes:` (will be strict serial)")
+                continue
+            for g in t.writes:
+                try:
+                    validate_glob(g)
+                except GlobError as e:
+                    fail(f"{slug_dir.name}/{t.id}: invalid writes glob {g!r} — {e}")
+                    issues += 1
+            if shared and globs_overlap(t.writes, shared):
+                warn(f"{slug_dir.name}/{t.id}: writes overlaps SHARED_ARTIFACTS — wave will be forced serial")
+
+    if issues:
+        return 1
+    ok("all `### Tasks` blocks pass hygiene")
+    return 0
+
+
+def check_wave_caches() -> int:
+    """v0.7: detect stale wave-decomposition caches."""
+    section("Wave caches")
+    tasks_dir = REPO_ROOT / ".flow" / "tasks"
+    if not tasks_dir.is_dir():
+        return 0
+    stale = 0
+    _scripts = str(REPO_ROOT / "scripts")
+    if _scripts not in sys.path:
+        sys.path.insert(0, _scripts)
+    from flow_wave_planner import PLANNER_VERSION  # noqa: E402
+
+    for cache_file in tasks_dir.glob("*/wave-decomposition.json"):
+        try:
+            data = json.loads(cache_file.read_text(encoding="utf-8"))
+        except Exception:
+            warn(f"{cache_file.parent.name}: malformed cache, will recompute")
+            stale += 1
+            continue
+        cached_v = data.get("planner_version", "0.0.0")
+        if cached_v != PLANNER_VERSION:
+            warn(f"{cache_file.parent.name}: cache planner_version={cached_v} differs from current {PLANNER_VERSION}")
+            stale += 1
+    if stale == 0:
+        ok("no stale wave caches")
+    return 0
+
+
+def cli_suggest_writes(slug: str) -> int:
+    """Heuristic suggestions for missing `writes:` fields based on task description."""
+    progress_path = REPO_ROOT / ".flow" / "tasks" / slug / "progress.md"
+    if not progress_path.is_file():
+        print(f"  no progress.md for {slug}")
+        return 1
+
+    _scripts = str(REPO_ROOT / "scripts")
+    if _scripts not in sys.path:
+        sys.path.insert(0, _scripts)
+    from flow_wave_planner import parse_plan_tasks  # noqa: E402
+
+    tasks = parse_plan_tasks(progress_path.read_text(encoding="utf-8"))
+
+    print(f"  {slug}: advisory writes: suggestions (NOT auto-written)")
+    print(f"  Read prd.md and progress.md context manually before adding any.")
+    for t in tasks:
+        if t.writes is not None:
+            continue  # already declared
+        # Heuristic: extract file-path-looking strings from description
+        matches = re.findall(
+            r"([a-zA-Z0-9_./\-]+\.(?:py|md|json|sh|ts|tsx|js|jsx|yaml|yml))",
+            t.description,
+        )
+        if matches:
+            print(f"    {t.id}: suggested writes (review!): {matches[:5]}")
+        else:
+            print(f"    {t.id}: no obvious paths in description — author must declare manually")
+    return 0
+
+
 def main():
+    args = sys.argv[1:]
+
+    # --suggest-writes <slug> mode — advisory only, no full doctor run
+    if len(args) >= 2 and args[0] == "--suggest-writes":
+        slug = args[1]
+        sys.exit(cli_suggest_writes(slug))
+
     if not DEPS_FILE.is_file():
         print(f"{RED}ERROR: dependencies.json not found at {DEPS_FILE}{RESET}", file=sys.stderr)
         sys.exit(1)
@@ -385,10 +511,12 @@ def main():
     check_user_local_overrides(deps)
     check_context_mode_running()
     check_capability_clis()
+    wave_plan_issues = check_wave_plans()
+    check_wave_caches()
 
     total_missing = missing_cmds + missing_plugins + missing_external
     print()
-    if total_missing == 0 and iso_status == 0:
+    if total_missing == 0 and iso_status == 0 and wave_plan_issues == 0:
         print(f"{GREEN}>> All checks passed.{RESET}")
         sys.exit(0)
     if iso_status == 2:
