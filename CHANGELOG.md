@@ -1,5 +1,78 @@
 # Changelog
 
+## v0.5.7 (2026-05-05)
+
+Stabilization release. Fixes the Sonnet alias env-var routing that was
+silently downgrading sub-agent dispatch (or forcing operators to fall
+back to haiku — research-depth-inadequate), and the phase-state
+"false-done" bug where automated autosave breadcrumbs in
+`progress.md ## Sediment Notes` made `<flow-state>` mis-report any task
+as `done` from Phase 1 onward. Adds an explicit Sonnet → Opus fallback
+chain to the sub-agent dispatch protocol so operators don't silently
+downgrade. Wires the new `external_skills` dependency section into
+`flow install` + `flow doctor` (gstack is now properly diagnosed and
+installable). Per cross-model codex review, the breadcrumb-filtering
+regex now consumes the full line so migrated tasks with old breadcrumbs
+in Sediment Notes don't falsely advance past Phase 4.
+
+### Fixed
+
+- **Agent tool model dispatch**: `defaults.json` `model_roles.*.default`
+  now ships **aliases** (`sonnet`/`opus`/`haiku`), not full model IDs.
+  The Agent tool's `model` parameter is enum-restricted to those three
+  aliases — full IDs were rejected with `InputValidationError`. Added
+  per-role `fallback` field documenting the retry alias on dispatch
+  failure.
+- **Phase-state false `done`** (`claude/hooks/user-prompt-submit.py`):
+  `is_section_filled` now filters the autosave breadcrumb pattern
+  (defense-in-depth); `determine_phase` now requires **sequential**
+  filling (Plan → Execute → Verify → Sediment), so a stray write to a
+  later section can't skip earlier empty sections.
+- **Sediment Notes pollution source** (`scripts/flow_autosave.py`):
+  the `distill queued` breadcrumb is re-routed from
+  `progress.md ## Sediment Notes` to
+  `~/.flow/.runtime/autosave-log-<cwd>.md` (out-of-band of any
+  phase-determining file).
+- **Breadcrumb regex consumes full line** (codex review P1): old regex
+  anchored on the prefix only, leaving residual ` (trigger=...) — note`
+  text that still counted as section content. Now matches up to the
+  newline so migrated old progress.md files don't falsely advance phase.
+
+### Added
+
+- `external_skills` section in `dependencies.json` for loose-skill
+  bundles distributed outside the marketplace+plugin system. First
+  entry: **gstack** (`~/.claude/skills/gstack/`) with `requires_cli`,
+  `capabilities`, and a documented `install` command.
+- `flow install install-external-skills` — new subcommand that clones
+  + builds bundles declared under `external_skills`, idempotent on
+  existing installs, fails-closed on missing required CLIs.
+- `flow doctor` — new section reporting external skills presence +
+  missing CLIs; entries count toward total-missing for exit code.
+- `claude/commands/flow/start.md` + `claude/skills/flow/flow-phase1-plan/SKILL.md`:
+  explicit **Sub-agent dispatch protocol** — primary `sonnet` alias,
+  fallback `opus`, never haiku for research depth.
+- `tests/smoke/test_phase_determination.py` — 17 unit tests covering
+  `is_section_filled` across all observed breadcrumb variants,
+  `determine_phase` sequential AND-chain, and three regression tests
+  for the false-`done` scenarios.
+- `.flow/pitfalls/{agent-sonnet-alias-stale, phase-state-triple-bug,
+  context-mode-mcp-flake, flow-protocol-needs-fallback-chain}.md` — 4
+  pitfall captures so future tasks reference these failure modes.
+
+### Changed
+
+- `claude/hooks/stop.py` docstring updated to reflect breadcrumb
+  destination change (was: progress.md Sediment Notes; now: runtime log).
+- `claude/capabilities/defaults.json` `_comment` updated to reflect
+  alias-based dispatch and the role of `ANTHROPIC_DEFAULT_*_MODEL`
+  env vars in concrete-id resolution (1M-context variants
+  recommended).
+
+### Tests
+
+- Suite: 80 → 97 (+17 in `test_phase_determination.py`).
+
 ## v0.5.6 (2026-05-04)
 
 Two new CLI surfaces resolving GitHub issues #4 and #5. Both were
