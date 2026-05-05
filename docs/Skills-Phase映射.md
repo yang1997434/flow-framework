@@ -321,14 +321,24 @@ Phase 4: 加 vault MOC 索引
 - ⚠️ karpathy-guidelines
 - ⚠️ 各种 review skill（code-review / review-pr / review-loop）
 
-**v0.2 没整合的**（重大缺失）：
-- ❌ **UI / 设计 skill 链全无**（impeccable 21 个 / frontend-design / design-shotgun / design-consultation 等 30+ 工具完全没在 Phase 描述出现）
-- ❌ 安全护栏（careful / freeze / guard / cso）
-- ❌ 部署 / 运维链（ship / land-and-deploy / canary / benchmark）
-- ❌ 文档输出类（docx / pptx / pdf 等）
-- ❌ 内容 / 发布类（baoyu-* 一整套）
+**v0.6.0 新整合的**：
+- ✅ 19 个 capability 全部进 registry（详见 `docs/specs/2026-05-05-capability-registry-v0.6-design.md`）
+- ✅ Phase 3 verify_completion 必触（关闭 "false done" 安全口子）
+- ✅ Phase 1 hat-shifted brainstorming（Engineer / DX / Security 视角）
+- ✅ Phase 3 code review 按 diff size 路由（small / large）
+- ✅ Cross-cutting safety_guardrails + weekly_retro
+- ✅ Deploy 任务 dev_setup + land_and_deploy + post_deploy_qa 全链
+- ✅ Phase 4 changelog_gen + branch_finish
 
-**结论**：v0.2 是"代码任务的骨架"，**对 UI / 设计 / 部署 / 文档 / 内容任务都不充分**。要么把这些写进 Phase 描述（让框架真编排），要么明确"Flow 默认面向后端代码任务，其他任务额外加配套 skill 链"。
+**v0.6.0 仍未整合（推 v0.7）**：
+- ❌ 安全护栏 hook 自动触发（safety_guardrails 当前是文档触发；v0.7 加 Bash hook）
+- ❌ release_docs（gstack:document-release）
+- ❌ project_learnings（gstack:learn —— 等 /flow:promote 重叠问题厘清）
+- ❌ security_audit / cso（等 task-type tagging）
+- ❌ 文档输出类（docx / pptx / pdf —— 任务类型扩展时引入）
+- ❌ 内容 / 发布类（baoyu-* —— 内容创作非 Flow 主线）
+
+**结论**：v0.6.0 是"代码任务全链 + UI 任务覆盖 + 部署任务全链"。v0.7 关注 hook-based 自动化与跨项目 learning 沉淀。
 
 ---
 
