@@ -5,9 +5,12 @@ Phase 2 (next commits): independence algorithm, cache, CLI.
 """
 from __future__ import annotations
 
+import argparse
 import datetime
+import hashlib
 import json
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -369,3 +372,110 @@ def is_cache_valid(
         and cached.get("planner_version") == planner_version
         and cached.get("cap_used") == cap_used
     )
+
+
+# ---------------------------------------------------------------------------
+# CLI helpers + subcommands (Phase 2 / T8)
+# ---------------------------------------------------------------------------
+
+
+def _compute_plan_hash(progress_md_path: Path) -> str:
+    text = progress_md_path.read_text(encoding="utf-8")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _get_base_commit(repo_root: Path) -> str:
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=str(repo_root), text=True
+    ).strip()
+
+
+def _cache_path_for_slug(slug: str) -> Path:
+    return REPO_ROOT / ".flow" / "tasks" / slug / "wave-decomposition.json"
+
+
+def _progress_md_for_slug(slug: str) -> Path:
+    return REPO_ROOT / ".flow" / "tasks" / slug / "progress.md"
+
+
+def cli_cache_check(args) -> int:
+    cache = read_cache(_cache_path_for_slug(args.task_slug))
+    if cache is None:
+        return 1
+    plan_hash = _compute_plan_hash(_progress_md_for_slug(args.task_slug))
+    base_commit = _get_base_commit(REPO_ROOT)
+    valid = is_cache_valid(
+        cache, plan_hash, base_commit, args.controller_model, PLANNER_VERSION, args.cap
+    )
+    if not valid:
+        return 1
+    print(json.dumps(cache, indent=2))
+    return 0
+
+
+def cli_decompose(args) -> int:
+    progress_text = _progress_md_for_slug(args.task_slug).read_text(encoding="utf-8")
+    tasks = parse_plan_tasks(progress_text)
+    waves = pack_into_waves(tasks, cap=args.cap)
+    out = {
+        "candidate_waves": [[t.id for t in w] for w in waves],
+        "rationale": [],  # filled by SKILL step 3
+    }
+    print(json.dumps(out, indent=2))
+    return 0
+
+
+def cli_write_cache(args) -> int:
+    progress_md = _progress_md_for_slug(args.task_slug)
+    plan_hash = _compute_plan_hash(progress_md)
+    base_commit = _get_base_commit(REPO_ROOT)
+    parsed = json.loads(args.waves_json)
+    # Reconstruct task objects from id list (writes/reads not needed in cache)
+    tasks_from_plan = parse_plan_tasks(progress_md.read_text(encoding="utf-8"))
+    by_id = {t.id: t for t in tasks_from_plan}
+    waves_obj = [
+        [by_id.get(tid, Task(id=tid)) for tid in wave_ids]
+        for wave_ids in parsed["candidate_waves"]
+    ]
+    write_cache(
+        _cache_path_for_slug(args.task_slug),
+        plan_hash=plan_hash,
+        base_commit=base_commit,
+        controller_model=args.controller_model,
+        planner_version=PLANNER_VERSION,
+        cap_used=args.cap,
+        waves=waves_obj,
+        rationale=parsed.get("rationale", []),
+    )
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="flow wave planner")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_cc = sub.add_parser("cache-check")
+    p_cc.add_argument("--task-slug", required=True)
+    p_cc.add_argument("--controller-model", required=True)
+    p_cc.add_argument("--cap", type=int, required=True)
+    p_cc.set_defaults(func=cli_cache_check)
+
+    p_dc = sub.add_parser("decompose")
+    p_dc.add_argument("--task-slug", required=True)
+    p_dc.add_argument("--controller-model", required=True)
+    p_dc.add_argument("--cap", type=int, required=True)
+    p_dc.set_defaults(func=cli_decompose)
+
+    p_wc = sub.add_parser("write-cache")
+    p_wc.add_argument("--task-slug", required=True)
+    p_wc.add_argument("--controller-model", required=True)
+    p_wc.add_argument("--cap", type=int, required=True)
+    p_wc.add_argument("--waves-json", required=True)
+    p_wc.set_defaults(func=cli_write_cache)
+
+    args = ap.parse_args()
+    sys.exit(args.func(args))
+
+
+if __name__ == "__main__":
+    main()
