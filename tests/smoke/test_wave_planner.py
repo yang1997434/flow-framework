@@ -208,5 +208,43 @@ class TestPackIntoWaves(unittest.TestCase):
         self.assertEqual(len(waves), 2)
 
 
+import json
+import tempfile
+
+
+class TestWaveCache(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.cache_path = Path(self.tmpdir) / "wave-decomposition.json"
+
+    def test_cache_write_and_read(self):
+        from flow_wave_planner import write_cache, read_cache
+        waves = [[Task(id="t1", writes=["a.py"])]]
+        write_cache(
+            self.cache_path,
+            plan_hash="abc",
+            base_commit="def123",
+            controller_model="claude-opus-4-7",
+            planner_version="1.0.0",
+            cap_used=3,
+            waves=waves,
+        )
+        cached = read_cache(self.cache_path)
+        self.assertEqual(cached["plan_hash"], "abc")
+        self.assertEqual(cached["base_commit"], "def123")
+        self.assertEqual(len(cached["waves"]), 1)
+
+    def test_cache_invalidates_on_plan_hash(self):
+        from flow_wave_planner import is_cache_valid
+        cached = {"plan_hash": "abc", "base_commit": "def", "controller_model": "m1",
+                  "planner_version": "1.0.0", "cap_used": 3}
+        self.assertTrue(is_cache_valid(cached, "abc", "def", "m1", "1.0.0", 3))
+        self.assertFalse(is_cache_valid(cached, "abc2", "def", "m1", "1.0.0", 3))  # plan changed
+        self.assertFalse(is_cache_valid(cached, "abc", "def2", "m1", "1.0.0", 3))  # base moved
+        self.assertFalse(is_cache_valid(cached, "abc", "def", "m2", "1.0.0", 3))   # model upgrade
+        self.assertFalse(is_cache_valid(cached, "abc", "def", "m1", "2.0.0", 3))   # planner version
+        self.assertFalse(is_cache_valid(cached, "abc", "def", "m1", "1.0.0", 4))   # cap changed
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,11 +5,16 @@ Phase 2 (next commits): independence algorithm, cache, CLI.
 """
 from __future__ import annotations
 
+import datetime
+import json
 import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+
+PLANNER_VERSION = "1.0.0"  # Bump when SHARED_ARTIFACTS changes or algorithm semantics change
 
 
 class PlanError(ValueError):
@@ -297,3 +302,70 @@ def pack_into_waves(tasks: list[Task], cap: int = 3) -> list[list[Task]]:
             force_serial = False  # serial wave consumed, reset for next wave
         waves.append(wave)
     return waves
+
+
+# ---------------------------------------------------------------------------
+# Wave decomposition cache (Phase 2 / T6)
+# ---------------------------------------------------------------------------
+
+
+def write_cache(
+    cache_path: Path,
+    *,
+    plan_hash: str,
+    base_commit: str,
+    controller_model: str,
+    planner_version: str,
+    cap_used: int,
+    waves: list[list[Task]],
+    rationale: list = None,
+) -> None:
+    """Write wave-decomposition.json. Atomic via tmp+rename."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "plan_hash": plan_hash,
+        "base_commit": base_commit,
+        "controller_model": controller_model,
+        "planner_version": planner_version,
+        "cap_used": cap_used,
+        "computed_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "waves": [
+            {
+                "index": i,
+                "tasks": [t.id for t in wave],
+            }
+            for i, wave in enumerate(waves)
+        ],
+        "rationale": rationale or [],
+    }
+    tmp = cache_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(cache_path)
+
+
+def read_cache(cache_path: Path) -> Optional[dict]:
+    """Return parsed cache or None if missing/malformed."""
+    if not cache_path.is_file():
+        return None
+    try:
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def is_cache_valid(
+    cached: dict,
+    plan_hash: str,
+    base_commit: str,
+    controller_model: str,
+    planner_version: str,
+    cap_used: int,
+) -> bool:
+    """All 5 keys must match for cache to be valid."""
+    return (
+        cached.get("plan_hash") == plan_hash
+        and cached.get("base_commit") == base_commit
+        and cached.get("controller_model") == controller_model
+        and cached.get("planner_version") == planner_version
+        and cached.get("cap_used") == cap_used
+    )
