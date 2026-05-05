@@ -43,6 +43,22 @@ def find_project_flow(start: Path) -> Path | None:
 
 SECTION_NAMES = ["Plan", "Execute Log", "Verify Report", "Sediment Notes"]
 
+# Canonical phase progression. Used by min_phase() to clamp section-based
+# advancement against the user's explicit frontmatter declaration.
+PHASE_ORDER = ("phase1-plan", "phase2-execute", "phase3-finish", "phase4-sediment", "done")
+
+# Map progress.md frontmatter `phase:` field (the user-authoritative declaration)
+# to the canonical phase output names. Frontmatter values are documented in the
+# task template comments: triage | research | implement | check | verify | sediment.
+PHASE_FRONTMATTER_MAP = {
+    "triage":    "phase1-plan",
+    "research":  "phase1-plan",
+    "implement": "phase2-execute",
+    "check":     "phase3-finish",
+    "verify":    "phase3-finish",
+    "sediment":  "phase4-sediment",
+}
+
 # Match old-format autosave breadcrumbs that may linger in pre-fix progress.md
 # files. Pattern variants observed in pre-fix files:
 #   - [YYYY-MM-DD HH:MM] distill queued
@@ -65,6 +81,35 @@ def extract_section(text: str, name: str) -> str:
     return m.group(1) if m else ""
 
 
+def parse_frontmatter_phase(text: str) -> str | None:
+    """Extract the `phase:` field from YAML frontmatter and map to canonical name.
+
+    Returns one of PHASE_ORDER values, or None if no frontmatter / no phase field /
+    unrecognized value. Defensive against malformed YAML — never raises.
+    """
+    m = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
+    if not m:
+        return None
+    pm = re.search(r"^\s*phase:\s*([A-Za-z][A-Za-z0-9_-]*)", m.group(1), re.MULTILINE)
+    if not pm:
+        return None
+    return PHASE_FRONTMATTER_MAP.get(pm.group(1))
+
+
+def min_phase(a: str, b: str) -> str:
+    """Return the earlier of two canonical phases per PHASE_ORDER.
+
+    Why: section-based heuristic can over-advance when a downstream section gets
+    transient content (e.g. brainstorm milestones logged to Execute Log during
+    phase 1). The frontmatter `phase:` field is the user's authoritative
+    declaration and acts as an upper bound.
+    """
+    try:
+        return a if PHASE_ORDER.index(a) <= PHASE_ORDER.index(b) else b
+    except ValueError:
+        return a  # unknown phase string — fail safe to first arg
+
+
 def is_section_filled(content: str) -> bool:
     """A section is 'filled' iff it has non-template, non-comment, non-autosave content.
 
@@ -83,23 +128,33 @@ def is_section_filled(content: str) -> bool:
 
 
 def determine_phase(progress_md: Path) -> str:
-    """Detect current phase by checking which sections have user-filled content.
+    """Detect current phase by combining frontmatter declaration + section content.
 
-    Phase mapping (REQUIRES sequential filling — a later section being filled
-    no longer skips ahead past empty earlier sections):
+    Resolution order:
+      1. Section-based heuristic computes a candidate phase from filled sections
+         (sequential AND-chain — a later section being filled no longer skips
+         ahead past empty earlier sections).
+      2. Frontmatter `phase:` field acts as an UPPER BOUND on advancement.
+         If the user explicitly says they're still in phase1 (triage/research)
+         or phase2 (implement), we respect that even if Execute Log has content.
+
+    Section heuristic mapping:
       - Plan empty                                   → phase1-plan
       - Plan filled, Execute empty                    → phase2-execute
       - Plan + Execute filled, Verify empty           → phase3-finish
       - Plan + Execute + Verify filled, Sediment empty → phase4-sediment
       - All four filled                              → done
 
-    Why sequential: prior version returned `done` whenever Sediment Notes had
-    *any* non-template content, even if Plan was empty. That allowed
-    automated breadcrumbs (or stray writes) to a downstream section to fool
-    the phase determination. Sequential AND-chain blocks that.
+    Why frontmatter cap: brainstorm milestones (e.g. "sub-agent dispatched",
+    "decisions locked") logged to Execute Log during phase 1 should NOT
+    auto-advance the phase to phase3-finish. The user's explicit `phase:
+    triage|research` declaration in frontmatter is the authoritative signal
+    of where they are; /flow:continue is responsible for advancing it.
 
-    Future enhancement: optional `<!-- phaseN-approved -->` markers for
-    explicit user-gating. Currently relies on sequential filling alone.
+    Why min(): if the user manually advances frontmatter to "implement" but
+    Plan section is still empty, sections (phase1-plan) win — prevents the
+    inverse bug where a stale frontmatter advance jumps the displayed phase
+    past actual artifact reality.
     """
     if not progress_md.is_file():
         return "phase1-plan"
@@ -113,14 +168,28 @@ def determine_phase(progress_md: Path) -> str:
     sediment_filled = verify_filled and sections["Sediment Notes"]
 
     if sediment_filled:
+        section_phase = "done"
+    elif verify_filled:
+        section_phase = "phase4-sediment"
+    elif execute_filled:
+        section_phase = "phase3-finish"
+    elif plan_filled:
+        section_phase = "phase2-execute"
+    else:
+        section_phase = "phase1-plan"
+
+    # Section heuristic wins when artifacts say "done" (all 4 sections filled).
+    # Why: PHASE_FRONTMATTER_MAP has no key for "done" — the frontmatter enum
+    # tops out at `sediment` (= phase4-sediment). If we always cap by frontmatter,
+    # a fully-completed task with `phase: sediment` would forever report
+    # phase4-sediment instead of done, even after Sediment Notes is filled.
+    # Letting `done` short-circuit the cap preserves natural completion state.
+    if section_phase == "done":
         return "done"
-    if verify_filled:
-        return "phase4-sediment"
-    if execute_filled:
-        return "phase3-finish"
-    if plan_filled:
-        return "phase2-execute"
-    return "phase1-plan"
+    fm_phase = parse_frontmatter_phase(text)
+    if fm_phase is not None:
+        return min_phase(fm_phase, section_phase)
+    return section_phase
 
 
 def main():

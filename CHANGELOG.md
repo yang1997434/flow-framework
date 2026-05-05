@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.5.8 (2026-05-05)
+
+Phase determination now respects user's authoritative `phase:` declaration in
+progress.md frontmatter as an upper bound on section-based advancement. Fixes
+the brainstorm-stuck-at-phase3 bug where logging brainstorm milestones
+(sub-agent dispatches, decision lock entries) into `## Execute Log` during
+phase 1 caused `<flow-state>` to mis-report the task as `phase3-finish` even
+though the user was still iterating on prd.md and the architecture wasn't
+locked.
+
+### Fixed
+
+- **Phase-state spurious advancement** (`claude/hooks/user-prompt-submit.py`):
+  `determine_phase` now combines section-based heuristic with the frontmatter
+  `phase:` field as an upper-bound cap. If the user explicitly sets
+  `phase: triage` or `phase: research`, the hook returns `phase1-plan`
+  regardless of how much content lives in `## Execute Log`. The frontmatter
+  value is the authoritative declaration of "where I am"; `/flow:continue` is
+  responsible for advancing it. Section heuristic still wins in the inverse
+  direction (stale frontmatter `implement` with empty Plan → phase1-plan from
+  sections), so a forgotten frontmatter advance can't promote past actual
+  artifact reality.
+
+### Added
+
+- New helpers in `claude/hooks/user-prompt-submit.py`: `parse_frontmatter_phase`
+  (extracts and maps the YAML `phase:` field; defensive against malformed YAML),
+  `min_phase` (returns the earlier of two canonical phases per `PHASE_ORDER`).
+  Constants: `PHASE_ORDER`, `PHASE_FRONTMATTER_MAP`.
+- Test coverage in `tests/smoke/test_phase_determination.py`: 21 new tests
+  across `FrontmatterPhaseParse`, `MinPhase`, `FrontmatterPhaseCap` classes —
+  including the actual user-reported regression case (frontmatter triage +
+  Plan/Execute filled with brainstorm artifacts → must return phase1-plan)
+  and the cross-model codex review finding (sections-all-filled → must reach
+  done even when frontmatter caps at `sediment`).
+
+### Cross-model review notes
+
+Per cross-model codex review on this fix, the section heuristic is now allowed
+to short-circuit the frontmatter cap when `section_phase == "done"`. Why:
+`PHASE_FRONTMATTER_MAP` has no key for `done` (the frontmatter enum tops out at
+`sediment`), so without this short-circuit, a fully-completed task with
+`phase: sediment` and all sections filled would forever report `phase4-sediment`
+instead of `done`. Two regression tests added.
+
 ## v0.5.7 (2026-05-05)
 
 Stabilization release. Fixes the Sonnet alias env-var routing that was

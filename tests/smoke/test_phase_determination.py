@@ -218,5 +218,197 @@ class DeterminePhaseRegression(unittest.TestCase):
         )
 
 
+class FrontmatterPhaseParse(unittest.TestCase):
+    """`parse_frontmatter_phase` extracts and maps the YAML `phase:` field."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ups = load_ups()
+
+    def test_no_frontmatter_returns_none(self):
+        self.assertIsNone(self.ups.parse_frontmatter_phase("## Plan\n- foo\n"))
+
+    def test_frontmatter_without_phase_field_returns_none(self):
+        text = "---\nslug: foo\nstatus: active\n---\n## Plan\n"
+        self.assertIsNone(self.ups.parse_frontmatter_phase(text))
+
+    def test_unknown_phase_value_returns_none(self):
+        text = "---\nphase: bogus\n---\n"
+        self.assertIsNone(self.ups.parse_frontmatter_phase(text))
+
+    def test_each_known_phase_maps_correctly(self):
+        cases = {
+            "triage":    "phase1-plan",
+            "research":  "phase1-plan",
+            "implement": "phase2-execute",
+            "check":     "phase3-finish",
+            "verify":    "phase3-finish",
+            "sediment":  "phase4-sediment",
+        }
+        for fm_value, expected in cases.items():
+            with self.subTest(fm_value=fm_value):
+                text = f"---\nphase: {fm_value}\n---\n"
+                self.assertEqual(self.ups.parse_frontmatter_phase(text), expected)
+
+    def test_phase_with_inline_comment_still_parses(self):
+        text = "---\nphase: triage    # triage | research | implement | check | verify | sediment\n---\n"
+        self.assertEqual(self.ups.parse_frontmatter_phase(text), "phase1-plan")
+
+
+class MinPhase(unittest.TestCase):
+    """`min_phase` returns whichever canonical phase comes earlier."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ups = load_ups()
+
+    def test_basic_ordering(self):
+        self.assertEqual(self.ups.min_phase("phase1-plan", "phase3-finish"), "phase1-plan")
+        self.assertEqual(self.ups.min_phase("phase3-finish", "phase1-plan"), "phase1-plan")
+        self.assertEqual(self.ups.min_phase("phase2-execute", "phase4-sediment"), "phase2-execute")
+
+    def test_equal_phases(self):
+        self.assertEqual(self.ups.min_phase("phase2-execute", "phase2-execute"), "phase2-execute")
+
+    def test_done_is_latest(self):
+        self.assertEqual(self.ups.min_phase("done", "phase4-sediment"), "phase4-sediment")
+        self.assertEqual(self.ups.min_phase("done", "phase1-plan"), "phase1-plan")
+
+    def test_unknown_phase_falls_safe(self):
+        # Unknown phase string — must not raise, returns first arg.
+        self.assertEqual(self.ups.min_phase("phase1-plan", "bogus-phase"), "phase1-plan")
+
+
+class FrontmatterPhaseCap(unittest.TestCase):
+    """Frontmatter `phase:` declaration caps section-based advancement.
+
+    Regression test for: brainstorm milestones logged to Execute Log during
+    phase 1 caused determine_phase to return phase3-finish even though the
+    user was still in brainstorm (frontmatter said `phase: triage`).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ups = load_ups()
+
+    def _phase_of(self, content: str) -> str:
+        p = make_progress_md(content)
+        try:
+            return self.ups.determine_phase(p)
+        finally:
+            p.unlink()
+
+    def test_brainstorm_milestones_in_execute_log_dont_jump_past_phase1(self):
+        """The actual bug user hit: frontmatter says triage (still brainstorming),
+        Plan + Execute Log both filled with brainstorm artifacts. Section-only
+        heuristic returns phase3-finish; frontmatter cap pulls back to phase1-plan."""
+        content = (
+            "---\n"
+            "slug: geo-framework\n"
+            "status: active\n"
+            "phase: triage    # triage | research | implement | check | verify | sediment\n"
+            "---\n"
+            "## Plan\n"
+            "Phase 2 拆为 6 个 sub-task...\n"
+            "## Execute Log\n"
+            "| time | agent | scope | outcome |\n"
+            "| 2026-05-05 02:50 | PAUSE | Phase 1 brainstorm | sub-agent dispatched |\n"
+            "## Verify Report\n<!-- TEMPLATE -->\n"
+            "## Sediment Notes\n<!-- TEMPLATE -->\n"
+        )
+        self.assertEqual(
+            self._phase_of(content),
+            "phase1-plan",
+            "frontmatter `phase: triage` must cap section advancement at phase1-plan",
+        )
+
+    def test_research_phase_caps_at_phase1(self):
+        """`phase: research` is still phase 1 territory."""
+        content = (
+            "---\nphase: research\n---\n"
+            "## Plan\n- Plan.\n"
+            "## Execute Log\n- Brainstorm log.\n"
+            "## Verify Report\n<!-- TEMPLATE -->\n"
+            "## Sediment Notes\n<!-- TEMPLATE -->\n"
+        )
+        self.assertEqual(self._phase_of(content), "phase1-plan")
+
+    def test_implement_caps_at_phase2_when_execute_log_has_content(self):
+        """User advanced frontmatter to `implement` but Execute Log has work
+        logged: cap at phase2-execute (not phase3-finish)."""
+        content = (
+            "---\nphase: implement\n---\n"
+            "## Plan\n- Plan.\n"
+            "## Execute Log\n- Implementation step done.\n"
+            "## Verify Report\n<!-- TEMPLATE -->\n"
+            "## Sediment Notes\n<!-- TEMPLATE -->\n"
+        )
+        self.assertEqual(self._phase_of(content), "phase2-execute")
+
+    def test_frontmatter_does_not_promote_past_section_reality(self):
+        """Inverse direction: stale frontmatter `implement` but Plan is empty.
+        Sections (phase1-plan) must win — frontmatter is a CAP not a floor."""
+        content = (
+            "---\nphase: implement\n---\n"
+            "## Plan\n<!-- TEMPLATE -->\n"
+            "## Execute Log\n<!-- TEMPLATE -->\n"
+            "## Verify Report\n<!-- TEMPLATE -->\n"
+            "## Sediment Notes\n<!-- TEMPLATE -->\n"
+        )
+        self.assertEqual(self._phase_of(content), "phase1-plan")
+
+    def test_no_frontmatter_falls_back_to_section_logic(self):
+        """No frontmatter at all → pure section-based heuristic (legacy behavior)."""
+        content = (
+            "## Plan\n- Plan.\n"
+            "## Execute Log\n- Did the thing.\n"
+            "## Verify Report\n<!-- TEMPLATE -->\n"
+            "## Sediment Notes\n<!-- TEMPLATE -->\n"
+        )
+        self.assertEqual(self._phase_of(content), "phase3-finish")
+
+    def test_frontmatter_without_phase_falls_back_to_section_logic(self):
+        """Frontmatter present but no `phase:` field → section logic only."""
+        content = (
+            "---\nslug: foo\nstatus: active\n---\n"
+            "## Plan\n- Plan.\n"
+            "## Execute Log\n- Did the thing.\n"
+            "## Verify Report\n<!-- TEMPLATE -->\n"
+            "## Sediment Notes\n<!-- TEMPLATE -->\n"
+        )
+        self.assertEqual(self._phase_of(content), "phase3-finish")
+
+    def test_completed_task_with_sediment_frontmatter_reaches_done(self):
+        """Codex P2 finding: PHASE_FRONTMATTER_MAP has no `done` value, so
+        a fully completed task with `phase: sediment` would forever report
+        phase4-sediment instead of done. Section heuristic must win when
+        all 4 sections are filled (= done state)."""
+        content = (
+            "---\nphase: sediment\n---\n"
+            "## Plan\n- Plan.\n"
+            "## Execute Log\n- Implementation log.\n"
+            "## Verify Report\n- Tests pass.\n"
+            "## Sediment Notes\n- ADR captured.\n"
+        )
+        self.assertEqual(
+            self._phase_of(content),
+            "done",
+            "fully filled sections must reach done even with frontmatter cap",
+        )
+
+    def test_completed_task_with_implement_frontmatter_still_reaches_done(self):
+        """Same finding, additional case: user forgot to advance frontmatter
+        past `implement` but actually completed all phases. Sections (done)
+        must still win — the artifact reality is what counts when truly done."""
+        content = (
+            "---\nphase: implement\n---\n"
+            "## Plan\n- Plan.\n"
+            "## Execute Log\n- Done.\n"
+            "## Verify Report\n- Verified.\n"
+            "## Sediment Notes\n- Lessons.\n"
+        )
+        self.assertEqual(self._phase_of(content), "done")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
