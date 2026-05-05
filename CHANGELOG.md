@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.7.0 — 2026-05-05
+
+### Major: Dependency-aware parallel subagent dispatch
+
+Phase 2 now supports `wave-dispatch` mode: implementer subagents that touch disjoint files run in parallel within a "wave"; cross-wave runs sequential. Conservative defaults (cap=3, mechanical disjointness primary, LLM concept-veto, post-hoc git-diff verification, shared-artifact denylist).
+
+**New skills**:
+- `flow:flow-wave-planner` — decompose plan into waves, cache reproducibly
+- `flow:flow-wave-runner` — paired implementer/spec-reviewer dispatch + sequential merge + code-quality reviewer
+
+**New capabilities**: `wave_planning`, `wave_dispatch`.
+
+**New CLI**:
+- `flow waves --preview <slug>` / `--show <slug>` / `--invalidate <slug>` — wave decomposition inspection
+- `flow doctor` — extended with writes hygiene, broad-glob, SHARED_ARTIFACTS overlap, stale cache
+- `flow doctor --suggest-writes <slug>` — advisory `writes:` suggestions for legacy plans
+
+**Plan schema**: optional `### Tasks` YAML block in progress.md with per-task `writes:` glob (and `reads:` hint). Plans without `### Tasks` block fall back to all-serial (zero regression).
+
+**Capability fallback**: missing `wave_planning` or `wave_dispatch` → automatic fallback to existing v0.6 dispatch path (zero regression for users without v0.7).
+
+### Backwards compatibility
+
+- All v0.6.x plans run unchanged
+- Capability registry baseline preserved (no removals)
+- No behavior changes for existing flow doctor / flow task / flow promote subcommands
+
+### Spec
+
+Full design: `docs/superpowers/specs/2026-05-05-v0.7-parallel-dispatch-design.md` (3 rounds of codex consult absorbed: round-1 architecture, round-2 bug fixes including LLM-veto-only / per-task pre-post diff / SHARED_ARTIFACTS glob-overlap / failed_blocking-non-waivable, round-3 verification fixes including per-task pre-post sha verifier and contiguous-prefix planner).
+
+### Out of scope (deferred to v0.8+)
+
+- Cross-phase parallel
+- Subagent-to-subagent direct communication within a wave
+- Auto-learning from historical plan executions
+
 ## v0.6.1 (2026-05-05)
 
 Patch addressing the two Minor follow-ups from v0.6.0 final code review

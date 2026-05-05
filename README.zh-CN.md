@@ -21,6 +21,10 @@
 | **凭据安全** | vault 不存密码 + `~/.flow/credentials.local` + grep 自检 |
 | **远程 SSH 友好** | 相对路径、无 GUI 依赖、machine-id 隔离 |
 
+**v0.7+ 新特性**：
+
+- **v0.7+：依赖感知的并行 subagent 调度** — plan 里每个 task 声明 `writes:` glob；框架验证文件不相交，独立 task 在 wave 内并行执行，跨 wave 串行集成。详见 `docs/superpowers/specs/2026-05-05-v0.7-parallel-dispatch-design.md`。
+
 ## 快速上手
 
 ```bash

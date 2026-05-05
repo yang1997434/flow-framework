@@ -21,6 +21,10 @@ A composable framework that wraps your existing skill ecosystem (superpowers / i
 | **Credential safety** | Vault never holds secrets; `~/.flow/credentials.local` + grep self-check |
 | **Remote SSH ready** | Relative paths, no GUI deps, machine-id-keyed runtime |
 
+**v0.7+ feature highlights**:
+
+- **v0.7+: dependency-aware parallel subagent dispatch** — declare per-task `writes:` glob in plans; framework verifies disjointness, runs independent tasks in parallel waves with sequential cross-wave integration. See `docs/superpowers/specs/2026-05-05-v0.7-parallel-dispatch-design.md`.
+
 ## Quick start
 
 ```bash
