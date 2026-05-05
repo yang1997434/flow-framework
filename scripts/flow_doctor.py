@@ -308,6 +308,66 @@ def check_context_mode_running() -> None:
         )
 
 
+def _is_dependency_available(name: str) -> bool:
+    """Check whether a capability dependency is available.
+
+    `requires_cli` in capability entries has mixed semantics — some values
+    name actual PATH binaries (e.g. `codex`), others name skill bundles
+    installed under `~/.claude/skills/<name>/` (e.g. `gstack`). Check both
+    locations: skill bundle dir first (cheap), then PATH binary fallback.
+    """
+    skill_bundle = Path.home() / ".claude" / "skills" / name
+    if skill_bundle.is_dir():
+        return True
+    return shutil.which(name) is not None
+
+
+def check_capability_clis() -> None:
+    """Check that each capability's `requires_cli` is available.
+
+    Walks the capability registry, collects every entry that declares
+    `requires_cli`, and warns if the named dependency is missing. This is a
+    warning, not a failure — capabilities marked `skip_if_not_available: true`
+    degrade gracefully at render time, but the user benefits from knowing
+    which capabilities will silently no-op so they're not surprised when,
+    e.g., Phase 3's `quality_health` step does nothing.
+
+    Pre-existing in v0.5: `cross_model_*` capabilities had `requires_cli` but
+    nothing consumed it. v0.6.1 closes that gap (issue #10).
+    """
+    section("Capability CLI requirements")
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    try:
+        from flow_capability import load_registry  # noqa: E402
+    except ImportError:
+        warn("capability registry", "could not import flow_capability — skipping check")
+        return
+
+    reg = load_registry()
+    missing: dict[str, list[str]] = defaultdict(list)
+    checked = 0
+    for cap_name, cap in reg.capabilities.items():
+        cli = cap.get("requires_cli")
+        if not cli:
+            continue
+        clis = cli if isinstance(cli, list) else [cli]
+        for c in clis:
+            checked += 1
+            if not _is_dependency_available(c):
+                missing[c].append(cap_name)
+
+    if not missing:
+        ok("all capability deps available", f"{checked} requires_cli entries checked")
+        return
+
+    for dep, caps in sorted(missing.items()):
+        preview = ", ".join(caps[:3]) + ("..." if len(caps) > 3 else "")
+        warn(
+            f"{dep} not available (PATH binary or ~/.claude/skills/{dep}/)",
+            f"affects {len(caps)} capability/ies: {preview}",
+        )
+
+
 def main():
     if not DEPS_FILE.is_file():
         print(f"{RED}ERROR: dependencies.json not found at {DEPS_FILE}{RESET}", file=sys.stderr)
@@ -324,6 +384,7 @@ def main():
     iso_status = check_hook_isolation()
     check_user_local_overrides(deps)
     check_context_mode_running()
+    check_capability_clis()
 
     total_missing = missing_cmds + missing_plugins + missing_external
     print()

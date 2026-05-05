@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.6.1 (2026-05-05)
+
+Patch addressing the two Minor follow-ups from v0.6.0 final code review
+(closes #9, #10). Both were "documentation / observability gaps that
+don't break anything but defer surprise to runtime." Folded into a single
+patch since they're small and complementary.
+
+### Fixed
+
+- **#9 — `safety_guardrails` cross-phase discoverability**: each phase
+  SKILL.md (`flow-phase{1,2,3,4}-*/SKILL.md`) now begins with a one-line
+  blockquote referencing `{{capability:safety_guardrails}}` and pointing
+  to the orchestrator's `§Cross-cutting capabilities` section. Previously
+  the safety reminder was only in `flow-orchestrator/SKILL.md`, which is
+  not loaded once a phase skill takes over. Now the reminder is in active
+  context regardless of which phase Claude is executing. Per-phase
+  destructive-op examples tailored to that phase's typical operations
+  (Phase 2: `git reset --hard` / migrations / `kubectl delete`; Phase 3:
+  `git branch -D` / force-push / `git clean -fd`; etc).
+
+- **#10 — capability `requires_cli` is now consumed by `flow doctor`**:
+  new `check_capability_clis()` walks the registry and warns if any
+  capability's declared `requires_cli` dependency is missing. Mixed-
+  semantics aware: `requires_cli` may name either a PATH binary
+  (e.g. `codex`) OR a Claude skill bundle under `~/.claude/skills/<name>/`
+  (e.g. `gstack`). New helper `_is_dependency_available()` checks both
+  locations. Pre-existing in v0.5: `cross_model_*` capabilities had
+  `requires_cli` set but nothing consumed it; v0.6.0 added 11 more
+  entries with the same pattern. v0.6.1 closes the loop — `flow doctor`
+  now warns "gstack not available — affects 11 capability/ies: …" if the
+  user hasn't installed gstack, surfacing what would silently no-op.
+
+### Added — tests
+
+- `tests/smoke/test_doctor_capability_clis.py` — 4 tests covering
+  `_is_dependency_available()` (skill bundle / PATH binary / missing) and
+  `check_capability_clis()` (no-crash + warning emission when missing).
+  Suite total grows 15 → 19.
+
+### Migration
+
+Pure additive — no schema changes, no removed capabilities. Re-run
+`flow install render-prompts` after upgrade to refresh phase SKILL.md
+files with the new safety blockquote.
+
 ## v0.6.0 (2026-05-05)
 
 Capability registry expansion — wires 19 new capabilities from gstack /

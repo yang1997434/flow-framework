@@ -7,6 +7,8 @@ description: "Use when running Phase 4 of Flow framework — promote ADRs/patter
 
 Capture learnings before moving on. Forced phase even if "nothing to sediment".
 
+> **Safety**: before any destructive operation in this phase (archive task = `git mv`, branch deletion via branch_finish, force-push to release branch), invoke `{{capability:safety_guardrails}}`. See orchestrator §Cross-cutting capabilities.
+
 ## Why this is its own phase
 
 Human instinct after task = "done, move on". Folding sediment into Phase 3 = it gets skipped. Independent Phase 4 forces conscious thought.

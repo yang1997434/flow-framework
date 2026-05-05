@@ -7,6 +7,8 @@ description: "Use when running Phase 3 of Flow framework — fresh-context verif
 
 Verify the diff against prd.md + spec, run cross-model review if triggered, commit.
 
+> **Safety**: before any destructive operation in this phase (`git reset --hard`, force-push, `git branch -D`, `git clean -fd`), invoke `{{capability:safety_guardrails}}`. See orchestrator §Cross-cutting capabilities.
+
 ### Step 0 (MANDATORY): Verify before claiming done
 
 Before any other Phase 3 action, invoke `{{capability:verify_completion}}`. This skill enforces:

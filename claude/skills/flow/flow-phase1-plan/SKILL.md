@@ -7,6 +7,8 @@ description: "Use when running Phase 1 of Flow framework — brainstorming requi
 
 Run the planning phase: brainstorm → (optional research) → prd.md complete → ADR-lite if applicable.
 
+> **Safety**: before any destructive operation in this phase (rare in Phase 1, but possible during research bash commands), invoke `{{capability:safety_guardrails}}`. See orchestrator §Cross-cutting capabilities.
+
 ## Preconditions
 
 - Active task exists: `.flow/.current-task` points to a task dir with empty/templated prd.md

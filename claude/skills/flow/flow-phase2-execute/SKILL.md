@@ -7,6 +7,8 @@ description: "Use when running Phase 2 of Flow framework — sub-agent dispatch,
 
 Turn prd.md into code. Dispatch sub-agents per task type + change size.
 
+> **Safety**: before any destructive operation in this phase (`rm -rf`, `git reset --hard`, `DROP TABLE`, force-push, `kubectl delete`, migrations), invoke `{{capability:safety_guardrails}}`. See orchestrator §Cross-cutting capabilities.
+
 ## Step 1 — Determine dispatch strategy
 
 Read prd.md. Decide:
