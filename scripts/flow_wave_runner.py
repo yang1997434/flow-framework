@@ -7,6 +7,7 @@ and waiver log appending.
 """
 from __future__ import annotations
 
+import argparse
 import subprocess
 from pathlib import Path
 
@@ -55,3 +56,56 @@ def append_waiver(waiver_log_path: Path, *, task_id: str, state: str, rationale:
     line = f"[{timestamp}] WAIVE task={task_id} state={state} rationale={rationale!r}\n"
     with waiver_log_path.open("a", encoding="utf-8") as f:
         f.write(line)
+
+
+def cli_diff_names(args) -> int:
+    repo = args.repo or REPO_ROOT
+    files = diff_names_between_shas(repo, args.pre, args.post)
+    print("\n".join(files))
+    return 0
+
+
+def cli_verify_subset(args) -> int:
+    actual = args.actual.split() if args.actual else []
+    declared = args.declared.split(",") if args.declared else []
+    ok, violations = verify_subset_of_writes(actual, declared)
+    if not ok:
+        print(f"VIOLATIONS: {violations}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cli_waive(args) -> int:
+    log_path = REPO_ROOT / ".flow" / "tasks" / args.task_slug / "wave-decisions.log"
+    append_waiver(log_path, task_id=args.task_id, state=args.state, rationale=args.rationale)
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="flow wave runner helpers")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_dn = sub.add_parser("diff-names")
+    p_dn.add_argument("--pre", required=True)
+    p_dn.add_argument("--post", required=True)
+    p_dn.add_argument("--repo", default=None)
+    p_dn.set_defaults(func=cli_diff_names)
+
+    p_vs = sub.add_parser("verify-subset")
+    p_vs.add_argument("--actual", required=True, help="space-separated actual paths")
+    p_vs.add_argument("--declared", required=True, help="comma-separated declared globs")
+    p_vs.set_defaults(func=cli_verify_subset)
+
+    p_wv = sub.add_parser("waive")
+    p_wv.add_argument("--task-slug", required=True)
+    p_wv.add_argument("--task-id", required=True)
+    p_wv.add_argument("--state", required=True)
+    p_wv.add_argument("--rationale", required=True)
+    p_wv.set_defaults(func=cli_waive)
+
+    args = ap.parse_args()
+    sys.exit(args.func(args))
+
+
+if __name__ == "__main__":
+    main()
