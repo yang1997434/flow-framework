@@ -44,9 +44,7 @@ def _parse_task_yaml(yaml_text: str) -> dict:
     lines = yaml_text.splitlines()
     result: dict = {}
     current_list: list | None = None
-    current_list_key: str | None = None
     current_item: dict | None = None
-    top_indent: int | None = None  # indent of list items (the `-` character)
 
     def _parse_value(raw: str) -> object:
         """Parse a scalar or inline list value."""
@@ -84,14 +82,16 @@ def _parse_task_yaml(yaml_text: str) -> dict:
             key, _, val = content.partition(":")
             key = key.strip()
             val = val.strip()
+            # New top-level key — always reset the active list-item context so
+            # any subsequent indented `key: value` lines don't bleed into the
+            # previously open task. (Issue #3 fix.)
+            current_item = None
             if not val:
                 # Start of a block value (list or dict follows)
                 current_list = []
-                current_list_key = key
-                current_item = None
                 result[key] = current_list
-                top_indent = None
             else:
+                current_list = None
                 result[key] = _parse_value(val)
             continue
 
@@ -100,8 +100,6 @@ def _parse_task_yaml(yaml_text: str) -> dict:
             if current_list is None:
                 raise PlanError(f"Line {lineno}: list item outside of any key context")
             item_content = content[1:].strip()
-            if top_indent is None:
-                top_indent = indent
             current_item = {}
             current_list.append(current_item)
             if ":" in item_content:
@@ -128,12 +126,7 @@ def parse_plan_tasks(progress_md_text: str) -> list[Task]:
     if not match:
         return []
     yaml_text = match.group(1)
-    try:
-        data = _parse_task_yaml(yaml_text)
-    except PlanError:
-        raise
-    except Exception as e:
-        raise PlanError(f"failed to parse YAML in `### Tasks` block: {e}") from e
+    data = _parse_task_yaml(yaml_text)
 
     if not data or "tasks" not in data:
         return []

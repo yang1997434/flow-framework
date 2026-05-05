@@ -8,7 +8,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from flow_wave_planner import parse_plan_tasks, Task, PlanError  # noqa: E402
+from flow_wave_planner import parse_plan_tasks, Task, PlanError, _parse_task_yaml  # noqa: E402
 
 
 class TestParsePlanTasks(unittest.TestCase):
@@ -56,6 +56,38 @@ tasks:
 """
         tasks = parse_plan_tasks(progress_md)
         self.assertEqual(tasks[0].writes, None)
+
+    def test_stray_top_level_key_after_tasks_does_not_corrupt(self):
+        # Regression for issue #3: a new top-level key (e.g. `meta: foo`) after
+        # the tasks list must reset the parser's active-task context, so any
+        # subsequent indented `key: value` lines don't bleed into the previously
+        # open task. The task wrapper uses selective field assignment, so the
+        # observable contract is: t1 parses cleanly, exactly 1 task, id == "t1".
+        progress_md = """
+### Tasks
+```yaml
+tasks:
+  - id: t1
+meta: foo
+  orphan_key: bar
+```
+"""
+        tasks = parse_plan_tasks(progress_md)
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].id, "t1")
+        # writes was never declared → strict-serial sentinel preserved
+        self.assertIsNone(tasks[0].writes)
+        # Drop down to the parser internals to confirm the orphan key did not
+        # bleed into the inner task dict (Task() uses selective field
+        # assignment, so the bleed is not observable via the public API alone).
+        yaml_text = """
+tasks:
+  - id: t1
+meta: foo
+  orphan_key: bar
+"""
+        raw = _parse_task_yaml(yaml_text)
+        self.assertNotIn("orphan_key", raw["tasks"][0])
 
     def test_invalid_yaml_raises(self):
         progress_md = """
