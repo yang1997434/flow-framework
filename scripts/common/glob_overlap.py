@@ -10,6 +10,8 @@ import fnmatch
 import re
 from pathlib import PurePosixPath
 
+__all__ = ["GlobError", "globs_overlap", "is_broad_glob", "validate_glob"]
+
 
 class GlobError(ValueError):
     """Raised when a glob pattern violates v0.7 hygiene rules."""
@@ -36,6 +38,14 @@ def validate_glob(pattern: str) -> None:
         raise GlobError(f"parent-dir traversal not allowed: {pattern!r}")
     if is_broad_glob(p):
         raise GlobError(f"glob too broad: {pattern!r}")
+    # Reject consecutive '**' segments. They produce ambiguous regex with
+    # adjacent placeholders that the rewrite rules in _to_regex don't cover,
+    # and they're semantically redundant (a single '**' already matches any
+    # number of path components, including zero).
+    segments = p.split("/")
+    for i in range(len(segments) - 1):
+        if segments[i] == "**" and segments[i + 1] == "**":
+            raise GlobError(f"consecutive '**' segments not allowed: {pattern!r}")
 
 
 def _to_regex(pattern: str) -> str:
@@ -124,6 +134,10 @@ def _to_regex(pattern: str) -> str:
     # middle /__DOUBLESTAR__/ → match any middle segments
     # e.g. "src/**/foo" → "src/(?:.+/)?foo"
     regex = re.sub(r"/__DOUBLESTAR__/", "/(?:.+/)?", regex)
+
+    # Tripwire: any unconverted placeholder means a pattern shape slipped past
+    # validate_glob. Fail loud rather than silently produce a wrong regex.
+    assert "__DOUBLESTAR__" not in regex, f"unconverted placeholder in {pattern!r}"
 
     return f"^{regex}$"
 

@@ -6,7 +6,7 @@ Tests cover the formal contract:
   - Two globs overlap iff there exists at least one path matching both
   - Recursive ** matches nested paths
   - Non-recursive * matches only at one level
-  - Bare '*' / '**' / '**/*' are flagged as overforbroad
+  - Bare '*' / '**' / '**/*' are flagged as overly broad
   - Negation '!path' patterns are rejected
   - Repo-relative paths only (no leading /, no '..')
 """
@@ -92,6 +92,12 @@ class TestValidate(unittest.TestCase):
 
     def test_normal_glob_accepted(self):
         validate_glob("src/auth/**")  # no raise
+
+    def test_consecutive_double_star_rejected(self):
+        with self.assertRaises(GlobError):
+            validate_glob("src/**/**")
+        with self.assertRaises(GlobError):
+            validate_glob("**/**")
 
 
 if __name__ == "__main__":
