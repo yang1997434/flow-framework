@@ -101,5 +101,31 @@ tasks:
             parse_plan_tasks(progress_md)
 
 
+class TestSharedArtifacts(unittest.TestCase):
+    def test_load_shared_artifacts(self):
+        from flow_wave_planner import load_shared_artifacts
+        globs = load_shared_artifacts()
+        self.assertIn("VERSION", globs)
+        self.assertIn("**/package.json", globs)
+        # at least 5 entries
+        self.assertGreater(len(globs), 5)
+
+    def test_task_writing_to_shared_artifact_flagged(self):
+        from flow_wave_planner import wave_touches_shared
+        task = Task(id="t1", writes=["VERSION"])
+        self.assertTrue(wave_touches_shared([task]))
+
+    def test_task_with_normal_writes_not_flagged(self):
+        from flow_wave_planner import wave_touches_shared
+        task = Task(id="t1", writes=["src/foo.py"])
+        self.assertFalse(wave_touches_shared([task]))
+
+    def test_nested_lockfile_flagged(self):
+        from flow_wave_planner import wave_touches_shared
+        task = Task(id="t1", writes=["packages/foo/package-lock.json"])
+        # **/package-lock.json should match nested
+        self.assertTrue(wave_touches_shared([task]))
+
+
 if __name__ == "__main__":
     unittest.main()

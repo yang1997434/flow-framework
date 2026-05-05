@@ -6,8 +6,18 @@ Phase 2 (next commits): independence algorithm, cache, CLI.
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
+
+# Optional PyYAML support — used when available, falls back to regex parser
+try:
+    import yaml as _yaml_mod  # type: ignore
+
+    _HAS_YAML = True
+except ImportError:
+    _HAS_YAML = False
 
 
 class PlanError(ValueError):
@@ -155,3 +165,67 @@ def parse_plan_tasks(progress_md_text: str) -> list[Task]:
             description=str(t.get("description") or ""),
         ))
     return out
+
+
+# ---------------------------------------------------------------------------
+# SHARED_ARTIFACTS loader + overlap check (Phase 2 / T4)
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SHARED_ARTIFACTS_FILE = (
+    REPO_ROOT / "claude" / "skills" / "flow" / "flow-wave-runner" / "SHARED_ARTIFACTS.md"
+)
+
+# Match the shared_artifacts: YAML block in the markdown file
+_SHARED_BLOCK_RE = re.compile(
+    r"```yaml\s*\n(shared_artifacts:.*?)\n```",
+    re.DOTALL,
+)
+
+# Regex to extract individual glob entries from the flat list.
+# Decision: use a focused line-regex rather than _parse_task_yaml (which
+# expects dict-shaped items) or a full YAML parser (optional dep). The
+# SHARED_ARTIFACTS format is a fixed flat list of quoted/unquoted strings —
+# a single regex over lines is simplest and has no dependencies.
+_GLOB_LINE_RE = re.compile(r"^\s*-\s*\"?([^\"\n]+?)\"?\s*$", re.MULTILINE)
+
+
+def load_shared_artifacts() -> list[str]:
+    """Parse SHARED_ARTIFACTS.md and return the glob list.
+
+    The file contains a yaml block::
+
+        ```yaml
+        shared_artifacts:
+          # comment
+          - "**/package.json"
+          ...
+        ```
+
+    Returns an empty list if the file is missing or the block is absent.
+    """
+    if not SHARED_ARTIFACTS_FILE.is_file():
+        return []
+    text = SHARED_ARTIFACTS_FILE.read_text(encoding="utf-8")
+    m = _SHARED_BLOCK_RE.search(text)
+    if not m:
+        return []
+    yaml_text = m.group(1)
+    # Extract all `- "glob"` / `- glob` entries via regex (see _GLOB_LINE_RE).
+    return _GLOB_LINE_RE.findall(yaml_text)
+
+
+def wave_touches_shared(tasks: list[Task]) -> bool:
+    """Return True if any task's writes overlaps SHARED_ARTIFACTS globs."""
+    sys.path.insert(0, str(REPO_ROOT / "scripts" / "common"))
+    from glob_overlap import globs_overlap  # type: ignore  # noqa: PLC0415
+
+    shared = load_shared_artifacts()
+    if not shared:
+        return False
+    for task in tasks:
+        if task.writes is None:
+            continue
+        if globs_overlap(task.writes, shared):
+            return True
+    return False
