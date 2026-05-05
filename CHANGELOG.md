@@ -1,5 +1,104 @@
 # Changelog
 
+## v0.6.0 (2026-05-05)
+
+Capability registry expansion — wires 19 new capabilities from gstack /
+superpowers / pr-review-toolkit / planning-with-files / code-review into
+Flow's per-phase orchestration. Capability count grows 14 → 33. Phase 1
+gains hat-shifted brainstorming (Engineer / DX / Security perspectives)
+that replaces gstack:plan-*-review's batched output with one-question-
+at-a-time UX consistent with `superpowers:brainstorming`.
+
+### Added — Phase 1 (2 capabilities + hat-shift)
+
+- `multi_step_plan` → `planning-with-files:plan` (B/C-size tasks)
+- `dev_setup` → `gstack:setup-deploy` (deploy task initialization)
+- Phase 1 SKILL.md hat-shifted brainstorming continuation
+  (Engineer / DX / Security hats; user picks 0-N; same one-question-
+  at-a-time rhythm as base brainstorm)
+
+### Added — Phase 2 (5 capabilities)
+
+- `subagent_discipline` → `superpowers:subagent-driven-development`
+  (pairs with parallel_dispatch — discipline + orchestration)
+- `execute_plan_discipline` → `superpowers:executing-plans`
+  (closes loop with multi_step_plan)
+- `systematic_debug` → `superpowers:systematic-debugging`
+  (4-phase root-cause discipline; first-line debug)
+- `deep_investigate` → `gstack:investigate`
+  (escalation when systematic_debug insufficient)
+- `land_and_deploy` → `gstack:land-and-deploy`
+  (alt to deploy_chain; one-shot for small confident changes)
+
+### Added — Phase 3 (8 capabilities)
+
+- **`verify_completion`** → `superpowers:verification-before-completion`
+  **MANDATORY at Phase 3 entry — closes a security-class gap where
+  Flow previously allowed self-reported success without actual
+  verification. Non-skippable.**
+- `code_review_small` → `code-review:code-review`
+  (5 Sonnet parallel + Haiku confidence; diff < 200 lines)
+- `code_review_large` → `pr-review-toolkit:review-pr`
+  (6-specialist agent panel; diff ≥ 200 lines)
+- `review_request_etiquette` →
+  `superpowers:requesting-code-review,superpowers:receiving-code-review`
+  (request scope discipline + verify-before-agreeing chain)
+- `pre_land_review` → `gstack:review`
+  (SQL safety / LLM trust / conditional side effects)
+- `quality_health` → `gstack:health`
+  (composite 0-10 quality score; Phase 3 entry gate)
+- `perf_baseline` → `gstack:benchmark`
+  (Web Vitals + resource size regression; perf-sensitive tasks)
+- `post_deploy_qa` → `gstack:qa`
+  (active deployed-site QA; complements canary's passive monitoring)
+
+### Added — Phase 4 (2 capabilities)
+
+- `branch_finish` → `superpowers:finishing-a-development-branch`
+  (structured merge / PR / cleanup decision)
+- `changelog_gen` → `gstack:changelog-generator`
+  (auto-generate user-facing changelog from commit history)
+
+### Added — Cross-cutting (2 capabilities)
+
+- `safety_guardrails` → `gstack:careful`
+  (destructive command warnings — orchestrator invokes before
+  rm -rf / DROP TABLE / force-push / kubectl delete / migrations.
+  Hook-based auto-fire deferred to v0.7)
+- `weekly_retro` → `gstack:retro`
+  (cross-task weekly review; user-triggered or `/loop weekly`)
+
+### Added — defensive infrastructure
+
+- `scripts/flow_capability.py`: `load_registry()` strips `_`-prefixed
+  keys from capabilities and model_roles dicts (defends against marker-key
+  AttributeError in `flow_skill_diff.analyze_plugin` and noise pollution
+  in `cmd_list` output).
+- `tests/smoke/test_capability.py`: new `test_v06_additions_are_well_formed`
+  asserts each v0.6.0 capability has dict shape + `default` (str) +
+  `description` fields.
+
+### Out of scope (rejected during design)
+
+- `plan_ceo_critique` (gstack:plan-ceo-review) — user opted out
+- `autoplan` (gstack:autoplan) — bundles all 4 plan-*-review
+- `plan_eng_critique` / `plan_devex_critique` — replaced by hat-shift
+- `release_docs` / `project_learnings` / `security_audit` /
+  `silent-failure-hunter` — deferred to v0.7
+
+### Migration
+
+Pure additive — no existing capability removed or renamed. Project-level
+overrides in `.flow/config.local.yaml` continue to work. Re-run
+`flow install render-prompts` after upgrade to substitute new
+`{{capability:X}}` placeholders into `~/.claude/{commands,skills}/flow/`.
+
+### Tests
+
+`tests/smoke/test_capability.py` REQUIRED_CAPS extended 13 → 33 entries.
+Suite total grows 14 → 15 tests (new: `test_v06_additions_are_well_formed`).
+All pass + flow_selftest.py PASSED.
+
 ## v0.5.9 (2026-05-05)
 
 Cosmetic / UX cleanup. Fresh `flow init` no longer leaves the project in a
