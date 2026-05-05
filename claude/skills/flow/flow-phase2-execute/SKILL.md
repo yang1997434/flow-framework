@@ -37,6 +37,11 @@ flow Phase 2 supports three execution modes. Pick one based on the task profile 
 |------|-------------|-------------|
 | `interactive` (default) | Most tasks. Main session orchestrates: writes Plan, dispatches sub-agents, integrates, decides when to stop. Human-in-the-loop friendly. | Steps 2–8 below, with you as the conductor. |
 | `parallel-subagents` | ≥3 independent modules / breadth-first scopes that don't share contracts. Currently the dominant flow Phase 2 mode. | Same as interactive but with N sub-agents in parallel; each in its own worktree. Use `{{capability:parallel_dispatch}}` for orchestration discipline. |
+
+When dispatching sub-agents, **also** invoke `{{capability:subagent_discipline}}` for prompt + return-contract conventions (parallel_dispatch handles the orchestration; subagent_discipline handles the per-agent contract).
+
+When an implementation plan exists (from `{{capability:multi_step_plan}}` in Phase 1), invoke `{{capability:execute_plan_discipline}}` to follow it task-by-task with checkpoint commits.
+
 | `ralph-loop` | Long autonomous runs against a well-specified PRD checklist (every Acceptance Criterion is independently testable). Useful overnight / when you want to walk away. | Shell out to `scripts/flow_ralph.sh <task-slug>`. The script repeatedly invokes `claude --print` headlessly with fresh context per iteration; it picks the next `- [ ]` from prd.md, implements it, ticks the box, and exits when either the completion-promise string appears or `--max-iterations` (default 20) is hit. Logs land in `~/.flow/.runtime/ralph-<slug>.log`. |
 
 **Why bash, not the official ralph-wiggum plugin?** Anthropic's plugin loops via an in-session Stop hook, which (a) collides with flow's own `stop.py` and (b) cannot be cleanly nested inside a sub-agent — see `.flow/tasks/05-04-audit-flow-issues/research/B-context-mode-ralph-loop.md`. The bash wrapper sidesteps both issues by running each iteration as a fresh `claude --print` process.
@@ -126,6 +131,21 @@ Agent(
 ```
 
 For **cross ≥3 layers** changes: upgrade check sub-agent to Opus.
+
+### Deploy task type — execution path
+
+Two alternative paths (user picks based on confidence; do not auto-pick — surface the choice):
+
+- **`{{capability:deploy_chain}}`** (default for large features) — separate `ship` then `canary` monitoring then manual land. Use when you want to observe canary metrics before merging.
+- **`{{capability:land_and_deploy}}`** — one-shot merge + deploy + canary verify. Use for **small confident changes** where round-tripping through observation feels like overhead.
+
+Trigger condition: `Type: deploy` field in `prd.md` (set during `/flow:start` triage).
+
+### When stuck on a bug
+
+1. **First touch** — invoke `{{capability:systematic_debug}}` (iron-law 4-phase root-cause discipline). Don't reach for fixes; identify the root cause first.
+2. **Escalate if insufficient** — if systematic_debug isn't producing the answer after 1-2 cycles, invoke `{{capability:deep_investigate}}` for the heavier debugging pipeline.
+3. **Last resort** — `{{capability:cross_model_challenge}}` (mode={{capability:cross_model_challenge.args.mode}}) for adversarial cross-model attack on assumptions.
 
 ## Step 7 — Stuck protocol
 

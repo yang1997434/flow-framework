@@ -24,11 +24,26 @@ from flow_capability import load_registry, render  # noqa: E402
 
 
 REQUIRED_CAPS = {
+    # Original 14 (v0.5.x baseline)
     "brainstorm", "ux_brief",
     "cross_model_consult", "cross_model_review", "cross_model_challenge",
     "tdd", "worktree", "parallel_dispatch",
     "ui_implement", "ui_audit", "ui_visual_review",
-    "session_save", "deploy_chain",
+    "session_save", "deploy_chain", "behavioral_guidelines",
+    # v0.6.0 additions — Phase 1 (2)
+    "multi_step_plan", "dev_setup",
+    # v0.6.0 additions — Phase 2 (5)
+    "subagent_discipline", "execute_plan_discipline",
+    "systematic_debug", "deep_investigate",
+    "land_and_deploy",
+    # v0.6.0 additions — Phase 3 (8)
+    "verify_completion",
+    "code_review_small", "code_review_large", "review_request_etiquette",
+    "pre_land_review", "quality_health", "perf_baseline", "post_deploy_qa",
+    # v0.6.0 additions — Phase 4 (2)
+    "branch_finish", "changelog_gen",
+    # v0.6.0 additions — Cross-cutting (2)
+    "safety_guardrails", "weekly_retro",
 }
 REQUIRED_ROLES = {"triage", "research", "plan", "implement", "review"}
 
@@ -64,6 +79,23 @@ class RegistryDefaults(unittest.TestCase):
     def test_ui_audit_has_follow_with(self):
         cap = self.reg.resolve_capability("ui_audit")
         self.assertIn("follow_with", cap)
+
+    def test_v06_additions_are_well_formed(self):
+        """v0.6.0 additions must each be a dict with default+description."""
+        baseline_caps = {
+            "brainstorm", "ux_brief", "cross_model_consult", "cross_model_review",
+            "cross_model_challenge", "tdd", "worktree", "parallel_dispatch",
+            "ui_implement", "ui_audit", "ui_visual_review",
+            "session_save", "deploy_chain", "behavioral_guidelines",
+        }
+        v06_caps = REQUIRED_CAPS - baseline_caps
+        self.assertEqual(len(v06_caps), 19, "v0.6.0 should add exactly 19 caps")
+        for name in v06_caps:
+            cap = self.reg.resolve_capability(name)
+            self.assertIsInstance(cap, dict, f"{name}: must be dict")
+            self.assertIn("default", cap, f"{name}: missing 'default'")
+            self.assertIsInstance(cap["default"], str, f"{name}: 'default' must be str")
+            self.assertIn("description", cap, f"{name}: missing 'description'")
 
 
 class RenderBasics(unittest.TestCase):

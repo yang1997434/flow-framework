@@ -12,6 +12,12 @@ Run the planning phase: brainstorm → (optional research) → prd.md complete �
 - Active task exists: `.flow/.current-task` points to a task dir with empty/templated prd.md
 - Task type + complexity already classified by Triage
 
+## Step 0 — Deploy task config bootstrap
+
+Before brainstorming, check whether this is a deploy task. Read `prd.md` header fields (`Type:` and `Complexity:` lines) — these are written during `/flow:start` triage and are the authoritative source for task classification.
+
+If `Type: deploy` and `.flow/config.yaml` does not yet have a `deploy_target` field, invoke `{{capability:dev_setup}}` to detect platform (Fly/Render/Vercel/Netlify/Heroku/GitHub Actions/custom) and write deploy config. One-time per project. Skip if `deploy_target` already set.
+
 ## Step 1 — Brainstorm
 
 Invoke `{{capability:brainstorm}}` skill. Follow its protocol:
@@ -21,6 +27,26 @@ Invoke `{{capability:brainstorm}}` skill. Follow its protocol:
 - Prefer offering 2-3 concrete options over open-ended questions
 
 For UI tasks: **also invoke `{{capability:ux_brief}}`** to produce UX brief alongside requirements.
+
+### Optional: perspective-shifted continuation
+
+After base brainstorm completes (prd.md sketched), Flow may propose 0-N perspective-shifted brainstorming rounds. Each round = a new `{{capability:brainstorm}}` invocation with a hat-prompt prefix. Same one-question-at-a-time rhythm as base brainstorm. Output appends to prd.md as "Perspective Critique: <hat>" section.
+
+Available hats (user picks; do not auto-chain all):
+
+- **Engineer hat** — "You are a senior engineer reviewing this plan. Focus on architecture, data flow, edge cases, performance hotspots, and integration points. One question at a time."
+- **DX hat** — "You are a developer-experience reviewer. Focus on friction points: setup steps, error messages, CLI ergonomics, time-to-first-value. One question at a time."
+- **Security hat** — "You are a security reviewer. Focus on threat surfaces, secret handling, input validation, trust boundaries, and blast radius of destructive operations. One question at a time."
+
+When to use which hat:
+- Backend / API tasks → Engineer + Security
+- CLI / SDK / dev tooling → Engineer + DX
+- Anything touching prod / migrations / auth → add Security (regardless of task type)
+- (Note: CEO / market-fit perspective intentionally not offered — Flow assumes user has validated commercial viability before reaching Phase 1)
+
+### B/C-size tasks: file-protocol planning
+
+For tasks projected at multi-day / multi-file (体量 B 或 C per Flow triage), invoke `{{capability:multi_step_plan}}` after base brainstorm. Size classification is stored in the `Complexity:` field of `prd.md` (written during `/flow:start` triage): `moderate` = 体量 B, `complex` = 体量 C. This creates `task_plan.md`, `findings.md`, `progress.md` per Manus-style protocol — complementary to brainstorming's prd.md (prd.md = WHAT, task_plan.md = stepwise HOW).
 
 ## Step 2 — Auto-context (before asking)
 

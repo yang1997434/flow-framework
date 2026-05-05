@@ -87,6 +87,30 @@ After phase 1 completes, prompt user: `"Phase 1 done. Reply '/flow:continue' to 
 - **Don't load all 4 phase skills at once** — load each on demand to avoid context bloat
 - **Read** `{{REPO_ROOT}}/docs/编码框架.md` only when uncertain — don't read full doc on every invocation
 
+## Cross-cutting capabilities (any phase)
+
+These capabilities are not phase-specific — invoke them whenever the trigger pattern matches, regardless of which Flow phase you're in.
+
+### Safety guardrails
+
+Before any **destructive operation** in any phase, invoke `{{capability:safety_guardrails}}`. Destructive includes:
+
+- File system: `rm -rf`, `git clean -fd`, `git reset --hard`
+- Database: `DROP TABLE`, `TRUNCATE`, `DELETE FROM` without WHERE, migrations
+- Source control: `git push --force`, `git branch -D`, force-push to shared branches
+- Infrastructure: `kubectl delete`, `terraform destroy`, removing prod resources
+
+This capability provides destructive-command warnings the user can override per-occurrence. Hook-based auto-fire (so the user never has to remember to invoke) is deferred to v0.7 — for now, the orchestrator (you) is responsible for triggering it before the destructive command.
+
+### Weekly retrospective
+
+User-triggered (or scheduled via `/loop weekly /flow:retro`). Invoke `{{capability:weekly_retro}}` for cross-task weekly review:
+- All commits across the week
+- Work patterns (parallel vs serial, big PRs vs small)
+- Quality trends (test coverage delta, type errors over time)
+
+This complements Phase 4 sediment which is per-task — retro is per-week, fills the gap between task-local learnings and project-level direction.
+
 ## Quick Read Guide
 
 When you (the orchestrator) need framework reference:

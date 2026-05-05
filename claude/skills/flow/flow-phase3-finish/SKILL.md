@@ -7,7 +7,48 @@ description: "Use when running Phase 3 of Flow framework — fresh-context verif
 
 Verify the diff against prd.md + spec, run cross-model review if triggered, commit.
 
-## Step 1 — Final verify (Generator/Evaluator pattern)
+### Step 0 (MANDATORY): Verify before claiming done
+
+Before any other Phase 3 action, invoke `{{capability:verify_completion}}`. This skill enforces:
+- Run actual verification commands (tests, lint, type-check, smoke tests)
+- Confirm output matches expected before claiming success
+- Do not assert "tests pass" — show the test runner output
+
+This is non-skippable. The capability has no `skip_if_not_available` flag because superpowers is a baseline plugin.
+
+### Step 1: Quality gate (gstack-dependent)
+
+If gstack is installed, invoke `{{capability:quality_health}}` for a composite 0-10 quality score (typecheck + lint + tests + dead code). Treat scores < 7 as a Phase 3 blocker — investigate and fix before proceeding to review.
+
+If gstack is not installed, this capability is skipped (`skip_if_not_available: true`). Manual quality check the user judges sufficient.
+
+### Step 2: Code review (size-based routing)
+
+Determine diff size: `git diff --stat <base>..HEAD | tail -1`
+
+**BEFORE invoking any reviewer**: invoke the FIRST half of `{{capability:review_request_etiquette}}` — the requesting skill — for request scope discipline (clear scope, what to look at).
+
+Then route by diff size:
+- **Diff < 200 lines** → invoke `{{capability:code_review_small}}` (5 Sonnet parallel + Haiku confidence scoring; daily-driver)
+- **Diff ≥ 200 lines OR multi-module** → invoke `{{capability:code_review_large}}` (6-specialist agent panel; high coverage)
+
+Threshold configurable in `.flow/config.yaml` via `phases.check.review_size_threshold` (default 200).
+
+**AFTER reviewer responds**: invoke the SECOND half of `{{capability:review_request_etiquette}}` — the receiving skill — for feedback processing discipline (verify before agreeing — don't blindly accept all suggestions).
+
+### Step 3: Pre-land review (conditional)
+
+If the diff includes any of: SQL migrations, LLM prompt changes, conditional side-effects (feature flags, environment-dependent code paths), invoke `{{capability:pre_land_review}}` for specialist patterns the general reviewers miss.
+
+### Step 4: Performance baseline (conditional)
+
+If the task touches hot paths or critical user flows, invoke `{{capability:perf_baseline}}` for Web Vitals + resource size regression compare against the previous baseline. Pairs with quality_health (one for code quality, the other for runtime performance).
+
+### Step 5: Post-deploy QA (deploy task only)
+
+For deploy task types (`Type: deploy` field in prd.md), after ship completes invoke `{{capability:post_deploy_qa}}` for active QA on the deployed site (clicks login, fills forms). Complements canary's passive monitoring — canary alerts on failure; post_deploy_qa actively verifies success.
+
+## Step 6 — Final verify (Generator/Evaluator pattern)
 
 **Critical**: dispatch a **fresh-context** sub-agent. NOT main session self-check.
 
@@ -36,7 +77,7 @@ Agent(
 )
 ```
 
-## Step 2 — Codex cross-model review (if triggered)
+## Step 7 — Codex cross-model review (if triggered)
 
 **Mandatory triggers**:
 - Task labeled `--critical` / `--breaking`
@@ -54,16 +95,16 @@ If triggered: invoke `{{capability:cross_model_review}}` (mode={{capability:cros
 
 For UI tasks: also invoke `{{capability:ui_audit}}` (auto-follows with `{{capability:ui_audit.follow_with}}`) + `{{capability:ui_visual_review}}` (real browser visual audit).
 
-## Step 3 — Process verify + review output
+## Step 8 — Process verify + review output
 
 Aggregate findings:
 - **Must-fix**: address before commit (return to Phase 2 if needed)
 - **Should-fix**: address now or note for follow-up
 - **Nit**: ignore with rationale
 
-Apply must-fix items → re-run Step 1 fresh-context verify.
+Apply must-fix items → re-run Step 6 fresh-context verify.
 
-## Step 4 — Write Verify Report
+## Step 9 — Write Verify Report
 
 Append to progress.md `## Verify Report`:
 
@@ -77,7 +118,7 @@ Append to progress.md `## Verify Report`:
 - Commit hash: <pending>
 ```
 
-## Step 5 — Commit
+## Step 10 — Commit
 
 Before drafting the commit, re-anchor the three-step delivery rule from `~/.claude/rules/code-delivery.md`:
 1. **自测** — run small data through the full pipeline, no errors
@@ -111,7 +152,7 @@ On confirm:
 
 Update Verify Report with final commit hash.
 
-## Step 6 — Phase 3 done
+## Step 11 — Phase 3 done
 
 Tell user: "Phase 3 complete. `/flow:finish` to run Phase 4 sediment + auto-save + archive."
 

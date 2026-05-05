@@ -76,6 +76,120 @@
       "default": "andrej-karpathy-skills:karpathy-guidelines",
       "description": "Phase 2 — surgical changes / define success criteria / surface assumptions / avoid over-engineering",
       "skip_if_not_available": true
+    },
+
+    "_v0_6_phase1_additions": "Phase 1 capabilities added in v0.6.0",
+    "multi_step_plan": {
+      "default": "planning-with-files:plan",
+      "description": "Phase 1 — Manus-style file-protocol planning for B/C-size tasks (multi-day, multi-file)",
+      "skip_if_not_available": true
+    },
+    "dev_setup": {
+      "default": "gstack:setup-deploy",
+      "description": "Phase 1 (deploy task) — detect platform (Fly/Render/Vercel/Netlify/Heroku/GitHub Actions/custom) + write deploy config",
+      "requires_cli": "gstack",
+      "skip_if_not_available": true
+    },
+
+    "_v0_6_phase2_additions": "Phase 2 capabilities added in v0.6.0",
+    "subagent_discipline": {
+      "default": "superpowers:subagent-driven-development",
+      "description": "Phase 2 — sub-agent prompts + return contracts; pairs with parallel_dispatch (the latter handles orchestration mechanics)",
+      "skip_if_not_available": true
+    },
+    "execute_plan_discipline": {
+      "default": "superpowers:executing-plans",
+      "description": "Phase 2 — discipline for following written implementation plans (closes the loop with multi_step_plan)",
+      "skip_if_not_available": true
+    },
+    "systematic_debug": {
+      "default": "superpowers:systematic-debugging",
+      "description": "Phase 2 — iron-law 4-phase root-cause discipline; first-line debug before reaching for fixes",
+      "skip_if_not_available": true
+    },
+    "deep_investigate": {
+      "default": "gstack:investigate",
+      "description": "Phase 2 — heavier debugging pipeline; escalation path when systematic_debug isn't enough",
+      "requires_cli": "gstack",
+      "skip_if_not_available": true
+    },
+    "land_and_deploy": {
+      "default": "gstack:land-and-deploy",
+      "description": "Phase 2 (deploy task) — one-shot merge + deploy + canary verify; alternative to deploy_chain (for small confident changes; deploy_chain is for large features needing separate ship → wait → land)",
+      "requires_cli": "gstack",
+      "skip_if_not_available": true
+    },
+
+    "_v0_6_phase3_additions": "Phase 3 capabilities added in v0.6.0",
+    "verify_completion": {
+      "default": "superpowers:verification-before-completion",
+      "description": "Phase 3 — MANDATORY at entry; runs verification commands and confirms output before any 'done' claim. Closes a security-class gap where Flow previously allowed self-reported success without actual verification"
+    },
+    "code_review_small": {
+      "default": "code-review:code-review",
+      "description": "Phase 3 — daily-driver reviewer (5 Sonnet parallel + Haiku confidence scoring) for diff < 200 lines, single module",
+      "skip_if_not_available": true
+    },
+    "code_review_large": {
+      "default": "pr-review-toolkit:review-pr",
+      "description": "Phase 3 — 6-specialist agent panel for diff ≥ 200 lines or multi-module PRs (high coverage but token-heavy)",
+      "skip_if_not_available": true
+    },
+    "review_request_etiquette": {
+      "default": "superpowers:requesting-code-review,superpowers:receiving-code-review",
+      "description": "Phase 3 — pair: superpowers:requesting-code-review BEFORE invoking code_review_small/large (clear scope, what to look at); superpowers:receiving-code-review AFTER reviewer responds (verify-before-agreeing, don't perform-agree). The comma-separated value is opaque to the resolver; SKILL.md prompt must reference each half at the correct point in the workflow.",
+      "skip_if_not_available": true
+    },
+    "pre_land_review": {
+      "default": "gstack:review",
+      "description": "Phase 3 — pre-merge diff review for SQL safety / LLM trust boundaries / conditional side effects; specialist patterns the general reviewers miss",
+      "requires_cli": "gstack",
+      "skip_if_not_available": true
+    },
+    "quality_health": {
+      "default": "gstack:health",
+      "description": "Phase 3 — composite 0-10 quality score using existing project tools (typecheck + lint + tests + dead code); fast quality gate at Phase 3 entry",
+      "requires_cli": "gstack",
+      "skip_if_not_available": true
+    },
+    "perf_baseline": {
+      "default": "gstack:benchmark",
+      "description": "Phase 3 — Web Vitals + resource size baseline regression compare for perf-sensitive backend tasks; pairs with quality_health (one for code quality, the other for runtime performance)",
+      "requires_cli": "gstack",
+      "skip_if_not_available": true
+    },
+    "post_deploy_qa": {
+      "default": "gstack:qa",
+      "description": "Phase 3 (deploy task) — active QA on deployed site (clicks login, fills forms); complements canary's passive monitoring (canary alerts on failure; post_deploy_qa actively verifies success)",
+      "requires_cli": "gstack",
+      "skip_if_not_available": true
+    },
+
+    "_v0_6_phase4_additions": "Phase 4 capabilities added in v0.6.0",
+    "branch_finish": {
+      "default": "superpowers:finishing-a-development-branch",
+      "description": "Phase 4 — structured options for merge / PR / cleanup; closes the loop after sediment is written",
+      "skip_if_not_available": true
+    },
+    "changelog_gen": {
+      "default": "gstack:changelog-generator",
+      "description": "Phase 4 — auto-generate user-facing changelog from commit history; eliminates manual CHANGELOG.md editing step (validate output once before flipping default; may overwrite vs append)",
+      "requires_cli": "gstack",
+      "skip_if_not_available": true
+    },
+
+    "_v0_6_cross_cutting_additions": "Cross-cutting capabilities added in v0.6.0 (any phase)",
+    "safety_guardrails": {
+      "default": "gstack:careful",
+      "description": "Cross-cutting — destructive command warnings (rm -rf, DROP TABLE, force-push, git reset --hard, kubectl delete, migrations); orchestrator invokes before any destructive op. Hook-based auto-fire deferred to v0.7",
+      "requires_cli": "gstack",
+      "skip_if_not_available": true
+    },
+    "weekly_retro": {
+      "default": "gstack:retro",
+      "description": "Cross-cutting — cross-task weekly review (commits / work patterns / quality trends). User-triggered or scheduled via /loop weekly. Fills the per-task-vs-cross-task gap (Phase 4 sediment is per-task; retro is per-week)",
+      "requires_cli": "gstack",
+      "skip_if_not_available": true
     }
   },
 
