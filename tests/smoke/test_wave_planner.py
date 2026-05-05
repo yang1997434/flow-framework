@@ -127,5 +127,86 @@ class TestSharedArtifacts(unittest.TestCase):
         self.assertTrue(wave_touches_shared([task]))
 
 
+class TestPackIntoWaves(unittest.TestCase):
+    def _t(self, id, writes=None):
+        return Task(id=id, writes=writes)
+
+    def test_two_disjoint_tasks_one_wave(self):
+        from flow_wave_planner import pack_into_waves
+        tasks = [
+            self._t("t1", ["src/auth/login.py"]),
+            self._t("t2", ["src/api/handlers.py"]),
+        ]
+        waves = pack_into_waves(tasks, cap=4)
+        self.assertEqual(len(waves), 1)
+        self.assertEqual([t.id for t in waves[0]], ["t1", "t2"])
+
+    def test_overlapping_writes_two_waves(self):
+        from flow_wave_planner import pack_into_waves
+        tasks = [
+            self._t("t1", ["src/foo.py"]),
+            self._t("t2", ["src/foo.py"]),  # SAME file
+        ]
+        waves = pack_into_waves(tasks, cap=4)
+        self.assertEqual(len(waves), 2)
+
+    def test_missing_writes_strict_serial(self):
+        from flow_wave_planner import pack_into_waves
+        tasks = [
+            self._t("t1", ["src/a.py"]),
+            self._t("t2", None),  # no writes declared
+            self._t("t3", ["src/c.py"]),
+        ]
+        # t2's missing writes blocks it from joining wave; t3 starts new wave
+        waves = pack_into_waves(tasks, cap=4)
+        self.assertEqual(len(waves), 3)
+        self.assertEqual([t.id for t in waves[0]], ["t1"])
+        self.assertEqual([t.id for t in waves[1]], ["t2"])
+        self.assertEqual([t.id for t in waves[2]], ["t3"])
+
+    def test_contiguous_prefix_no_reorder(self):
+        # CRITICAL: t3 cannot leapfrog past t2 even if t3 could join wave 0.
+        # This is the round-3 bug fix from codex.
+        from flow_wave_planner import pack_into_waves
+        tasks = [
+            self._t("t1", ["src/a.py"]),
+            self._t("t2", ["src/a.py"]),  # overlaps t1 → can't join wave 0
+            self._t("t3", ["src/c.py"]),  # disjoint from t1 BUT cannot join past t2
+        ]
+        waves = pack_into_waves(tasks, cap=4)
+        # Expected: [[t1], [t2], [t3]] — strictly plan order respected
+        self.assertEqual(len(waves), 3)
+
+    def test_cap_caps_wave_size(self):
+        from flow_wave_planner import pack_into_waves
+        # 5 disjoint tasks, cap=3 → wave of 3 + wave of 2
+        tasks = [self._t(f"t{i}", [f"src/file{i}.py"]) for i in range(5)]
+        waves = pack_into_waves(tasks, cap=3)
+        self.assertEqual(len(waves), 2)
+        self.assertEqual(len(waves[0]), 3)
+        self.assertEqual(len(waves[1]), 2)
+
+    def test_shared_artifact_forces_serial(self):
+        from flow_wave_planner import pack_into_waves
+        tasks = [
+            self._t("t1", ["VERSION"]),  # shared artifact
+            self._t("t2", ["src/foo.py"]),
+        ]
+        waves = pack_into_waves(tasks, cap=4)
+        # t1 touches VERSION → entire wave[0] must be serial → wave 0 size 1
+        self.assertEqual(len(waves), 2)
+        self.assertEqual([t.id for t in waves[0]], ["t1"])
+
+    def test_broad_glob_forces_serial(self):
+        from flow_wave_planner import pack_into_waves
+        tasks = [
+            self._t("t1", ["**"]),  # broad → can't join any wave
+            self._t("t2", ["src/foo.py"]),
+        ]
+        waves = pack_into_waves(tasks, cap=4)
+        # t1 broad → strict serial. t2 starts new wave.
+        self.assertEqual(len(waves), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

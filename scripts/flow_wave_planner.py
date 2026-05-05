@@ -223,3 +223,77 @@ def wave_touches_shared(tasks: list[Task]) -> bool:
         if globs_overlap(task.writes, shared):
             return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Wave packing algorithm (Phase 2 / T5)
+# ---------------------------------------------------------------------------
+
+
+def can_join_wave(t: Task, wave: list[Task]) -> bool:
+    """Return True if task t can be added to the current wave.
+
+    Mechanical disjointness only. LLM concept-veto is the controller's job at
+    SKILL.md level — this Python function is the deterministic floor.
+    """
+    _common = str(REPO_ROOT / "scripts" / "common")
+    if _common not in sys.path:
+        sys.path.insert(0, _common)
+    from glob_overlap import globs_overlap, is_broad_glob  # type: ignore  # noqa: PLC0415
+
+    if t.writes is None:
+        return False  # missing writes → strict serial
+    # Broad-glob check on the candidate
+    if any(is_broad_glob(g) for g in t.writes):
+        return False
+    # SHARED_ARTIFACTS overlap on the candidate
+    shared = load_shared_artifacts()
+    if shared and globs_overlap(t.writes, shared):
+        return False
+    # Pairwise disjointness against existing wave members
+    for w in wave:
+        if w.writes is None:
+            return False  # defensive
+        if any(is_broad_glob(g) for g in w.writes):
+            return False
+        if globs_overlap(t.writes, w.writes):
+            return False
+        if shared and globs_overlap(w.writes, shared):
+            return False  # existing wave member touches shared → already serial
+    return True
+
+
+def pack_into_waves(tasks: list[Task], cap: int = 3) -> list[list[Task]]:
+    """Decompose tasks into waves using contiguous-prefix policy.
+
+    Plan order is the implicit dependency declaration. As soon as a task cannot
+    join the current wave, the wave is emitted and a new wave starts from that
+    task. The planner NEVER reorders past a non-joiner.
+
+    Contiguous-prefix invariant: when a task cannot join the current wave it
+    starts a new SERIAL wave (size 1). This prevents tasks later in plan order
+    from leapfrogging the non-joiner by being absorbed into the same new wave.
+    """
+    if cap < 1:
+        raise ValueError(f"cap must be >= 1, got {cap}")
+    waves: list[list[Task]] = []
+    remaining = list(tasks)
+    force_serial = False  # True when the current wave was started by a non-joiner
+    while remaining:
+        seed = remaining.pop(0)
+        wave = [seed]
+        if not force_serial:
+            while remaining and len(wave) < cap:
+                next_task = remaining[0]
+                if can_join_wave(next_task, wave):
+                    wave.append(next_task)
+                    remaining.pop(0)
+                else:
+                    force_serial = True  # next wave is forced serial
+                    break  # contiguous-prefix: do not skip past a non-joiner
+            else:
+                force_serial = False  # wave filled without conflict → reset
+        else:
+            force_serial = False  # serial wave consumed, reset for next wave
+        waves.append(wave)
+    return waves
