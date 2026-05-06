@@ -43,19 +43,21 @@ def _v080_tag_available() -> bool:
 
     Codex T3 round 1 [P2]: shallow CI clones often skip tags; if the test
     just `git worktree add ...v0.8.0`s without checking, a missing tag turns
-    the suite red even though no production code regressed. We'd rather
-    skip with a clear reason than confuse a forward-compat regression with
-    "tags not fetched".
+    the suite red even though no production code regressed.
+
+    Codex T3 round 2 [P2]: do NOT swallow OSError/FileNotFoundError here —
+    that would convert a broken-git environment into a silent skip, which
+    is exactly the bypass this guard is supposed to prevent. Let those
+    propagate so the test fails loudly with a real cause instead of
+    pretending the tag is missing. Only the explicit `git rev-parse` "tag
+    not found" return (rc!=0) signals "skip is fine".
     """
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--verify", "--quiet", "v0.8.0^{commit}"],
-            cwd=str(REPO_ROOT),
-            capture_output=True,
-        )
-        return result.returncode == 0
-    except (OSError, FileNotFoundError):
-        return False
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", "v0.8.0^{commit}"],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+    )
+    return result.returncode == 0
 
 
 class TestV080ReaderHandlesV081Contract(unittest.TestCase):
