@@ -9,6 +9,20 @@ Turn prd.md into code. Dispatch sub-agents per task type + change size.
 
 > **Safety**: before any destructive operation in this phase (`rm -rf`, `git reset --hard`, `DROP TABLE`, force-push, `kubectl delete`, migrations), invoke `{{capability:safety_guardrails}}`. See orchestrator §Cross-cutting capabilities.
 
+## v0.8.0 autonomy guard
+
+Before doing anything else: if `progress.md` frontmatter sets
+`autonomy_mode: auto`, run
+
+```bash
+python3 scripts/flow.py orchestrator --auto-execute <slug>
+```
+
+This will exit with code 2 and a "v0.8.0 does not support autonomous dispatch"
+message. That is by design. Acknowledge to the user, then fall through to
+the existing interactive Phase 2 flow (treat the contract as a planning
+artifact only). v0.8.1+ removes this guard.
+
 ## Step 1 — Determine dispatch strategy
 
 Read prd.md. Decide:
