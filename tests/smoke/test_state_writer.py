@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -7,12 +8,17 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "common"))
 from flow_state_writer import (
     append_decision, append_review_issue, write_checkpoint, write_blocked,
     DecisionRecord, ReviewIssueRecord,
     AcceptanceProgressEvent, append_acceptance_progress,
     compute_criterion_hash,
+    AutoPrepareLock,
+    write_auto_prepare_lock, consume_auto_prepare_lock,
+    detect_auto_prepare_state,
 )
+from safe_io import append_jsonl_locked
 
 
 class TestStateWriter(unittest.TestCase):
@@ -276,6 +282,210 @@ class TestCriterionHash(unittest.TestCase):
             {"command": "true", "method": "cmd", "type": "unit",
              "description": "x"})
         self.assertEqual(h1, h2)
+
+
+# ----------------------------------------------------------------------
+# T5 — auto_prepare.lock state machine + 4-state crash recovery.
+# ----------------------------------------------------------------------
+
+
+class TestAutoPrepareLock(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp))
+        self.task_dir = self.tmp / ".flow" / "tasks" / "demo"
+        self.task_dir.mkdir(parents=True)
+
+    def _make_lock(self, **overrides) -> AutoPrepareLock:
+        defaults = dict(
+            lock_version=1, slug="demo", run_id="run-1", task_id="T1",
+            contract_path="/tmp/c.json", contract_hash="a" * 64,
+            contract_schema_version=1,
+            created_at="2026-05-06T00:00:00Z",
+            pid=os.getpid(), host="testhost", cwd="/tmp",
+            target_branch="master",
+            intended_first_task_dispatch_at="2026-05-06T00:00:01Z",
+        )
+        defaults.update(overrides)
+        return AutoPrepareLock(**defaults)
+
+    # ----- write -----
+
+    def test_write_lock_creates_file(self):
+        path = write_auto_prepare_lock(self.task_dir, self._make_lock())
+        self.assertTrue(path.exists())
+        self.assertEqual(path.name, "auto_prepare.lock")
+        rec = json.loads(path.read_text())
+        self.assertEqual(rec["slug"], "demo")
+        self.assertEqual(rec["lock_version"], 1)
+        self.assertEqual(rec["run_id"], "run-1")
+        self.assertEqual(rec["task_id"], "T1")
+
+    def test_write_lock_rejects_when_lock_already_present(self):
+        """§8.1: NEVER live alongside another unconsumed lock."""
+        write_auto_prepare_lock(self.task_dir, self._make_lock())
+        with self.assertRaises(FileExistsError):
+            write_auto_prepare_lock(self.task_dir, self._make_lock())
+
+    def test_write_lock_creates_missing_task_dir(self):
+        nested = self.tmp / ".flow" / "tasks" / "fresh"
+        path = write_auto_prepare_lock(nested, self._make_lock(slug="fresh"))
+        self.assertTrue(path.exists())
+
+    # ----- consume -----
+
+    def test_consume_renames_lock_to_consumed(self):
+        write_auto_prepare_lock(self.task_dir, self._make_lock())
+        consumed = consume_auto_prepare_lock(
+            self.task_dir, slug="demo", run_id="run-1", task_id="T1")
+        self.assertFalse((self.task_dir / "auto_prepare.lock").exists())
+        self.assertTrue((self.task_dir / "auto_prepare.consumed").exists())
+        self.assertEqual(consumed.name, "auto_prepare.consumed")
+
+    def test_consume_emits_auto_prepare_consumed_event(self):
+        """Y8: explicit consumption proof in decisions.jsonl."""
+        write_auto_prepare_lock(self.task_dir, self._make_lock())
+        consume_auto_prepare_lock(
+            self.task_dir, slug="demo", run_id="run-1", task_id="T1")
+        dec_path = self.task_dir / "decisions.jsonl"
+        self.assertTrue(dec_path.exists())
+        last = json.loads(dec_path.read_text().splitlines()[-1])
+        self.assertEqual(last["event"], "auto_prepare_consumed")
+        self.assertEqual(last["task_id"], "T1")
+        self.assertEqual(last["run_id"], "run-1")
+        self.assertEqual(last["slug"], "demo")
+        self.assertIn("consumed_at", last)
+        self.assertIn("lock_path", last)
+        self.assertIn("event_id", last)
+
+    def test_consume_when_no_lock_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            consume_auto_prepare_lock(
+                self.task_dir, slug="demo", run_id="r", task_id="T1")
+
+    # ----- detect: 6 states -----
+
+    def test_state_no_run(self):
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="r", task_id="T1",
+            current_contract_hash="abc")
+        self.assertEqual(r["state"], "no_run")
+
+    def test_state_clean_post_engagement(self):
+        """No lock, but auto_engaged exists for this run → normal post-engagement."""
+        append_jsonl_locked(self.task_dir / "decisions.jsonl", {
+            "event": "auto_engaged", "run_id": "run-1", "task_id": "T1",
+        })
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="a" * 64)
+        self.assertEqual(r["state"], "clean_post_engagement")
+
+    def test_state_active_run_when_pid_alive(self):
+        write_auto_prepare_lock(
+            self.task_dir, self._make_lock(pid=os.getpid()))
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="a" * 64)
+        self.assertEqual(r["state"], "active_run")
+        self.assertEqual(r["lock"]["pid"], os.getpid())
+
+    def test_state_interrupted_dead_pid(self):
+        # pid 2**31 - 1 is well outside the OS pid range — guaranteed dead.
+        write_auto_prepare_lock(
+            self.task_dir, self._make_lock(pid=2**31 - 1))
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="a" * 64)
+        self.assertEqual(r["state"], "interrupted_dead_pid")
+        self.assertEqual(r["block_type"], "auto_prepare_interrupted")
+
+    def test_state_interrupted_contract_changed(self):
+        write_auto_prepare_lock(self.task_dir, self._make_lock(
+            pid=os.getpid(), contract_hash="a" * 64))
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="b" * 64)  # mismatch
+        self.assertEqual(r["state"], "interrupted_contract_changed")
+        self.assertEqual(r["block_type"], "auto_prepare_interrupted")
+
+    def test_state_orphan_lock_post_engaged(self):
+        """Lock present AND auto_engaged event present → orphan; consume + warn."""
+        write_auto_prepare_lock(
+            self.task_dir, self._make_lock(pid=os.getpid()))
+        append_jsonl_locked(self.task_dir / "decisions.jsonl", {
+            "event": "auto_engaged", "run_id": "run-1", "task_id": "T1",
+        })
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="a" * 64)
+        self.assertEqual(r["state"], "orphan_lock_post_engaged")
+        self.assertEqual(r["action"], "consume_with_warning")
+
+    # ----- detect: edge cases (D1 / blindspot-A) -----
+
+    def test_state_engaged_only_matches_same_run_and_task(self):
+        """`auto_engaged` for a DIFFERENT run_id+task_id MUST NOT count."""
+        append_jsonl_locked(self.task_dir / "decisions.jsonl", {
+            "event": "auto_engaged", "run_id": "OTHER", "task_id": "T1",
+        })
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="a" * 64)
+        self.assertEqual(r["state"], "no_run")
+
+    def test_state_corrupt_lock_classified_as_interrupted(self):
+        """Corrupt JSON in lock → block (state=interrupted_lock_corrupt),
+        NOT silent no_run. Distinct state-name from dead_pid avoids D1
+        conflation; same block_type so T19 routes identically.
+        """
+        (self.task_dir / "auto_prepare.lock").write_text(
+            "{not valid json", encoding="utf-8")
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="a" * 64)
+        self.assertEqual(r["state"], "interrupted_lock_corrupt")
+        self.assertEqual(r["block_type"], "auto_prepare_interrupted")
+        self.assertTrue(r.get("lock_corrupt"))
+
+    def test_state_non_dict_lock_classified_as_interrupted(self):
+        """Lock JSON that parses but isn't an object → corrupt branch."""
+        (self.task_dir / "auto_prepare.lock").write_text(
+            "[1, 2, 3]", encoding="utf-8")
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="a" * 64)
+        self.assertEqual(r["state"], "interrupted_lock_corrupt")
+        self.assertEqual(r["block_type"], "auto_prepare_interrupted")
+        self.assertTrue(r.get("lock_corrupt"))
+
+    def test_state_lock_with_null_hash_not_silently_matched(self):
+        """`contract_hash: null` MUST mismatch a real current_contract_hash."""
+        # Hand-craft a lock with explicit null hash (bypass dataclass).
+        (self.task_dir / "auto_prepare.lock").write_text(
+            json.dumps({
+                "lock_version": 1, "slug": "demo", "run_id": "run-1",
+                "task_id": "T1", "contract_path": "/c.json",
+                "contract_hash": None,  # explicit null
+                "contract_schema_version": 1,
+                "created_at": "2026-05-06T00:00:00Z",
+                "pid": os.getpid(), "host": "x", "cwd": "/",
+                "target_branch": "master",
+                "intended_first_task_dispatch_at": "2026-05-06T00:00:01Z",
+            }), encoding="utf-8")
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="a" * 64)
+        self.assertEqual(r["state"], "interrupted_contract_changed")
+
+    def test_state_lock_with_zero_pid_treated_as_dead(self):
+        """pid=0 / pid=-1 are kill(2)-special — treat as dead, not alive."""
+        write_auto_prepare_lock(
+            self.task_dir, self._make_lock(pid=0))
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="a" * 64)
+        self.assertEqual(r["state"], "interrupted_dead_pid")
 
 
 if __name__ == "__main__":

@@ -14,15 +14,18 @@ log to stderr, proceed (mirrors v0.8.0 `append_decision` posture).
 from __future__ import annotations
 
 import datetime
+import errno
 import hashlib
 import json
+import os
 import sys
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "common"))
-from safe_io import atomic_write_text, append_jsonl_locked
+from safe_io import atomic_write_text, atomic_write_json, append_jsonl_locked
 
 
 VALID_REVIEW_DISPOSITIONS = (
@@ -279,3 +282,369 @@ def compute_criterion_hash(criterion: dict) -> str:
     """
     norm = json.dumps(criterion, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+
+# ----------------------------------------------------------------------
+# T5 — auto_prepare.lock state machine + 4-state crash recovery.
+#
+# Per design §8.1 (file path / schema / state machine), §6 R10 (boundary
+# marker rationale), §6 Y8 (`auto_prepare_consumed` event proves
+# consumption), §1 row 17 (`blocked_auto_prepare` status routing).
+#
+# Three-call surface:
+#   - write_auto_prepare_lock()      — atomic write at contract-parse time,
+#                                       BEFORE the `auto_engaged` event.
+#   - consume_auto_prepare_lock()    — rename to `auto_prepare.consumed`
+#                                       AFTER `auto_engaged` succeeds + emit
+#                                       `auto_prepare_consumed` event (Y8).
+#   - detect_auto_prepare_state()    — return one of 6 states for orchestrator
+#                                       (T19) crash recovery routing.
+#
+# Atomicity choices (and why):
+#   - WRITE: same `atomic_write_json()` used everywhere else in this module
+#     — temp + fsync + rename within the same fs. POSIX `rename(2)` is the
+#     atomic primitive; either old-or-new content is observable, never a
+#     partial JSON. Rejecting re-write while a live lock is present is
+#     enforced by `path.exists()` before `atomic_write_json` (the alternative,
+#     `O_CREAT|O_EXCL`, would race fork-children of the same orchestrator;
+#     this layer is single-writer-per-task by design — the contract).
+#   - CONSUME: `os.replace(src, dst)` — POSIX-atomic rename within the same
+#     dir. After the call, exactly one of `auto_prepare.lock` /
+#     `auto_prepare.consumed` is observable.
+#
+# PID liveness: pure-Python `os.kill(pid, 0)` distinguishes
+#   - `ProcessLookupError` (errno ESRCH)  → DEAD.
+#   - `PermissionError`    (errno EPERM)  → ALIVE-but-not-ours (different uid).
+#   - any other OSError                   → re-raise (do NOT silently treat
+#                                            EINVAL/EAGAIN/etc. as "alive" or
+#                                            "dead"; that would be a D2/D3
+#                                            blindspot — silently swallowing
+#                                            an OSError that we don't
+#                                            understand).
+#   The default for unknown failure is "alive" (caller will treat it as
+#   `active_run` — conservative: do not mistakenly classify a live process
+#   as crashed). But we re-raise unknown errno because conservative-default
+#   without a record is the very D2 antipattern the pitfall doc warns about.
+# ----------------------------------------------------------------------
+
+
+AUTO_PREPARE_LOCK_FILENAME = "auto_prepare.lock"
+AUTO_PREPARE_CONSUMED_FILENAME = "auto_prepare.consumed"
+
+
+@dataclass
+class AutoPrepareLock:
+    """13-field lock record per design §8.1 — pre-`auto_engaged` boundary
+    marker. Single file per task at `<task_dir>/auto_prepare.lock`. NEVER
+    co-exists with an `auto_engaged` event for the same `run_id/task_id`
+    (orphan_lock_post_engaged is the recovery state for that anomaly).
+    """
+    lock_version: int
+    slug: str
+    run_id: str
+    task_id: str
+    contract_path: str
+    contract_hash: str
+    contract_schema_version: int
+    created_at: str
+    pid: int
+    host: str
+    cwd: str
+    target_branch: str
+    intended_first_task_dispatch_at: str
+
+
+def _new_event_id() -> str:
+    """12-hex uuid suffix — used by all autonomy events (§8.4)."""
+    return uuid.uuid4().hex[:12]
+
+
+def write_auto_prepare_lock(task_dir: Path, lock: AutoPrepareLock) -> Path:
+    """Atomic write at contract-parse time, BEFORE the `auto_engaged` event.
+
+    Rejects re-write while a live (un-consumed) lock is already present —
+    that would mean either a duplicate orchestrator startup (caller bug) or
+    that the previous run's recovery hasn't finished (must call
+    `detect_auto_prepare_state` first). Either case is a programmer error;
+    fail-loud rather than silently overwrite.
+    """
+    task_dir = Path(task_dir)
+    task_dir.mkdir(parents=True, exist_ok=True)
+    path = task_dir / AUTO_PREPARE_LOCK_FILENAME
+    if path.exists():
+        raise FileExistsError(
+            f"auto_prepare.lock already present at {path}; "
+            f"detect_auto_prepare_state() before retry"
+        )
+    atomic_write_json(path, asdict(lock))
+    return path
+
+
+def consume_auto_prepare_lock(
+    task_dir: Path, *, slug: str, run_id: str, task_id: str,
+) -> Path:
+    """Rename `auto_prepare.lock` → `auto_prepare.consumed` AFTER
+    `auto_engaged` succeeds + emit `auto_prepare_consumed` event (Y8).
+
+    `os.replace` is the atomic rename primitive (within a single fs).
+    Y8 event-emit ordering: rename FIRST, then append event. Rationale:
+    if rename succeeds and event-append fails (lock contention on
+    decisions.jsonl), the audit gap is logged (mirrors v0.8.0 posture);
+    the boundary marker is still consumed. The reverse ordering would
+    leave a "consumed" event with the lock still on disk on the rare
+    event-write-failure path — worse for forensics.
+    """
+    task_dir = Path(task_dir)
+    lock_path = task_dir / AUTO_PREPARE_LOCK_FILENAME
+    if not lock_path.exists():
+        raise FileNotFoundError(
+            f"no auto_prepare.lock to consume at {lock_path}"
+        )
+    consumed_path = task_dir / AUTO_PREPARE_CONSUMED_FILENAME
+    os.replace(lock_path, consumed_path)  # POSIX-atomic rename
+    consumed_at = datetime.datetime.now(datetime.UTC).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    # Y8: emit auto_prepare_consumed event. T6 wires append_autonomy_event
+    # with required-field validation; here we use the raw helper because
+    # T6 hasn't landed yet. T6 Step 6.4 refactors this to call
+    # append_autonomy_event(EVENT_AUTO_PREPARE_CONSUMED, ...).
+    ok = append_jsonl_locked(
+        task_dir / "decisions.jsonl",
+        {
+            "event_id": _new_event_id(),
+            "ts": consumed_at,
+            "event": "auto_prepare_consumed",
+            "slug": slug,
+            "run_id": run_id,
+            "task_id": task_id,
+            "lock_path": str(consumed_path),
+            "consumed_at": consumed_at,
+        },
+    )
+    if not ok:
+        # Audit gap → stderr; mirror v0.8.0 decision-write posture. The
+        # rename already succeeded; consumption is "done" from the boundary
+        # marker's perspective. T19 recovery sees `consumed` file +
+        # `auto_engaged` event = clean_post_engagement.
+        print(
+            f"WARN: lock contention on {task_dir / 'decisions.jsonl'}; "
+            f"auto_prepare_consumed event dropped for run={run_id} "
+            f"task={task_id}",
+            file=sys.stderr,
+        )
+    return consumed_path
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """POSIX `kill(pid, 0)` liveness check — distinguishes ESRCH (dead)
+    from EPERM (alive, different uid). Re-raises any other OSError so
+    we never silently treat an unknown errno as a definitive answer
+    (D2/D3 blindspot — `except OSError: return X` is exactly the
+    `subprocess rc / kill rc` confusion the pitfall doc warns about).
+
+    Out-of-range PIDs are treated as dead (defensively); negative or
+    zero PIDs would have special semantics under `kill(2)` (process
+    group / all-processes broadcast) and MUST NOT be used here.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        # errno.ESRCH — pid not found = definitively dead.
+        return False
+    except PermissionError:
+        # errno.EPERM — pid exists but is owned by another user. The
+        # process IS alive; we just can't signal it. From the recovery
+        # standpoint that means "do not interfere" — same as our own
+        # alive-pid case.
+        return True
+    except OSError as e:
+        # Any other errno (EINVAL? EFAULT? unexpected). Do NOT silently
+        # treat as alive-or-dead. Re-raise so the orchestrator surfaces
+        # the unknown OS error rather than mis-classifying recovery state.
+        raise OSError(
+            f"unexpected OSError while checking pid {pid}: "
+            f"errno={e.errno} ({errno.errorcode.get(e.errno, '?')})"
+        ) from e
+
+
+def _has_auto_engaged_for(
+    task_dir: Path, run_id: str, task_id: str,
+) -> bool:
+    """Tail-scan `decisions.jsonl` for an `auto_engaged` event matching
+    this `run_id/task_id`. Per Q7.2 (round-3 R10): scope is per-task,
+    so the match must include both fields.
+
+    Schema-parsing rule (cf. flow_contract.py CONTRIBUTOR NOTE): for the
+    matching predicate we DO use `dict.get()` here intentionally — these
+    fields are read from a forward-compat append-only log where missing /
+    null fields are SEMANTICALLY equivalent to "this record is not
+    `auto_engaged` for our run". The `.get(...) == X` form on a record
+    we did not produce is the forward-compat-correct check; it's not a
+    schema-parsing-of-our-own-input path. (If the v0.8.1 producer ever
+    writes `event=null` instead of omitting the key, the equality check
+    against `"auto_engaged"` correctly returns False — no bypass.)
+    """
+    path = task_dir / "decisions.jsonl"
+    if not path.is_file():
+        return False
+    # Whole-file read is fine for this size class — `decisions.jsonl`
+    # is per-task, capped by the task's lifetime. T9's tail-reader
+    # uses incremental scanning; T5's recovery path is one-shot startup.
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        # Don't swallow — re-raise. If decisions.jsonl is unreadable,
+        # recovery cannot make a sound classification (D2 blindspot:
+        # silently treating "unreadable journal" as "no engagement"
+        # would falsely classify a real interrupted run as `no_run`
+        # and silently restart — exactly the silent-degeneration mode
+        # the §6 contradiction-fix prohibits).
+        raise
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            # Skip a single malformed line (audit gap), don't fail the
+            # whole scan. A corrupt line is forensic noise, not a reason
+            # to mis-classify recovery state.
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if (rec.get("event") == "auto_engaged"
+                and rec.get("run_id") == run_id
+                and rec.get("task_id") == task_id):
+            return True
+    return False
+
+
+def detect_auto_prepare_state(
+    task_dir: Path, *,
+    run_id: str, task_id: str, current_contract_hash: str,
+) -> dict:
+    """Return one of 6 (+1 synthetic) states for the orchestrator's (T19)
+    crash recovery dispatcher. Per design §8.1 detection-state-machine
+    table:
+
+        | lock? | engaged? | pid? | hash? | state                           |
+        |-------|----------|------|-------|---------------------------------|
+        | no    | no       | n/a  | n/a   | no_run                          |
+        | no    | yes      | n/a  | n/a   | clean_post_engagement           |
+        | yes   | yes      | n/a  | n/a   | orphan_lock_post_engaged        |
+        | yes   | no       | alive| n/a   | active_run                      |
+        | yes   | no       | dead | match | interrupted_dead_pid (block)    |
+        | yes   | no       | n/a  | mis   | interrupted_contract_changed    |
+        | yes   | no       | n/a  | n/a   | interrupted_lock_corrupt        |
+                                          (synthetic — not in plan;
+                                           corrupt-JSON / non-dict lock.
+                                           Same block_type, distinct
+                                           state-name to avoid D1
+                                           conflation. T19 routes this
+                                           identically to dead_pid.)
+
+    Detection-order rationale (D1 / blindspot-C):
+      1. Read lock-presence + engaged-presence FIRST (cheap, no parse).
+      2. If both present → orphan (lock that should have been consumed
+         when engaged was emitted; we report this for cleanup, not for
+         classification).
+      3. Only when lock-present-and-not-engaged do we parse lock JSON +
+         consult pid liveness / contract hash. The contract-hash check
+         is a `==` compare, NOT `.get(...) or ""` — see schema-parsing-
+         get-vs-in pitfall: an explicitly-null `contract_hash` in the
+         on-disk lock indicates a malformed lock and MUST NOT silently
+         match an arbitrary current hash.
+      4. Contract-mismatch is checked BEFORE pid-liveness because it's
+         a more decisive signal: if the contract changed, the recovery
+         decision is `block` regardless of pid. A live pid running
+         against a stale contract is still an interrupted recovery
+         state from the user's perspective.
+    """
+    task_dir = Path(task_dir)
+    lock_path = task_dir / AUTO_PREPARE_LOCK_FILENAME
+    lock_present = lock_path.is_file()
+    engaged = _has_auto_engaged_for(task_dir, run_id, task_id)
+
+    if not lock_present and not engaged:
+        return {"state": "no_run"}
+    if not lock_present and engaged:
+        return {"state": "clean_post_engagement"}
+    if lock_present and engaged:
+        # §8.1 invariant: lock NEVER co-lives with auto_engaged.
+        # T19 routes this to "consume + warn" (not block — the engaged
+        # event proves the auto run got past the boundary).
+        return {
+            "state": "orphan_lock_post_engaged",
+            "action": "consume_with_warning",
+            "lock_path": str(lock_path),
+        }
+
+    # lock_present and not engaged — distinguish the three sub-cases.
+    # Parse lock JSON. If parse fails, that itself is a blocked-state
+    # signal: the boundary marker is corrupt, do NOT silently `no_run`.
+    # We surface this as `interrupted_lock_corrupt` (a synthetic 7th state
+    # not in the plan's 6-state table) rather than conflate it with
+    # `interrupted_dead_pid` — same `block_type` so T19 routes the same
+    # way, but a distinct state-name avoids D1 conflation: a state name
+    # that lies about its cause is exactly the kind of fallback-after-
+    # soft-degrade footgun the §6 contradiction-fix prohibits.
+    try:
+        raw = lock_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        # Concurrent consume between is_file() and read_text(). Treat as
+        # `clean_post_engagement` if engaged would now be True — but we
+        # already checked engaged above. Race-window inside this function
+        # is single-orchestrator-per-task by design (T19 startup); the
+        # only reason we'd see this is a hand-edit. Re-raise as a loud
+        # signal rather than silently mis-classify.
+        raise
+    except OSError:
+        raise
+    try:
+        lock = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return {
+            "state": "interrupted_lock_corrupt",
+            "block_type": "auto_prepare_interrupted",
+            "lock": None,
+            "lock_corrupt": True,
+            "parse_error": str(e),
+        }
+    if not isinstance(lock, dict):
+        return {
+            "state": "interrupted_lock_corrupt",
+            "block_type": "auto_prepare_interrupted",
+            "lock": None,
+            "lock_corrupt": True,
+        }
+
+    # Use `==` against required fields (no `.get(...) or ""` — explicit
+    # null / missing must NOT silently match an arbitrary current hash).
+    on_disk_hash = lock.get("contract_hash")
+    if on_disk_hash != current_contract_hash:
+        return {
+            "state": "interrupted_contract_changed",
+            "block_type": "auto_prepare_interrupted",
+            "lock": lock,
+        }
+    # Pid liveness LAST (cheapest semantically, but most expensive
+    # in the only-trustworthy-from-our-uid sense). `_is_pid_alive`
+    # validates `pid > 0`; pass `-1` for missing/non-int to force the
+    # "dead" branch deterministically rather than crashing on int().
+    raw_pid = lock.get("pid")
+    try:
+        pid_val = int(raw_pid) if raw_pid is not None else -1
+    except (TypeError, ValueError):
+        pid_val = -1
+    if _is_pid_alive(pid_val):
+        return {"state": "active_run", "lock": lock}
+    return {
+        "state": "interrupted_dead_pid",
+        "block_type": "auto_prepare_interrupted",
+        "lock": lock,
+    }
