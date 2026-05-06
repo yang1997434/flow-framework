@@ -19,6 +19,15 @@ from flow_state_writer import (
     write_auto_prepare_lock, consume_auto_prepare_lock,
     detect_auto_prepare_state,
     _has_auto_engaged_for, JournalCorruptError,
+    # T6 — 10 autonomy event types + helper.
+    EVENT_AUTO_ENGAGED, EVENT_TASK_READY_TO_MERGE,
+    EVENT_MERGE_STARTED, EVENT_MERGE_APPLIED,
+    EVENT_POST_MERGE_VERIFICATION_STARTED,
+    EVENT_POST_MERGE_VERIFICATION_COMPLETED,
+    EVENT_POST_MERGE_VERIFY_FAILED, EVENT_TASK_COMPLETED,
+    EVENT_AUTO_PREPARE_CONSUMED, EVENT_AUTO_PREPARE_INTERRUPTED,
+    ALL_AUTONOMY_EVENTS, EVENT_REQUIRED_FIELDS,
+    append_autonomy_event, _new_event_id,
 )
 from safe_io import append_jsonl_locked
 
@@ -752,6 +761,338 @@ class TestHostMismatchFailClosed(unittest.TestCase):
             self.task_dir, run_id="run-1", task_id="T1",
             current_contract_hash="b" * 64)  # mismatch
         self.assertEqual(r["state"], "interrupted_contract_changed")
+
+
+# ----------------------------------------------------------------------
+# T6 — 10 autonomy event types in decisions.jsonl.
+#
+# Per design §8.4 + §6 R3/R4/R6/Y3/Y8/R10. Tests cover:
+#   - Step 6.1: 10 EVENT_* constants exposed + ALL_AUTONOMY_EVENTS tuple.
+#   - Step 6.3: append_autonomy_event validates event name + required-field
+#     coverage; writes to decisions.jsonl on success.
+#   - Step 6.5: DecisionRecord.supersedes list[str] + forward-compat
+#     normalization (None → []; str → [str]; default factory []).
+#   - Step 6.7: v0.8.0 decision and v0.8.1 event coexist by `event` key.
+# ----------------------------------------------------------------------
+
+
+def _auto_engaged_fields() -> dict:
+    """Valid required-field set for `auto_engaged` event (per §8.4)."""
+    return {
+        "event_id": _new_event_id(),
+        "ts": "2026-05-06T00:00:00Z",
+        "slug": "demo",
+        "run_id": "run-1",
+        "task_id": "T1",
+        "worktree_id": "demo+t1+abc1234",
+        "worktree_path": "/tmp/wt/demo+t1+abc1234",
+        "original_base_commit": "abc" * 7 + "1",
+        "current_base_commit": "abc" * 7 + "1",
+        "lifecycle_state": "active",
+        "checkpoint_id": None,
+        "contract_path": "/tmp/contract.json",
+        "contract_hash": "a" * 64,
+        "contract_schema_version": 1,
+    }
+
+
+class TestAutonomyEventConstants(unittest.TestCase):
+    """Step 6.1: 10 EVENT_* constants exposed + ALL_AUTONOMY_EVENTS tuple."""
+
+    def test_ten_event_constants_exposed(self):
+        names = {
+            EVENT_AUTO_ENGAGED, EVENT_TASK_READY_TO_MERGE,
+            EVENT_MERGE_STARTED, EVENT_MERGE_APPLIED,
+            EVENT_POST_MERGE_VERIFICATION_STARTED,
+            EVENT_POST_MERGE_VERIFICATION_COMPLETED,
+            EVENT_POST_MERGE_VERIFY_FAILED, EVENT_TASK_COMPLETED,
+            EVENT_AUTO_PREPARE_CONSUMED, EVENT_AUTO_PREPARE_INTERRUPTED,
+        }
+        # Cardinality check — exactly 10, all distinct.
+        self.assertEqual(len(names), 10)
+        # Tuple `ALL_AUTONOMY_EVENTS` matches the constant set (no extras /
+        # no missing).
+        self.assertEqual(set(ALL_AUTONOMY_EVENTS), names)
+        self.assertEqual(len(ALL_AUTONOMY_EVENTS), 10)
+
+    def test_event_required_fields_covers_every_event(self):
+        """Every event in ALL_AUTONOMY_EVENTS must have a required-field
+        entry — silent missing-key would be an A-class fallback bypass."""
+        for ev in ALL_AUTONOMY_EVENTS:
+            self.assertIn(ev, EVENT_REQUIRED_FIELDS,
+                          f"event {ev!r} missing required-field entry")
+            self.assertGreater(len(EVENT_REQUIRED_FIELDS[ev]), 0)
+
+    def test_required_fields_match_design_84_table(self):
+        """Per design §8.4 cardinality (Y4) — verify each event's required
+        field count + identity. Catches a refactor that drops a column."""
+        # (event, expected required field count, sample required field)
+        spec = [
+            (EVENT_AUTO_ENGAGED, 14, "contract_schema_version"),
+            (EVENT_TASK_READY_TO_MERGE, 12, "diff_hash"),
+            (EVENT_MERGE_STARTED, 9, "integration_target"),
+            (EVENT_MERGE_APPLIED, 8, "merge_strategy"),
+            (EVENT_POST_MERGE_VERIFICATION_STARTED, 8,
+             "verification_worktree_path"),
+            (EVENT_POST_MERGE_VERIFICATION_COMPLETED, 8, "criteria_results"),
+            (EVENT_POST_MERGE_VERIFY_FAILED, 8, "user_choices"),
+            (EVENT_TASK_COMPLETED, 8, "final_diff_hash"),
+            (EVENT_AUTO_PREPARE_CONSUMED, 7, "consumed_at"),
+            (EVENT_AUTO_PREPARE_INTERRUPTED, 7, "blocked_md_path"),
+        ]
+        for ev, expected_count, sample_field in spec:
+            with self.subTest(event=ev):
+                req = EVENT_REQUIRED_FIELDS[ev]
+                self.assertEqual(len(req), expected_count,
+                                 f"{ev}: expected {expected_count} required "
+                                 f"fields, got {len(req)}: {sorted(req)}")
+                self.assertIn(sample_field, req,
+                              f"{ev}: missing sentinel field {sample_field}")
+
+    def test_every_event_includes_run_id(self):
+        """Per §6 S2 — `run_id` carried by all autonomy events."""
+        for ev in ALL_AUTONOMY_EVENTS:
+            self.assertIn("run_id", EVENT_REQUIRED_FIELDS[ev],
+                          f"{ev}: missing run_id (S2 invariant)")
+
+
+class TestAppendAutonomyEvent(unittest.TestCase):
+    """Step 6.3: append_autonomy_event validates + writes."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp))
+        self.task_dir = self.tmp / ".flow" / "tasks" / "demo"
+
+    def test_rejects_unknown_event(self):
+        with self.assertRaises(ValueError) as cm:
+            append_autonomy_event(self.task_dir, "totally_made_up", {})
+        self.assertIn("totally_made_up", str(cm.exception))
+        # File must NOT be created — fail-closed before disk.
+        self.assertFalse((self.task_dir / "decisions.jsonl").exists())
+
+    def test_rejects_missing_required_field(self):
+        fields = _auto_engaged_fields()
+        fields.pop("worktree_path")
+        with self.assertRaises(ValueError) as cm:
+            append_autonomy_event(self.task_dir, EVENT_AUTO_ENGAGED, fields)
+        self.assertIn("worktree_path", str(cm.exception))
+        # Fail-closed: no partial write.
+        self.assertFalse((self.task_dir / "decisions.jsonl").exists())
+
+    def test_rejects_event_key_in_fields(self):
+        """`fields` MUST NOT contain its own `event` key — that would
+        let a buggy caller silently override the validated event-name.
+        Fail-closed; do not let the **fields expansion overwrite our
+        positional `event` arg."""
+        fields = _auto_engaged_fields()
+        fields["event"] = "different_event"
+        with self.assertRaises(ValueError) as cm:
+            append_autonomy_event(self.task_dir, EVENT_AUTO_ENGAGED, fields)
+        self.assertIn("'event'", str(cm.exception))
+
+    def test_writes_to_decisions_jsonl(self):
+        fields = _auto_engaged_fields()
+        append_autonomy_event(self.task_dir, EVENT_AUTO_ENGAGED, fields)
+        path = self.task_dir / "decisions.jsonl"
+        self.assertTrue(path.is_file())
+        rec = json.loads(path.read_text().splitlines()[-1])
+        self.assertEqual(rec["event"], "auto_engaged")
+        self.assertEqual(rec["worktree_path"], fields["worktree_path"])
+        self.assertEqual(rec["contract_schema_version"], 1)
+        # `event` key is the FIRST in the record (visual-grep convention).
+        loaded_keys = list(rec.keys())
+        self.assertEqual(loaded_keys[0], "event")
+
+    def test_explicit_null_value_satisfies_required(self):
+        """Schema-parsing rule: required = "key present", not "value
+        truthy". `checkpoint_id: None` is valid (design §8.4 allows it
+        for fresh runs).
+        """
+        fields = _auto_engaged_fields()
+        # `checkpoint_id` is already None in the helper; verify it writes.
+        self.assertIsNone(fields["checkpoint_id"])
+        append_autonomy_event(self.task_dir, EVENT_AUTO_ENGAGED, fields)
+        rec = json.loads(
+            (self.task_dir / "decisions.jsonl").read_text().splitlines()[-1])
+        self.assertIsNone(rec["checkpoint_id"])
+
+    def test_extra_fields_pass_through(self):
+        """Caller may include MORE fields than required (forward-compat
+        for additional design columns). Validator only checks REQUIRED
+        coverage; extras are persisted as-is."""
+        fields = _auto_engaged_fields()
+        fields["extra_diagnostic"] = "hello"
+        append_autonomy_event(self.task_dir, EVENT_AUTO_ENGAGED, fields)
+        rec = json.loads(
+            (self.task_dir / "decisions.jsonl").read_text().splitlines()[-1])
+        self.assertEqual(rec["extra_diagnostic"], "hello")
+
+    def test_writes_each_of_ten_events(self):
+        """Smoke-coverage: every one of the 10 events accepts a
+        minimal-required-fields payload and writes a line. Catches a
+        regression where a single event's required-set was mistyped."""
+        # Provide a minimal valid fields-dict for each event (exactly the
+        # required keys, with synthesized values).
+        per_event_fields = {
+            EVENT_AUTO_ENGAGED: _auto_engaged_fields(),
+            EVENT_TASK_READY_TO_MERGE: {
+                "event_id": "e", "ts": "t", "slug": "s", "run_id": "r",
+                "task_id": "T1", "worktree_id": "wt", "worktree_path": "/p",
+                "original_base_commit": "a", "current_base_commit": "a",
+                "lifecycle_state": "active", "diff_hash": "h",
+                "target_commit_pre_merge": "c",
+            },
+            EVENT_MERGE_STARTED: {
+                "event_id": "e", "ts": "t", "slug": "s", "run_id": "r",
+                "task_id": "T1", "worktree_id": "wt", "worktree_path": "/p",
+                "integration_target": "master",
+                "target_commit_pre_merge": "c",
+            },
+            EVENT_MERGE_APPLIED: {
+                "event_id": "e", "ts": "t", "slug": "s", "run_id": "r",
+                "task_id": "T1", "worktree_id": "wt",
+                "target_commit_post_merge": "d", "merge_strategy": "ff-only",
+            },
+            EVENT_POST_MERGE_VERIFICATION_STARTED: {
+                "event_id": "e", "ts": "t", "slug": "s", "run_id": "r",
+                "task_id": "T1", "verification_worktree_id": "vwt",
+                "verification_worktree_path": "/vp",
+                "target_commit_post_merge": "d",
+            },
+            EVENT_POST_MERGE_VERIFICATION_COMPLETED: {
+                "event_id": "e", "ts": "t", "slug": "s", "run_id": "r",
+                "task_id": "T1", "verification_worktree_id": "vwt",
+                "status": "pass", "criteria_results": [],
+            },
+            EVENT_POST_MERGE_VERIFY_FAILED: {
+                "event_id": "e", "ts": "t", "slug": "s", "run_id": "r",
+                "task_id": "T1", "verification_worktree_id": "vwt",
+                "blocked_md_path": "/p/blocked.md",
+                "user_choices": ["retry", "abort"],
+            },
+            EVENT_TASK_COMPLETED: {
+                "event_id": "e", "ts": "t", "slug": "s", "run_id": "r",
+                "task_id": "T1", "worktree_id": "wt",
+                "final_diff_hash": "h", "target_commit_post_merge": "d",
+            },
+            EVENT_AUTO_PREPARE_CONSUMED: {
+                "event_id": "e", "ts": "t", "slug": "s", "run_id": "r",
+                "task_id": "T1",
+                "lock_path": "/p/auto_prepare.consumed",
+                "consumed_at": "t",
+            },
+            EVENT_AUTO_PREPARE_INTERRUPTED: {
+                "event_id": "e", "ts": "t", "slug": "s", "run_id": "r",
+                "task_id": "T1", "lock_path": "/p/auto_prepare.lock",
+                "blocked_md_path": "/p/blocked.md",
+            },
+        }
+        for ev in ALL_AUTONOMY_EVENTS:
+            with self.subTest(event=ev):
+                # Fresh task dir per event so each writes line 1.
+                td = self.tmp / f"per-event-{ev}"
+                append_autonomy_event(td, ev, per_event_fields[ev])
+                lines = (td / "decisions.jsonl").read_text().splitlines()
+                self.assertEqual(len(lines), 1)
+                self.assertEqual(json.loads(lines[0])["event"], ev)
+
+
+class TestDecisionRecordSupersedes(unittest.TestCase):
+    """Step 6.5/6.6: supersedes is list[str] with forward-compat
+    normalization for v0.8.0 single-string + None."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp))
+        self.task_dir = self.tmp / ".flow" / "tasks" / "demo"
+        self.task_dir.mkdir(parents=True)
+
+    def test_decision_record_supersedes_list(self):
+        """Q6.2: list semantics — one retry can resolve multiple priors."""
+        rec = DecisionRecord(
+            id="d-3", ts="2026-05-06T00:00:00Z", phase=2, task="T1",
+            decision="land fix",
+            reason="resolved RED issues from rounds 1 and 2",
+            supersedes=["d-1", "d-2"],
+        )
+        append_decision(self.task_dir, rec)
+        line = (self.task_dir / "decisions.jsonl").read_text().splitlines()[-1]
+        self.assertEqual(json.loads(line)["supersedes"], ["d-1", "d-2"])
+
+    def test_decision_record_supersedes_default_empty_list(self):
+        rec = DecisionRecord(
+            id="d-1", ts="t", phase=1, task="T1",
+            decision="x", reason="y",
+        )
+        self.assertEqual(rec.supersedes, [])
+
+    def test_decision_record_v080_string_supersedes_normalized(self):
+        """Forward-compat: v0.8.0-shape single string normalizes to [str]."""
+        rec = DecisionRecord(
+            id="d-2", ts="t", phase=1, task="T1",
+            decision="x", reason="y",
+            supersedes="d-1",  # v0.8.0 shape
+        )
+        self.assertEqual(rec.supersedes, ["d-1"])
+
+    def test_decision_record_supersedes_none_normalized_to_empty(self):
+        rec = DecisionRecord(
+            id="d-2", ts="t", phase=1, task="T1",
+            decision="x", reason="y", supersedes=None,
+        )
+        self.assertEqual(rec.supersedes, [])
+
+    def test_decision_record_supersedes_rejects_bad_type(self):
+        """Fail-closed: an int / dict / etc. is not a valid supersedes
+        shape. Silent acceptance would let bogus JSON hit decisions.jsonl
+        and confuse downstream readers (A-class falsy bypass)."""
+        with self.assertRaises(ValueError):
+            DecisionRecord(
+                id="d-x", ts="t", phase=1, task="T1",
+                decision="x", reason="y",
+                supersedes=123,  # bogus
+            )
+
+    def test_decision_record_supersedes_rejects_list_with_non_str(self):
+        """Fail-closed on list[non-str] — element type matters for
+        on-disk JSON correctness."""
+        with self.assertRaises(ValueError):
+            DecisionRecord(
+                id="d-x", ts="t", phase=1, task="T1",
+                decision="x", reason="y",
+                supersedes=["d-1", 7],  # mixed
+            )
+
+
+class TestV080V081Coexistence(unittest.TestCase):
+    """Step 6.7: v0.8.0 DecisionRecord + v0.8.1 autonomy event in the
+    same decisions.jsonl. Reader must disambiguate by `event` presence."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp))
+        self.task_dir = self.tmp / ".flow" / "tasks" / "demo"
+        self.task_dir.mkdir(parents=True)
+
+    def test_v080_decision_and_v081_event_coexist_in_jsonl(self):
+        # v0.8.0-shape decision (no `event` field).
+        append_decision(self.task_dir, DecisionRecord(
+            id="d-1", ts="2026-05-06T00:00:00Z", phase=1, task="T1",
+            decision="x", reason="y",
+        ))
+        # v0.8.1-shape autonomy event.
+        append_autonomy_event(self.task_dir, EVENT_AUTO_ENGAGED,
+                              _auto_engaged_fields())
+        lines = (self.task_dir / "decisions.jsonl").read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        rec0, rec1 = (json.loads(l) for l in lines)
+        # v0.8.0 decision: `event` key is ABSENT (not None).
+        self.assertNotIn("event", rec0)
+        # v0.8.1 event: `event` key present + names the kind.
+        self.assertEqual(rec1["event"], "auto_engaged")
+        # v0.8.0 decision must still carry its identity field.
+        self.assertEqual(rec0["id"], "d-1")
 
 
 if __name__ == "__main__":

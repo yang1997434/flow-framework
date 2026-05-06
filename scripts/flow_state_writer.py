@@ -23,7 +23,7 @@ import sys
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 
 class JournalCorruptError(Exception):
@@ -74,7 +74,43 @@ class DecisionRecord:
     alternatives: list[str] = field(default_factory=list)
     files_affected: list[str] = field(default_factory=list)
     review_status: str = "pending"
-    supersedes: Optional[str] = None
+    # T6 / Q6.2 — promoted from `Optional[str]` (v0.8.0) to `list[str]`
+    # (codex-refined). One retry can resolve multiple prior failed decisions.
+    # Forward-compat normalization in `__post_init__`: a v0.8.0-shape single
+    # string becomes `[str]`; explicit `None` becomes `[]`. Use `Union[...]`
+    # at the type-annotation level so static checkers don't flag the legacy
+    # caller shape during the v0.8.0 → v0.8.1 transition.
+    supersedes: Union[list[str], str, None] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # Q6.2 forward-compat: accept legacy single-string shape and None.
+        # Schema-parsing rule (cf. .flow/pitfalls/schema-parsing-get-vs-in.md):
+        # we explicitly distinguish None / str / list rather than relying on
+        # truthiness — `[]` is a valid empty value, `None` is the legacy
+        # absent shape, and a non-empty string must NOT be expanded to a
+        # per-character list (the `isinstance(..., str)` branch comes BEFORE
+        # any iteration). Anything else (e.g. tuple of strings) is normalized
+        # to a list to keep JSON serialization deterministic; types other
+        # than list/str/None are rejected because forwarding silently would
+        # be the same A-class falsy bypass the pitfall doc warns against.
+        if self.supersedes is None:
+            self.supersedes = []
+        elif isinstance(self.supersedes, str):
+            self.supersedes = [self.supersedes]
+        elif isinstance(self.supersedes, list):
+            # Already correct shape — but enforce element type for fail-closed
+            # JSON correctness; an int/None inside the list would slip through
+            # to disk and confuse downstream readers.
+            if not all(isinstance(x, str) for x in self.supersedes):
+                raise ValueError(
+                    f"supersedes must be list[str], got "
+                    f"{[type(x).__name__ for x in self.supersedes]}"
+                )
+        else:
+            raise ValueError(
+                f"supersedes must be list[str] | str | None, "
+                f"got {type(self.supersedes).__name__}"
+            )
 
 
 @dataclass
@@ -300,6 +336,169 @@ def compute_criterion_hash(criterion: dict) -> str:
 
 
 # ----------------------------------------------------------------------
+# T6 — 10 autonomy event types in `decisions.jsonl`.
+#
+# Per design §8.4 (event table) + §6 R3/R4/R6/Y3/Y8/R10. Single helper
+# `append_autonomy_event(task_dir, event, fields)` validates:
+#   1. `event` is one of the 10 known autonomy events (fail-closed enum).
+#   2. `fields` covers the per-event required-field set (fail-closed schema).
+#
+# Ordering note (cf. blindspot-C / D2): validation runs BEFORE any disk
+# write — invalid events raise `ValueError` and never touch the journal.
+# Lock contention on `decisions.jsonl` falls back to a stderr WARN (mirrors
+# v0.8.0 `append_decision` posture: audit gap, not crash). Distinct from
+# schema validation — a contended lock is not a schema problem and must
+# not raise at the validator layer.
+#
+# Co-existence with v0.8.0 records (Step 6.7): the v0.8.0 `DecisionRecord`
+# shape has NO `event` field; v0.8.1 autonomy events ALWAYS carry
+# `event: <name>`. Readers disambiguate by presence/absence of the key —
+# do NOT use `.get("event")` truthiness (the schema-parsing pitfall says
+# `null` and absent must not collide).
+# ----------------------------------------------------------------------
+
+
+EVENT_AUTO_ENGAGED = "auto_engaged"
+EVENT_TASK_READY_TO_MERGE = "task_ready_to_merge"
+EVENT_MERGE_STARTED = "merge_started"
+EVENT_MERGE_APPLIED = "merge_applied"
+EVENT_POST_MERGE_VERIFICATION_STARTED = "post_merge_verification_started"
+EVENT_POST_MERGE_VERIFICATION_COMPLETED = "post_merge_verification_completed"
+EVENT_POST_MERGE_VERIFY_FAILED = "post_merge_verify_failed"
+EVENT_TASK_COMPLETED = "task_completed"
+EVENT_AUTO_PREPARE_CONSUMED = "auto_prepare_consumed"
+EVENT_AUTO_PREPARE_INTERRUPTED = "auto_prepare_interrupted"
+
+ALL_AUTONOMY_EVENTS: tuple[str, ...] = (
+    EVENT_AUTO_ENGAGED,
+    EVENT_TASK_READY_TO_MERGE,
+    EVENT_MERGE_STARTED,
+    EVENT_MERGE_APPLIED,
+    EVENT_POST_MERGE_VERIFICATION_STARTED,
+    EVENT_POST_MERGE_VERIFICATION_COMPLETED,
+    EVENT_POST_MERGE_VERIFY_FAILED,
+    EVENT_TASK_COMPLETED,
+    EVENT_AUTO_PREPARE_CONSUMED,
+    EVENT_AUTO_PREPARE_INTERRUPTED,
+)
+
+# Per-event required-field map (design §8.4). `frozenset` prevents accidental
+# in-place mutation by callers; `set(fields.keys()) - required` is the
+# difference primitive used in the validator. We DO NOT use `.get()` here —
+# `key not in fields` is the existence check (schema-parsing-get-vs-in
+# pitfall: `null` value MUST NOT silently satisfy a required field). The
+# validator below enforces presence; per-field type/value validation is the
+# producer's responsibility (e.g. T10 emits `auto_engaged`, owns its types).
+EVENT_REQUIRED_FIELDS: dict[str, frozenset[str]] = {
+    EVENT_AUTO_ENGAGED: frozenset({
+        "event_id", "ts", "slug", "run_id", "task_id",
+        "worktree_id", "worktree_path",
+        "original_base_commit", "current_base_commit",
+        "lifecycle_state", "checkpoint_id",
+        "contract_path", "contract_hash", "contract_schema_version",
+    }),
+    EVENT_TASK_READY_TO_MERGE: frozenset({
+        "event_id", "ts", "slug", "run_id", "task_id",
+        "worktree_id", "worktree_path",
+        "original_base_commit", "current_base_commit",
+        "lifecycle_state", "diff_hash", "target_commit_pre_merge",
+    }),
+    EVENT_MERGE_STARTED: frozenset({
+        "event_id", "ts", "slug", "run_id", "task_id",
+        "worktree_id", "worktree_path",
+        "integration_target", "target_commit_pre_merge",
+    }),
+    EVENT_MERGE_APPLIED: frozenset({
+        "event_id", "ts", "slug", "run_id", "task_id", "worktree_id",
+        "target_commit_post_merge", "merge_strategy",
+    }),
+    EVENT_POST_MERGE_VERIFICATION_STARTED: frozenset({
+        "event_id", "ts", "slug", "run_id", "task_id",
+        "verification_worktree_id", "verification_worktree_path",
+        "target_commit_post_merge",
+    }),
+    EVENT_POST_MERGE_VERIFICATION_COMPLETED: frozenset({
+        "event_id", "ts", "slug", "run_id", "task_id",
+        "verification_worktree_id", "status", "criteria_results",
+    }),
+    EVENT_POST_MERGE_VERIFY_FAILED: frozenset({
+        "event_id", "ts", "slug", "run_id", "task_id",
+        "verification_worktree_id", "blocked_md_path", "user_choices",
+    }),
+    EVENT_TASK_COMPLETED: frozenset({
+        "event_id", "ts", "slug", "run_id", "task_id", "worktree_id",
+        "final_diff_hash", "target_commit_post_merge",
+    }),
+    EVENT_AUTO_PREPARE_CONSUMED: frozenset({
+        "event_id", "ts", "slug", "run_id", "task_id",
+        "lock_path", "consumed_at",
+    }),
+    EVENT_AUTO_PREPARE_INTERRUPTED: frozenset({
+        "event_id", "ts", "slug", "run_id", "task_id",
+        "lock_path", "blocked_md_path",
+    }),
+}
+
+
+def append_autonomy_event(
+    task_dir: Path, event: str, fields: dict,
+) -> None:
+    """Append a v0.8.1 autonomy event to ``<task_dir>/decisions.jsonl``.
+
+    Validates two things, fail-closed, BEFORE any disk write:
+      1. ``event`` is in :data:`ALL_AUTONOMY_EVENTS` (raises ``ValueError``
+         on unknown name — caller bug).
+      2. ``fields`` covers :data:`EVENT_REQUIRED_FIELDS[event]` (raises
+         ``ValueError`` listing the missing fields).
+
+    On lock contention (audit gap), mirrors v0.8.0 ``append_decision``
+    posture: print a WARN to stderr and proceed. We do NOT raise at the
+    contention layer — it's a transient I/O event, not a schema problem.
+
+    Schema-parsing rule (.flow/pitfalls/schema-parsing-get-vs-in.md): the
+    presence check uses ``required - set(fields.keys())`` so an explicit
+    ``null`` value still SATISFIES the required-field contract — the
+    contract is "key present", not "value truthy". Per-field type/value
+    validation is the producer's concern.
+    """
+    if event not in ALL_AUTONOMY_EVENTS:
+        raise ValueError(
+            f"unknown autonomy event: {event!r}; "
+            f"must be in {ALL_AUTONOMY_EVENTS}"
+        )
+    required = EVENT_REQUIRED_FIELDS[event]
+    missing = required - set(fields.keys())
+    if missing:
+        raise ValueError(
+            f"event {event!r} missing required fields: {sorted(missing)}"
+        )
+    # Build the on-disk record. `event` is positioned first by convention
+    # (helps tail-readers + grep visually); **fields preserves caller's
+    # ordering for the rest. If `fields` already contains an `event` key
+    # (caller bug), our explicit `event=` placement wins via dict-merge
+    # semantics — but only because `**fields` is expanded LAST. To prevent
+    # a caller from accidentally overriding the validated event-name, we
+    # reject `event` in `fields` upfront.
+    if "event" in fields:
+        raise ValueError(
+            f"`fields` must not contain an 'event' key; pass event name "
+            f"as the second positional arg (got fields['event']="
+            f"{fields['event']!r})"
+        )
+    record = {"event": event, **fields}
+    path = task_dir / "decisions.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ok = append_jsonl_locked(path, record)
+    if not ok:
+        # Audit gap → stderr; mirror v0.8.0 decision-write posture.
+        print(
+            f"WARN: lock contention on {path}; "
+            f"autonomy event dropped: {event}/{fields.get('event_id')}",
+            file=sys.stderr,
+        )
+
+
+# ----------------------------------------------------------------------
 # T5 — auto_prepare.lock state machine + 4-state crash recovery.
 #
 # Per design §8.1 (file path / schema / state machine), §6 R10 (boundary
@@ -420,16 +619,20 @@ def consume_auto_prepare_lock(
     consumed_at = datetime.datetime.now(datetime.UTC).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
-    # Y8: emit auto_prepare_consumed event. T6 wires append_autonomy_event
-    # with required-field validation; here we use the raw helper because
-    # T6 hasn't landed yet. T6 Step 6.4 refactors this to call
-    # append_autonomy_event(EVENT_AUTO_PREPARE_CONSUMED, ...).
-    ok = append_jsonl_locked(
-        task_dir / "decisions.jsonl",
+    # Y8: emit auto_prepare_consumed event. T6 wires this through
+    # `append_autonomy_event`, gaining required-field validation
+    # (event name + 7 required fields). Behavior preserved vs T5's
+    # ad-hoc emission: same 7 fields, same fail-soft on lock contention
+    # (audit gap → stderr WARN inside append_autonomy_event itself).
+    # The rename already succeeded; consumption is "done" from the
+    # boundary marker's perspective. T19 recovery sees `consumed` file
+    # + `auto_engaged` event = clean_post_engagement.
+    append_autonomy_event(
+        task_dir,
+        EVENT_AUTO_PREPARE_CONSUMED,
         {
             "event_id": _new_event_id(),
             "ts": consumed_at,
-            "event": "auto_prepare_consumed",
             "slug": slug,
             "run_id": run_id,
             "task_id": task_id,
@@ -437,17 +640,6 @@ def consume_auto_prepare_lock(
             "consumed_at": consumed_at,
         },
     )
-    if not ok:
-        # Audit gap → stderr; mirror v0.8.0 decision-write posture. The
-        # rename already succeeded; consumption is "done" from the boundary
-        # marker's perspective. T19 recovery sees `consumed` file +
-        # `auto_engaged` event = clean_post_engagement.
-        print(
-            f"WARN: lock contention on {task_dir / 'decisions.jsonl'}; "
-            f"auto_prepare_consumed event dropped for run={run_id} "
-            f"task={task_id}",
-            file=sys.stderr,
-        )
     return consumed_path
 
 
