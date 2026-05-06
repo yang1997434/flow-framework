@@ -156,3 +156,35 @@ def parse_contract(path: Path) -> Contract:
         afk_on_timeout=afk,
         unknown_fields=unknown,
     )
+
+
+def validate_contract(path: Path) -> tuple[bool, list[str]]:
+    """Validate contract.json end-to-end. Returns (ok, errors).
+
+    Layered on parse_contract: parse errors → ok=False with one error.
+    Cross-field rules and version-compat checks happen here. Warnings are
+    prefixed `[warn]` and do NOT flip ok to False.
+    """
+    errors: list[str] = []
+    try:
+        c = parse_contract(path)
+    except ContractError as e:
+        return False, [str(e)]
+
+    if c.contract_schema_version > CONTRACT_SCHEMA_VERSION:
+        errors.append(
+            f"contract_schema_version {c.contract_schema_version} is newer than "
+            f"this flow ({CONTRACT_SCHEMA_VERSION}). Upgrade flow or downgrade "
+            f"the contract."
+        )
+
+    if c.autonomy_mode == "auto" and not c.acceptance_criteria:
+        # Warn rather than fail in v0.8.0 — Phase 3 falls back to legacy gate.
+        # Treated as warning by CLI (non-zero hint, not failure exit).
+        errors.append(
+            "[warn] autonomy_mode=auto but no acceptance_criteria — Phase 3 "
+            "will fall back to the legacy test+codex gate. Add criteria to "
+            "unlock the v0.8.1+ verification gate."
+        )
+
+    return (not any(e for e in errors if not e.startswith("[warn]"))), errors
