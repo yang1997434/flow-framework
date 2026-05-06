@@ -18,11 +18,26 @@ import errno
 import hashlib
 import json
 import os
+import socket
 import sys
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
+
+
+class JournalCorruptError(Exception):
+    """Codex T5 R1 [P2] — raised by `_has_auto_engaged_for` when
+    `decisions.jsonl` contains a line that cannot be parsed (json error
+    or non-dict). Distinguishes "journal physically corrupt" from
+    "no auto_engaged event present" so recovery does NOT silently
+    treat a truncated/garbled journal as a pre-engagement state.
+
+    Caller (`detect_auto_prepare_state`) catches this and routes to
+    `interrupted_journal_corrupt` — same `block_type` as the other
+    interrupted states (T19 routes identically), distinct state-name
+    preserves cause/effect honesty per §6 contradiction-fix rule.
+    """
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "common"))
 from safe_io import atomic_write_text, atomic_write_json, append_jsonl_locked
@@ -504,19 +519,28 @@ def _has_auto_engaged_for(
         # and silently restart — exactly the silent-degeneration mode
         # the §6 contradiction-fix prohibits).
         raise
-    for line in text.splitlines():
-        line = line.strip()
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
         if not line:
             continue
+        # Codex T5 R1 [P2] — fail-closed on malformed lines. Original
+        # silent-skip was a D2 fallback bypass: if the only `auto_engaged`
+        # event for this task got truncated mid-flush, silent-skip → caller
+        # sees False → recovery classifies as no_run / pre-engagement and
+        # silently dispatches FRESH, even though the original orchestrator
+        # HAD engaged. Raise a distinguished exception so the caller routes
+        # to a definite block state (interrupted_journal_corrupt).
         try:
             rec = json.loads(line)
-        except json.JSONDecodeError:
-            # Skip a single malformed line (audit gap), don't fail the
-            # whole scan. A corrupt line is forensic noise, not a reason
-            # to mis-classify recovery state.
-            continue
+        except json.JSONDecodeError as e:
+            raise JournalCorruptError(
+                f"decisions.jsonl line {line_no} malformed: {e}"
+            ) from e
         if not isinstance(rec, dict):
-            continue
+            raise JournalCorruptError(
+                f"decisions.jsonl line {line_no} not a dict "
+                f"(got {type(rec).__name__})"
+            )
         if (rec.get("event") == "auto_engaged"
                 and rec.get("run_id") == run_id
                 and rec.get("task_id") == task_id):
@@ -528,47 +552,75 @@ def detect_auto_prepare_state(
     task_dir: Path, *,
     run_id: str, task_id: str, current_contract_hash: str,
 ) -> dict:
-    """Return one of 6 (+1 synthetic) states for the orchestrator's (T19)
+    """Return one of 6 (+3 synthetic) states for the orchestrator's (T19)
     crash recovery dispatcher. Per design §8.1 detection-state-machine
     table:
 
-        | lock? | engaged? | pid? | hash? | state                           |
-        |-------|----------|------|-------|---------------------------------|
-        | no    | no       | n/a  | n/a   | no_run                          |
-        | no    | yes      | n/a  | n/a   | clean_post_engagement           |
-        | yes   | yes      | n/a  | n/a   | orphan_lock_post_engaged        |
-        | yes   | no       | alive| n/a   | active_run                      |
-        | yes   | no       | dead | match | interrupted_dead_pid (block)    |
-        | yes   | no       | n/a  | mis   | interrupted_contract_changed    |
-        | yes   | no       | n/a  | n/a   | interrupted_lock_corrupt        |
-                                          (synthetic — not in plan;
-                                           corrupt-JSON / non-dict lock.
-                                           Same block_type, distinct
-                                           state-name to avoid D1
-                                           conflation. T19 routes this
-                                           identically to dead_pid.)
+        | lock? | engaged? | pid? | hash? | host? | state                       |
+        |-------|----------|------|-------|-------|-----------------------------|
+        | no    | no       | n/a  | n/a   | n/a   | no_run                      |
+        | no    | yes      | n/a  | n/a   | n/a   | clean_post_engagement       |
+        | yes   | yes      | n/a  | n/a   | n/a   | orphan_lock_post_engaged    |
+        | yes   | no       | alive| match | match | active_run                  |
+        | yes   | no       | dead | match | match | interrupted_dead_pid        |
+        | yes   | no       | n/a  | mis   | n/a   | interrupted_contract_changed|
+        | yes   | no       | n/a  | n/a   | mis   | interrupted_host_mismatch † |
+        | yes   | no       | n/a  | n/a   | n/a   | interrupted_lock_corrupt †  |
+        | n/a   | corrupt  | n/a  | n/a   | n/a   | interrupted_journal_corrupt†|
+
+      † = synthetic states (not in plan's 6-state table). All three share
+          `block_type=auto_prepare_interrupted` so T19 routes them
+          identically; distinct state-names preserve cause/effect honesty
+          per §6 contradiction-fix rule (a state name that lies about its
+          cause is the kind of fallback-after-soft-degrade footgun the
+          rule prohibits).
 
     Detection-order rationale (D1 / blindspot-C):
       1. Read lock-presence + engaged-presence FIRST (cheap, no parse).
+         Engaged-scan can raise `JournalCorruptError` if decisions.jsonl
+         has a malformed line — caught and routed to
+         `interrupted_journal_corrupt` (codex T5 R1 [P2] fix; silent-skip
+         was a D2 fallback bypass — a truncated `auto_engaged` line could
+         be the only proof of engagement).
       2. If both present → orphan (lock that should have been consumed
          when engaged was emitted; we report this for cleanup, not for
          classification).
       3. Only when lock-present-and-not-engaged do we parse lock JSON +
-         consult pid liveness / contract hash. The contract-hash check
-         is a `==` compare, NOT `.get(...) or ""` — see schema-parsing-
+         consult contract hash → host → pid liveness. The contract-hash
+         check is a `==` compare, NOT `.get(...) or ""` — see schema-parsing-
          get-vs-in pitfall: an explicitly-null `contract_hash` in the
          on-disk lock indicates a malformed lock and MUST NOT silently
          match an arbitrary current hash.
-      4. Contract-mismatch is checked BEFORE pid-liveness because it's
-         a more decisive signal: if the contract changed, the recovery
-         decision is `block` regardless of pid. A live pid running
-         against a stale contract is still an interrupted recovery
-         state from the user's perspective.
+      4. Contract-mismatch is checked BEFORE host/pid because it's the
+         most decisive signal: if the contract changed, the recovery
+         decision is `block` regardless of host/pid.
+      5. Host-mismatch is checked BEFORE pid because cross-host PID
+         collision (codex T5 R1 [P2]): lock written on machine A copied/
+         synced to B. On B, `_is_pid_alive(lock_pid)` would treat any
+         locally-live PID as "the original orchestrator" — coincidence.
+         Without the host check, recovery classifies as `active_run`
+         forever and never proceeds.
     """
     task_dir = Path(task_dir)
     lock_path = task_dir / AUTO_PREPARE_LOCK_FILENAME
     lock_present = lock_path.is_file()
-    engaged = _has_auto_engaged_for(task_dir, run_id, task_id)
+    # Codex T5 R1 [P2] — if decisions.jsonl has a malformed line, route to
+    # `interrupted_journal_corrupt`. Distinct state-name (vs lock_corrupt)
+    # preserves cause/effect honesty; same `block_type` so T19 routes
+    # identically. Do NOT silent-skip the bad line in `_has_auto_engaged_for`:
+    # that would be a D2 fallback bypass — a truncated `auto_engaged` line
+    # could be the only proof of engagement, and silent-skip would let
+    # recovery dispatch fresh on top of a real interrupted run.
+    try:
+        engaged = _has_auto_engaged_for(task_dir, run_id, task_id)
+    except JournalCorruptError as e:
+        return {
+            "state": "interrupted_journal_corrupt",
+            "block_type": "auto_prepare_interrupted",
+            "lock": None,
+            "journal_corrupt": True,
+            "parse_error": str(e),
+        }
 
     if not lock_present and not engaged:
         return {"state": "no_run"}
@@ -632,6 +684,52 @@ def detect_auto_prepare_state(
             "block_type": "auto_prepare_interrupted",
             "lock": lock,
         }
+    # Codex T5 R1 [P2] — cross-host PID-collision guard. Lock was written
+    # on machine A (host="hostA" recorded), then task_dir was copied/synced
+    # to machine B. On B, `_is_pid_alive(lock_pid)` would treat any locally
+    # live PID as "the original orchestrator" — but it's a totally unrelated
+    # B-process. Without this check, recovery classifies as `active_run`
+    # forever and never proceeds.
+    #
+    # Schema-parsing rule (cf. .flow/pitfalls/schema-parsing-get-vs-in.md):
+    # use `"host" in lock` for explicit-null treatment, NOT `lock.get("host")`.
+    # v0.8.1 lock schema requires `host: str` (see AutoPrepareLock dataclass).
+    # Three cases:
+    #   1. `host` key missing       → fail-closed (older v0.8.0-shaped lock
+    #      should never reach here in v0.8.1; fail-closed routes to a
+    #      definite block state rather than silently trusting PID)
+    #   2. `host` key present, == ours → trust pid liveness (pre-existing path)
+    #   3. `host` key present, != ours → original orchestrator unreachable
+    #      from here; route to interrupted_host_mismatch (distinct
+    #      state-name preserves cause/effect; same block_type → T19 routes
+    #      identically to dead_pid).
+    current_host = socket.gethostname()
+    if "host" not in lock or not isinstance(lock.get("host"), str):
+        # Missing or non-string host → fail-closed. v0.8.1 schema requires
+        # `host: str`; a lock without it is malformed for this version.
+        # We treat as host_mismatch (not lock_corrupt) because the lock
+        # JSON itself parses as a dict — only the host field is wrong.
+        return {
+            "state": "interrupted_host_mismatch",
+            "block_type": "auto_prepare_interrupted",
+            "lock": lock,
+            "current_host": current_host,
+            "lock_host": lock.get("host"),
+        }
+    if lock["host"] != current_host:
+        # Cross-host: the recorded PID can't be trusted on this machine.
+        # The lock's host orchestrator is unreachable from B's perspective;
+        # we cannot signal it, cannot probe it, and any locally-live PID
+        # match is a coincidence. Route to a distinct state so forensics
+        # / T19 logs show the actual cause (per §6 contradiction-fix rule).
+        return {
+            "state": "interrupted_host_mismatch",
+            "block_type": "auto_prepare_interrupted",
+            "lock": lock,
+            "current_host": current_host,
+            "lock_host": lock["host"],
+        }
+
     # Pid liveness LAST (cheapest semantically, but most expensive
     # in the only-trustworthy-from-our-uid sense). `_is_pid_alive`
     # validates `pid > 0`; pass `-1` for missing/non-int to force the

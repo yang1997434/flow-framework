@@ -1,5 +1,6 @@
 import json
 import os
+import socket
 import sys
 import tempfile
 import unittest
@@ -17,6 +18,7 @@ from flow_state_writer import (
     AutoPrepareLock,
     write_auto_prepare_lock, consume_auto_prepare_lock,
     detect_auto_prepare_state,
+    _has_auto_engaged_for, JournalCorruptError,
 )
 from safe_io import append_jsonl_locked
 
@@ -302,7 +304,12 @@ class TestAutoPrepareLock(unittest.TestCase):
             contract_path="/tmp/c.json", contract_hash="a" * 64,
             contract_schema_version=1,
             created_at="2026-05-06T00:00:00Z",
-            pid=os.getpid(), host="testhost", cwd="/tmp",
+            # Default to current host so existing assertions about pid /
+            # contract / corrupt states continue to exercise THOSE states
+            # rather than getting short-circuited by host_mismatch (codex
+            # T5 R1 [P2] added the host check). Cross-host scenarios are
+            # covered explicitly in TestHostMismatchFailClosed.
+            pid=os.getpid(), host=socket.gethostname(), cwd="/tmp",
             target_branch="master",
             intended_first_task_dispatch_at="2026-05-06T00:00:01Z",
         )
@@ -486,6 +493,247 @@ class TestAutoPrepareLock(unittest.TestCase):
             self.task_dir, run_id="run-1", task_id="T1",
             current_contract_hash="a" * 64)
         self.assertEqual(r["state"], "interrupted_dead_pid")
+
+
+# ----------------------------------------------------------------------
+# Codex T5 R1 [P2] — F1 + F2 fix-pass tests.
+# ----------------------------------------------------------------------
+
+
+class TestJournalCorruptFailClosed(unittest.TestCase):
+    """F1: malformed `decisions.jsonl` lines must NOT silent-skip.
+
+    A truncated/corrupt mid-flush could BE the only `auto_engaged` event
+    for this task. Silent-skip → caller sees False → recovery
+    classifies as no_run → fresh dispatch on top of an interrupted run.
+    This is a D2 fallback bypass per
+    `.flow/pitfalls/claude-review-blindspots.md`.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp))
+        self.task_dir = self.tmp / ".flow" / "tasks" / "demo"
+        self.task_dir.mkdir(parents=True)
+
+    def _make_lock(self, **overrides) -> AutoPrepareLock:
+        defaults = dict(
+            lock_version=1, slug="demo", run_id="run-1", task_id="T1",
+            contract_path="/tmp/c.json", contract_hash="a" * 64,
+            contract_schema_version=1,
+            created_at="2026-05-06T00:00:00Z",
+            pid=os.getpid(), host=socket.gethostname(), cwd="/tmp",
+            target_branch="master",
+            intended_first_task_dispatch_at="2026-05-06T00:00:01Z",
+        )
+        defaults.update(overrides)
+        return AutoPrepareLock(**defaults)
+
+    def test_has_auto_engaged_raises_on_malformed_json_line(self):
+        """`_has_auto_engaged_for` MUST raise JournalCorruptError, not
+        return False, when a line fails JSON parsing."""
+        path = self.task_dir / "decisions.jsonl"
+        # First line valid, second truncated mid-flush — common crash mode.
+        path.write_text(
+            json.dumps({"event": "noise", "run_id": "x", "task_id": "y"}) + "\n"
+            + '{"event": "auto_engaged", "run_id": "run-1"',  # truncated
+            encoding="utf-8",
+        )
+        with self.assertRaises(JournalCorruptError) as ctx:
+            _has_auto_engaged_for(self.task_dir, "run-1", "T1")
+        self.assertIn("line 2", str(ctx.exception))
+
+    def test_has_auto_engaged_raises_on_non_dict_line(self):
+        """Non-dict (e.g. a JSON list) is also corrupt — must raise."""
+        path = self.task_dir / "decisions.jsonl"
+        path.write_text("[1, 2, 3]\n", encoding="utf-8")
+        with self.assertRaises(JournalCorruptError):
+            _has_auto_engaged_for(self.task_dir, "run-1", "T1")
+
+    def test_detect_state_returns_interrupted_journal_corrupt(self):
+        """Top-level: detect_auto_prepare_state must catch the
+        JournalCorruptError and route to `interrupted_journal_corrupt`.
+        Same block_type as the other interrupted states (T19 routes
+        identically); distinct state-name preserves cause/effect honesty.
+        """
+        # Write a valid lock so we exercise the engaged-scan path.
+        write_auto_prepare_lock(self.task_dir, self._make_lock())
+        path = self.task_dir / "decisions.jsonl"
+        path.write_text("{not valid json", encoding="utf-8")
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="a" * 64)
+        self.assertEqual(r["state"], "interrupted_journal_corrupt")
+        self.assertEqual(r["block_type"], "auto_prepare_interrupted")
+        self.assertTrue(r.get("journal_corrupt"))
+        self.assertIn("parse_error", r)
+
+    def test_control_clean_journal_no_auto_engaged_returns_false(self):
+        """Control: a clean journal containing other events but no
+        `auto_engaged` returns False normally (no spurious raise)."""
+        path = self.task_dir / "decisions.jsonl"
+        path.write_text(
+            json.dumps({"event": "noise", "run_id": "run-1",
+                        "task_id": "T1"}) + "\n"
+            + json.dumps({"event": "other", "run_id": "run-1",
+                          "task_id": "T1"}) + "\n",
+            encoding="utf-8",
+        )
+        # No raise — clean parse, no match.
+        self.assertFalse(_has_auto_engaged_for(self.task_dir, "run-1", "T1"))
+
+    def test_control_clean_journal_state_is_no_run(self):
+        """Control through detect_auto_prepare_state: clean journal +
+        no lock + no match = the appropriate non-corrupt state (no_run)."""
+        path = self.task_dir / "decisions.jsonl"
+        path.write_text(
+            json.dumps({"event": "noise", "run_id": "x",
+                        "task_id": "y"}) + "\n",
+            encoding="utf-8",
+        )
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="a" * 64)
+        self.assertEqual(r["state"], "no_run")
+
+
+class TestHostMismatchFailClosed(unittest.TestCase):
+    """F2: cross-host PID-collision guard.
+
+    Lock written on machine A (host="hostA"); task_dir copied to B.
+    On B, `_is_pid_alive(lock_pid)` would treat any locally-live PID as
+    "the original orchestrator" — a coincidence. Without this check,
+    recovery classifies as `active_run` forever and never proceeds.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp))
+        self.task_dir = self.tmp / ".flow" / "tasks" / "demo"
+        self.task_dir.mkdir(parents=True)
+
+    def _make_lock(self, **overrides) -> AutoPrepareLock:
+        defaults = dict(
+            lock_version=1, slug="demo", run_id="run-1", task_id="T1",
+            contract_path="/tmp/c.json", contract_hash="a" * 64,
+            contract_schema_version=1,
+            created_at="2026-05-06T00:00:00Z",
+            pid=os.getpid(), host=socket.gethostname(), cwd="/tmp",
+            target_branch="master",
+            intended_first_task_dispatch_at="2026-05-06T00:00:01Z",
+        )
+        defaults.update(overrides)
+        return AutoPrepareLock(**defaults)
+
+    def test_mismatched_host_routes_to_host_mismatch_even_when_pid_alive(self):
+        """The whole point: with a foreign host, even a locally-LIVE pid
+        (our own pid here) MUST NOT classify as active_run."""
+        write_auto_prepare_lock(
+            self.task_dir,
+            self._make_lock(host="some-other-machine", pid=os.getpid()),
+        )
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="a" * 64)
+        self.assertEqual(r["state"], "interrupted_host_mismatch")
+        self.assertEqual(r["block_type"], "auto_prepare_interrupted")
+        self.assertEqual(r["lock_host"], "some-other-machine")
+        self.assertEqual(r["current_host"], socket.gethostname())
+
+    def test_mismatched_host_routes_to_host_mismatch_when_pid_dead(self):
+        """Even with a definitively dead pid, a foreign host should still
+        surface as host_mismatch (more specific cause)."""
+        write_auto_prepare_lock(
+            self.task_dir,
+            self._make_lock(host="some-other-machine", pid=2**31 - 1),
+        )
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="a" * 64)
+        self.assertEqual(r["state"], "interrupted_host_mismatch")
+
+    def test_matching_host_alive_pid_still_active_run(self):
+        """Control: matching host + alive pid → active_run (preserved
+        pre-existing behavior). This guards against over-tightening."""
+        write_auto_prepare_lock(
+            self.task_dir,
+            self._make_lock(host=socket.gethostname(), pid=os.getpid()),
+        )
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="a" * 64)
+        self.assertEqual(r["state"], "active_run")
+
+    def test_matching_host_dead_pid_still_dead_pid(self):
+        """Control: matching host + dead pid → interrupted_dead_pid
+        (preserved pre-existing behavior)."""
+        write_auto_prepare_lock(
+            self.task_dir,
+            self._make_lock(host=socket.gethostname(), pid=2**31 - 1),
+        )
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="a" * 64)
+        self.assertEqual(r["state"], "interrupted_dead_pid")
+
+    def test_missing_host_field_fails_closed(self):
+        """A lock without `host` (older v0.8.0-shaped lock) MUST
+        fail-closed to host_mismatch — v0.8.1 schema requires `host: str`,
+        and silently trusting PID-only on a missing field would be the
+        same fallback bypass F2 is fixing.
+        """
+        # Hand-craft a lock with `host` key absent — bypass dataclass.
+        (self.task_dir / "auto_prepare.lock").write_text(
+            json.dumps({
+                "lock_version": 1, "slug": "demo", "run_id": "run-1",
+                "task_id": "T1", "contract_path": "/c.json",
+                "contract_hash": "a" * 64, "contract_schema_version": 1,
+                "created_at": "2026-05-06T00:00:00Z",
+                "pid": os.getpid(),
+                # no `host` key
+                "cwd": "/", "target_branch": "master",
+                "intended_first_task_dispatch_at": "2026-05-06T00:00:01Z",
+            }), encoding="utf-8")
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="a" * 64)
+        self.assertEqual(r["state"], "interrupted_host_mismatch")
+        self.assertIsNone(r["lock_host"])
+
+    def test_explicit_null_host_fails_closed(self):
+        """Schema-parsing rule: explicit `host: null` is malformed and
+        MUST NOT silently match anything. Mirror the contract_hash
+        explicit-null test pattern.
+        """
+        (self.task_dir / "auto_prepare.lock").write_text(
+            json.dumps({
+                "lock_version": 1, "slug": "demo", "run_id": "run-1",
+                "task_id": "T1", "contract_path": "/c.json",
+                "contract_hash": "a" * 64, "contract_schema_version": 1,
+                "created_at": "2026-05-06T00:00:00Z",
+                "pid": os.getpid(),
+                "host": None,  # explicit null
+                "cwd": "/", "target_branch": "master",
+                "intended_first_task_dispatch_at": "2026-05-06T00:00:01Z",
+            }), encoding="utf-8")
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="a" * 64)
+        self.assertEqual(r["state"], "interrupted_host_mismatch")
+        self.assertIsNone(r["lock_host"])
+
+    def test_contract_changed_takes_precedence_over_host(self):
+        """Detection order: contract-mismatch → host → pid. A foreign
+        host with a stale contract should surface as
+        `interrupted_contract_changed` (more decisive signal)."""
+        write_auto_prepare_lock(
+            self.task_dir,
+            self._make_lock(host="other-host", contract_hash="a" * 64),
+        )
+        r = detect_auto_prepare_state(
+            self.task_dir, run_id="run-1", task_id="T1",
+            current_contract_hash="b" * 64)  # mismatch
+        self.assertEqual(r["state"], "interrupted_contract_changed")
 
 
 if __name__ == "__main__":

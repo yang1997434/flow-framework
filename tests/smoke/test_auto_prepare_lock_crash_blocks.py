@@ -9,6 +9,7 @@ pins the detect-side contract so T19 has a stable foundation to build on.
 """
 import json
 import os
+import socket
 import sys
 import tempfile
 import unittest
@@ -37,7 +38,7 @@ class TestAutoPrepareLockCrashDetected(unittest.TestCase):
                 contract_schema_version=1,
                 created_at="2026-05-06T00:00:00Z",
                 pid=2**31 - 1,  # outside OS pid range
-                host="x", cwd=td, target_branch="master",
+                host=socket.gethostname(), cwd=td, target_branch="master",
                 intended_first_task_dispatch_at="2026-05-06T00:00:01Z",
             )
             write_auto_prepare_lock(Path(td), lock)
