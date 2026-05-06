@@ -401,7 +401,18 @@ def parse_contract(path: Path) -> Contract:
     # Codex round-4 [P2]: key presence, not `is None`. Explicit
     # `max_codex_rounds_per_task: null` must reject (the field is typed int);
     # absent → default 3.
-    budget = dict(raw.get("budget") or {})
+    # Codex round-5 [P2]: parent `budget` itself must reject explicit null /
+    # falsy non-dict, mirroring `notification` and `scope`. Prior `or {}`
+    # path treated `"budget": null` as absent, silently applying defaults.
+    if "budget" in raw:
+        budget_raw = raw["budget"]
+        if not isinstance(budget_raw, dict):
+            raise ContractError(
+                f"budget must be an object, got {budget_raw!r}"
+            )
+        budget = dict(budget_raw)
+    else:
+        budget = {}
     if "max_codex_rounds_per_task" not in budget:
         budget["max_codex_rounds_per_task"] = 3
     else:

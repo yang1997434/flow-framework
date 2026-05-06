@@ -576,6 +576,36 @@ class TestParseContract(unittest.TestCase):
         self.assertIn("max_codex_rounds_per_task", msg)
         self.assertIn(">= 1", msg)
 
+    def test_budget_explicit_null_rejected(self):
+        """Codex round-5: parent `budget: null` must also reject (mirrors
+        notification/scope null handling). Without this, the v0.8.1
+        max_codex_rounds_per_task default would be silently applied to
+        a malformed budget."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "budget": None,
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        msg = str(ctx.exception)
+        self.assertIn("budget must be an object", msg)
+
+    def test_budget_falsy_non_dict_rejected(self):
+        """Codex round-5: `budget: false`, `0`, `""` also reject (full
+        fail-closed parity with notification/scope falsy handling)."""
+        for falsy in (False, 0, ""):
+            path = self._write({
+                "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+                "autonomy_mode": "interactive",
+                "created_at": "2026-05-06T00:00:00Z",
+                "budget": falsy,
+            })
+            with self.assertRaises(ContractError) as ctx:
+                parse_contract(path)
+            self.assertIn("budget must be an object", str(ctx.exception))
+
     def test_idempotent_cmd_allowlist_explicit_null_rejected(self):
         """Codex round-4: explicit `null` must reject — typed list[str].
         Without this, a user who *intends* to disable the allowlist by
