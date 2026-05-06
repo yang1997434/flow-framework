@@ -32,3 +32,4 @@ tests/temp/
 
 # Worktrees (subagent-driven feature isolation)
 .worktrees/
+.context/
