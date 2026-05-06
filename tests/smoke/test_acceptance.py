@@ -1730,5 +1730,61 @@ class TestHttpMalformedUrl(unittest.TestCase):
         )
 
 
+class TestEmbeddedNulRunOneSafetyNet(unittest.TestCase):
+    """Codex T7 R5 [P2]: criterion strings with embedded NUL bytes raised
+    ValueError out of Path.resolve() or subprocess.Popen, escaping past
+    run_one's `started` event → orphan progress log. Defense-in-depth
+    catch-all in run_one._dispatch_method now routes any unexpected
+    Exception to inconclusive so the paired `completed` event always fires.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp))
+        self.runner = _make_runner(self.tmp)
+        self.task_dir = Path(self.tmp) / "task_dir"
+        self.task_dir.mkdir(parents=True)
+
+    def _assert_paired_events(self, result):
+        """Common: status must be inconclusive AND progress log has both
+        started + (completed or timeout)."""
+        self.assertEqual(result.status, "inconclusive")
+        progress_log = self.task_dir / "acceptance-progress.jsonl"
+        self.assertTrue(progress_log.exists())
+        events = [
+            json.loads(line)
+            for line in progress_log.read_text().splitlines()
+            if line.strip()
+        ]
+        kinds = [e.get("event") for e in events]
+        self.assertIn("started", kinds)
+        self.assertTrue(
+            "completed" in kinds or "timeout" in kinds,
+            msg=f"orphan started event; kinds={kinds}",
+        )
+
+    def test_file_exists_with_nul_byte_path_routes_inconclusive(self):
+        crit = AcceptanceCriterion(
+            description="nul-path", type="integration",
+            method="file_exists", path="a\x00b",
+        )
+        result = self.runner.run_one(
+            crit, criterion_idx=0, attempt_id="a-nul-path",
+            retry_idx=0, task_dir=self.task_dir,
+        )
+        self._assert_paired_events(result)
+
+    def test_cmd_with_nul_byte_command_routes_inconclusive(self):
+        crit = AcceptanceCriterion(
+            description="nul-cmd", type="integration",
+            method="cmd", command="echo hi\x00; sleep 5",
+        )
+        result = self.runner.run_one(
+            crit, criterion_idx=0, attempt_id="a-nul-cmd",
+            retry_idx=0, task_dir=self.task_dir,
+        )
+        self._assert_paired_events(result)
+
+
 if __name__ == "__main__":
     unittest.main()

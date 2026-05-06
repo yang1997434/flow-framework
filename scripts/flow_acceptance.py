@@ -1165,8 +1165,26 @@ class AcceptanceRunner:
             command_hash=None,
         ))
 
-        # 2. Dispatch to the per-method executor.
-        result = self._dispatch_method(criterion)
+        # 2. Dispatch to the per-method executor. Codex T7 R5 [P2]:
+        # defense-in-depth catch-all. Embedded NUL bytes (and any other
+        # unanticipated input that makes Path.resolve / subprocess.Popen /
+        # urlsplit / etc. raise something OTHER than the executor's typed
+        # except-tuple) used to escape past run_one's `started` event,
+        # leaving an orphan progress entry. Any non-BaseException now maps
+        # to inconclusive so the matching `completed` event always fires.
+        # KeyboardInterrupt / SystemExit are NOT swallowed.
+        try:
+            result = self._dispatch_method(criterion)
+        except Exception as e:  # noqa: BLE001 — intentional catch-all
+            result = RunResult(
+                status="inconclusive",
+                error_msg=(
+                    f"executor raised unexpected {type(e).__name__}: {e}. "
+                    f"This is likely a malformed criterion (embedded NUL, "
+                    f"control chars, etc.) — inconclusive routes the "
+                    f"contract to operator review."
+                ),
+            )
 
         # 3. Y1: e2e timeout AND e2e fail force escalate=True. Method-level
         # executors leave escalate=False; only the orchestration shell knows
