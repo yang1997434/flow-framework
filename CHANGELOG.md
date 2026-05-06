@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.8.0 — 2026-05-06
+
+### Major: Autonomous mode foundation (execution gated to v0.8.1)
+
+The `contract.json` schema lands. Tasks can now declare autonomy scope,
+budget, irreversible actions, acceptance criteria, and stop-condition
+decision tables. Dry-run orchestrator builds per-task file ownership
+manifests and previews what v0.8.1 *would* execute.
+
+**New CLI:**
+- `flow contract --init <slug>` — generate template
+- `flow contract --validate <slug>` — schema + integrity check
+- `flow orchestrator --dry-run <slug>` — print plan + manifests
+- `flow orchestrator --auto-execute <slug>` — refused with explanatory error
+
+**New schema:**
+- `.flow/tasks/<slug>/contract.json` (versioned: `contract_schema_version: 1`)
+- `progress.md` frontmatter pointer: `contract_path`, `contract_schema_version`,
+  `autonomy_mode`, `last_checkpoint`
+- State writers (no reads yet): `decisions.jsonl`, `review-issues.jsonl`,
+  `checkpoints/<ts>.md`, `blocked.md`
+
+**New capabilities:**
+- `autonomy_orchestrator` (placeholder; activated in v0.8.1)
+- `acceptance_verify` (placeholder; activated in v0.8.1)
+
+**`flow doctor` extension:** contract.json existence + schema-version check
+for every task whose `progress.md` declares `autonomy_mode`.
+
+### Backwards compatibility
+
+Pure additive. Missing contract → interactive (v0.7 behavior unchanged).
+Forward-compat: unknown contract fields accepted with warning.
+
+### Migration
+
+See `docs/v0.8-migration.md`.
+
 ## v0.7.1 — 2026-05-05
 
 ### Fixed
