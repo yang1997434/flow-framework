@@ -1071,6 +1071,23 @@ class TestValidateContract(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(any("schema_version" in e for e in errs))
 
+    def test_validate_too_new_schema_hard_error(self):
+        # T2 R11: pin a specific too-new version and assert validator
+        # surfaces both the version number AND "newer" in the error so
+        # downstream log parsers (orchestrator stderr scanner, future
+        # tier-2 notifications) can match on stable strings.
+        path = self._write({
+            "contract_schema_version": 999,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+        })
+        ok, errors = validate_contract(path)
+        self.assertFalse(ok)
+        self.assertTrue(
+            any("999" in e and "newer" in e.lower() for e in errors),
+            msg=f"errors: {errors}",
+        )
+
     def test_auto_mode_without_acceptance_criteria_warns(self):
         path = self._write({
             "contract_schema_version": CONTRACT_SCHEMA_VERSION,

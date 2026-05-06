@@ -21,7 +21,9 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "common"))
 from flow_wave_planner import parse_plan_tasks  # type: ignore
-from flow_contract import parse_contract, ContractError, Contract  # type: ignore
+from flow_contract import (  # type: ignore
+    parse_contract, ContractError, Contract, CONTRACT_SCHEMA_VERSION,
+)
 from progress_meta import read_progress_meta, ProgressMeta  # type: ignore
 
 
@@ -86,6 +88,21 @@ def build_plan(slug: str) -> OrchestratorPlan:
         plan.autonomy_mode = "interactive"
         plan.fallback_reason = f"contract parse failed ({e}) — falling back to interactive"
         return plan
+
+    # T2 R11: hard-reject contracts whose schema_version exceeds what this
+    # runtime knows. v0.8.0 only warned via the validator and let the
+    # orchestrator proceed; codex round-3 R11 caught the silent-accept gap.
+    # Fail-closed at the orchestrator boundary covers BOTH --dry-run and
+    # --auto-execute (the caller routes through build_plan in both paths).
+    if contract.contract_schema_version > CONTRACT_SCHEMA_VERSION:
+        print(
+            f"ERROR: contract.json declares contract_schema_version="
+            f"{contract.contract_schema_version} but this flow runtime "
+            f"knows up to {CONTRACT_SCHEMA_VERSION}. Upgrade flow OR "
+            f"downgrade the contract.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     plan.contract = contract
     plan.autonomy_mode = contract.autonomy_mode
@@ -165,6 +182,13 @@ def _cmd_dry_run(slug: str) -> int:
 
 
 def _cmd_auto_execute(slug: str) -> int:
+    # T2 R11: parse + ceiling-check the contract FIRST so a too-new schema
+    # fails closed with a precise version-mismatch message rather than the
+    # generic "v0.8.0 disabled" stub. build_plan() does the parse + ceiling
+    # enforcement and sys.exit(1)'s on a too-new schema; if it returns we
+    # know the contract is parseable and ≤ runtime version, then we still
+    # refuse v0.8.0 dispatch with the long-standing not-yet-implemented msg.
+    build_plan(slug)
     print(
         "ERROR: v0.8.0 does not support autonomous dispatch. "
         "The schema and dry-run preview are stable; the safety stack "
