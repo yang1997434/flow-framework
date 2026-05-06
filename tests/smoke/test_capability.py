@@ -202,5 +202,21 @@ class AntiRegressionRepoSource(unittest.TestCase):
             # mutates ~/.claude/, so we don't run it in unit test)
 
 
+class TestV08Capabilities(unittest.TestCase):
+    def test_autonomy_orchestrator_registered(self):
+        from flow_capability import load_registry
+        reg = load_registry()
+        cap = reg.resolve_capability("autonomy_orchestrator")
+        self.assertIsNotNone(cap)
+        self.assertEqual(cap["default"], "flow:flow-phase2-execute")
+
+    def test_acceptance_verify_registered(self):
+        from flow_capability import load_registry
+        reg = load_registry()
+        cap = reg.resolve_capability("acceptance_verify")
+        self.assertIsNotNone(cap)
+        self.assertEqual(cap["default"], "flow:flow-phase3-finish")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -202,6 +202,18 @@
       "default": "flow:flow-wave-runner",
       "description": "Phase 2 — execute one wave: paired implementer/spec-reviewer in parallel, sequential merge with FILES_CHANGED verification, code-quality reviewer at wave end",
       "fallback_to": "subagent_dispatch"
+    },
+
+    "_v0_8_phase2_additions": "Phase 2 capabilities added in v0.8.0 (autonomy orchestrator)",
+    "autonomy_orchestrator": {
+      "default": "flow:flow-phase2-execute",
+      "description": "Phase 2 — autonomous orchestrator (v0.8.0 stub: dry-run only; v0.8.1 extends with worktree-per-task dispatch + safety stack)",
+      "skip_if_not_available": true
+    },
+    "acceptance_verify": {
+      "default": "flow:flow-phase3-finish",
+      "description": "Phase 3 — acceptance_criteria runner gate (v0.8.0 stub: not yet wired; v0.8.1 extends with all 5 criterion-type executors)",
+      "skip_if_not_available": true
     }
   },
 
