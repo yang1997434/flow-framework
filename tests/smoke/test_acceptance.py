@@ -20,11 +20,14 @@ from __future__ import annotations
 
 import http.server
 import json
+import os
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -36,6 +39,8 @@ from flow_acceptance import (   # type: ignore  # noqa: E402
     RunResult,
     DEFAULT_TIMEOUT_BY_METHOD,
     E2E_TYPE_TIMEOUT,
+    MAX_JSON_QUERY_FILE_BYTES,
+    MAX_HTTP_REDIRECTS,
 )
 from flow_contract import AcceptanceCriterion  # type: ignore  # noqa: E402
 
@@ -693,6 +698,369 @@ class TestDispatchUnknownMethod(unittest.TestCase):
             r = runner._dispatch_method(crit)
             self.assertEqual(r.status, "inconclusive")
             self.assertIn("unknown method", r.error_msg or "")
+
+
+# ---------------------------------------------------------------------------
+# SAFETY-BOUNDARY hardening (codex R1 — T7 IS the safety boundary)
+# ---------------------------------------------------------------------------
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True if PID is still a live process. POSIX-only.
+
+    ``os.kill(pid, 0)`` is the standard idiom: signal 0 doesn't deliver
+    anything, but ``ProcessLookupError`` is raised iff PID is unknown to
+    the kernel. ``PermissionError`` means the PID exists but we don't
+    own it — for our test, the child is ours, so this won't trip.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class TestCmdProcessGroupKill(unittest.TestCase):
+    """[P1] BLOCKER fix: ``cmd`` timeout must kill the WHOLE process group,
+    not just the shell. With ``shell=True`` + ``subprocess.run``, the
+    timeout would only kill the shell, leaving ``&``-backgrounded children
+    alive. We now spawn with ``start_new_session=True`` and SIGTERM/SIGKILL
+    the process group on TimeoutExpired."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp))
+        self.runner = _make_runner(self.tmp)
+
+    def test_cmd_timeout_kills_backgrounded_descendant(self):
+        # Spawn a shell that backgrounds a long sleep, writes the sleep's
+        # PID to a sentinel file, then waits forever. When the timeout
+        # fires we expect the whole process group dead — including the
+        # backgrounded sleep. Without the process-group-kill fix the
+        # sleep would survive the shell's death.
+        pidfile = Path(self.tmp) / "child.pid"
+        # 60s sleep — far longer than the 2s timeout; if it survives we'll
+        # see it via ps/kill -0 and fail the test loud.
+        cmd = (
+            f"sleep 60 & echo $! > {pidfile}; "
+            f"# wait blocks the shell so the timeout has a clean target\n"
+            f"wait"
+        )
+        crit = AcceptanceCriterion(
+            description="bg-sleep", type="unit", method="cmd",
+            command=cmd, timeout_sec=2,
+        )
+        r = self.runner._run_cmd(crit)
+        self.assertEqual(r.status, "timed_out", msg=r.error_msg)
+        # Allow up to 2s for our SIGTERM/SIGKILL drain to land before we
+        # check liveness — the runner already waited up to
+        # PROCESS_GROUP_KILL_GRACE_SEC=2s, so this is belt-and-suspenders.
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if pidfile.exists():
+                break
+            time.sleep(0.05)
+        self.assertTrue(
+            pidfile.exists(),
+            msg="shell didn't write the sentinel pidfile before timeout",
+        )
+        child_pid = int(pidfile.read_text().strip())
+        # Critical assertion: the backgrounded sleep must NOT be alive.
+        # Without the fix, the shell dies but the sleep keeps going for
+        # 60s. With the fix, killpg(SIGTERM/SIGKILL) takes out the group.
+        # Wait briefly for kill to propagate.
+        for _ in range(20):
+            if not _pid_alive(child_pid):
+                break
+            time.sleep(0.1)
+        self.assertFalse(
+            _pid_alive(child_pid),
+            msg=(
+                f"backgrounded sleep PID {child_pid} survived per-criterion "
+                f"timeout — process group kill is NOT working"
+            ),
+        )
+
+    def test_cmd_timeout_signal_handler_ignored_falls_back_to_sigkill(self):
+        # Trap SIGTERM so the shell ignores graceful shutdown. Without
+        # the SIGKILL fallback the runner would block forever waiting
+        # for an unkillable shell. With the fallback the criterion
+        # times out cleanly + the shell dies.
+        cmd = (
+            "trap '' TERM; "
+            "echo trapped; "
+            "sleep 30"
+        )
+        crit = AcceptanceCriterion(
+            description="trap-term", type="unit", method="cmd",
+            command=cmd, timeout_sec=2,
+        )
+        t0 = time.monotonic()
+        r = self.runner._run_cmd(crit)
+        elapsed = time.monotonic() - t0
+        self.assertEqual(r.status, "timed_out")
+        # Should complete within timeout + 2s SIGTERM drain + slack.
+        # If SIGKILL fallback didn't fire we'd see ~30s.
+        self.assertLess(
+            elapsed, 10,
+            msg=f"timeout took {elapsed:.1f}s — SIGKILL fallback may not fire",
+        )
+
+
+class TestPathContainment(unittest.TestCase):
+    """[P2] codex fix: file_exists and json_query reject paths that
+    escape the worktree root (absolute paths or ``..`` traversal)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp))
+        self.runner = _make_runner(self.tmp)
+
+    def test_file_exists_absolute_path_rejected(self):
+        # ``/etc/passwd`` exists on every linux box; if path containment
+        # were broken this would return ``pass``. With the fix it must
+        # return ``inconclusive`` (malformed contract).
+        crit = AcceptanceCriterion(
+            description="abs", type="smoke", method="file_exists",
+            path="/etc/passwd", timeout_sec=30,
+        )
+        r = self.runner._run_file_exists(crit)
+        self.assertEqual(r.status, "inconclusive")
+        self.assertIn("outside worktree", r.error_msg or "")
+
+    def test_file_exists_dotdot_traversal_rejected(self):
+        # ``../../../etc/passwd`` would resolve outside the temp
+        # worktree. Containment guard must catch that.
+        crit = AcceptanceCriterion(
+            description="traversal", type="smoke", method="file_exists",
+            path="../../../etc/passwd", timeout_sec=30,
+        )
+        r = self.runner._run_file_exists(crit)
+        self.assertEqual(r.status, "inconclusive")
+        self.assertIn("outside worktree", r.error_msg or "")
+
+    def test_file_exists_relative_path_inside_worktree_unchanged(self):
+        # Control: legitimate relative path inside the worktree still
+        # works post-fix. Asserts the guard didn't over-fire.
+        (Path(self.tmp) / "VERSION").write_text("0.8.1\n")
+        crit = AcceptanceCriterion(
+            description="ok", type="smoke", method="file_exists",
+            path="VERSION", timeout_sec=30,
+        )
+        r = self.runner._run_file_exists(crit)
+        self.assertEqual(r.status, "pass")
+
+    def test_json_query_absolute_path_rejected(self):
+        crit = AcceptanceCriterion(
+            description="abs json", type="smoke", method="json_query",
+            path="/etc/hostname",  # exists but not JSON; containment trips first
+            json_query="x", timeout_sec=30,
+        )
+        r = self.runner._run_json_query(crit)
+        self.assertEqual(r.status, "inconclusive")
+        self.assertIn("outside worktree", r.error_msg or "")
+
+    def test_json_query_dotdot_traversal_rejected(self):
+        crit = AcceptanceCriterion(
+            description="trav json", type="smoke", method="json_query",
+            path="../../../etc/hostname", json_query="x", timeout_sec=30,
+        )
+        r = self.runner._run_json_query(crit)
+        self.assertEqual(r.status, "inconclusive")
+        self.assertIn("outside worktree", r.error_msg or "")
+
+
+class TestJsonQuerySizeCap(unittest.TestCase):
+    """[P2] codex fix: json_query refuses files > MAX_JSON_QUERY_FILE_BYTES
+    BEFORE materializing them."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp))
+        self.runner = _make_runner(self.tmp)
+
+    def test_json_query_oversized_file_inconclusive(self):
+        # Write a file just over the cap. We use a sparse file via
+        # truncate() so we don't actually allocate 11 MB on disk —
+        # but stat().st_size still reports the full size, which is
+        # what the cap guard checks. (Sparse vs dense doesn't matter
+        # here; we never get to read_text.)
+        big = Path(self.tmp) / "huge.json"
+        with open(big, "wb") as f:
+            f.truncate(MAX_JSON_QUERY_FILE_BYTES + 1)
+        crit = AcceptanceCriterion(
+            description="huge", type="smoke", method="json_query",
+            path="huge.json", json_query="x", timeout_sec=30,
+        )
+        r = self.runner._run_json_query(crit)
+        self.assertEqual(r.status, "inconclusive")
+        # error_msg must mention the size (operator visibility) AND
+        # the cap so an operator knows to either shrink the file or
+        # raise the cap.
+        self.assertIn("size", (r.error_msg or "").lower())
+        self.assertIn(str(MAX_JSON_QUERY_FILE_BYTES), r.error_msg or "")
+
+    def test_json_query_under_cap_unchanged(self):
+        # Control: files within the cap still parse normally.
+        small = Path(self.tmp) / "small.json"
+        small.write_text(json.dumps({"ok": True}))
+        crit = AcceptanceCriterion(
+            description="small", type="smoke", method="json_query",
+            path="small.json", json_query="ok", timeout_sec=30,
+        )
+        r = self.runner._run_json_query(crit)
+        self.assertEqual(r.status, "pass")
+
+
+class _RedirectHTTPHandler(http.server.BaseHTTPRequestHandler):
+    """Configurable redirect server for HTTP boundary tests."""
+
+    # Class attributes set per-test before each server start.
+    redirect_target: str = "/ok"
+    redirect_chain_remaining: int = 0
+
+    def do_GET(self):
+        if self.path == "/ok":
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
+        if self.path == "/to-file":
+            # 301 to a file:// URL — the bypass codex flagged.
+            self.send_response(301)
+            self.send_header("Location", "file:///etc/passwd")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path == "/to-ftp":
+            self.send_response(301)
+            self.send_header("Location", "ftp://example.com/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path.startswith("/chain"):
+            # /chain/N → redirects to /chain/(N-1) → ... → /ok.
+            try:
+                n = int(self.path.rsplit("/", 1)[1])
+            except ValueError:
+                n = 0
+            if n <= 0:
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+                return
+            self.send_response(301)
+            self.send_header("Location", f"/chain/{n - 1}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *_a, **_kw):
+        pass
+
+
+class TestHttpRedirectBoundary(unittest.TestCase):
+    """[P2] codex fix: redirect targets must re-validate scheme; redirect
+    count + wall-clock deadline must bound total time."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = http.server.HTTPServer(
+            ("127.0.0.1", 0), _RedirectHTTPHandler,
+        )
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(
+            target=cls.server.serve_forever, daemon=True,
+        )
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp))
+        self.runner = _make_runner(self.tmp)
+
+    def test_redirect_to_file_scheme_rejected(self):
+        # A 301 → file:///etc/passwd would, without the fix, become
+        # a successful local file read returning ``pass``. With the
+        # custom redirect handler, the cross-scheme redirect is refused
+        # and the verdict becomes ``fail`` (either via URLError on the
+        # stdlib re-raise, or via HTTPError(301) when the chain dies).
+        # The critical assertion is "NOT pass" — we never let the
+        # file:// hop succeed.
+        crit = AcceptanceCriterion(
+            description="redirect-to-file", type="integration",
+            method="http",
+            url=f"http://127.0.0.1:{self.port}/to-file",
+            timeout_sec=5,
+        )
+        r = self.runner._run_http(crit)
+        self.assertNotEqual(
+            r.status, "pass",
+            msg="cross-scheme redirect to file:// MUST NOT succeed",
+        )
+        self.assertEqual(r.status, "fail")
+        # If exit_code is set, it must be the 301 from the original
+        # redirect response, NOT 200 (which would mean the file:// hop
+        # succeeded). 2xx here is the bypass we're blocking.
+        if r.exit_code is not None:
+            self.assertNotIn(r.exit_code, range(200, 300))
+
+    def test_redirect_to_ftp_scheme_rejected(self):
+        crit = AcceptanceCriterion(
+            description="redirect-to-ftp", type="integration",
+            method="http",
+            url=f"http://127.0.0.1:{self.port}/to-ftp",
+            timeout_sec=5,
+        )
+        r = self.runner._run_http(crit)
+        self.assertNotEqual(r.status, "pass")
+        self.assertEqual(r.status, "fail")
+        if r.exit_code is not None:
+            self.assertNotIn(r.exit_code, range(200, 300))
+
+    def test_redirect_chain_capped(self):
+        # MAX_HTTP_REDIRECTS=1; a chain of 5 must NOT pass even though
+        # the final hop is /ok. Stdlib raises HTTPError on too-many-
+        # redirects, which our executor maps to ``fail``. Either way
+        # the verdict must NOT be ``pass``.
+        crit = AcceptanceCriterion(
+            description="long-chain", type="integration", method="http",
+            url=f"http://127.0.0.1:{self.port}/chain/5",
+            timeout_sec=5,
+        )
+        r = self.runner._run_http(crit)
+        self.assertNotEqual(
+            r.status, "pass",
+            msg=(
+                "5-hop chain should exceed MAX_HTTP_REDIRECTS="
+                f"{MAX_HTTP_REDIRECTS}; got pass which means cap is broken"
+            ),
+        )
+
+    def test_single_redirect_under_cap_succeeds(self):
+        # MAX_HTTP_REDIRECTS=1: a single hop /chain/1 → /ok must pass.
+        # Verifies the cap doesn't over-fire on legitimate 1-redirect
+        # APIs.
+        crit = AcceptanceCriterion(
+            description="single-hop", type="integration", method="http",
+            url=f"http://127.0.0.1:{self.port}/chain/1",
+            timeout_sec=5,
+        )
+        r = self.runner._run_http(crit)
+        self.assertEqual(r.status, "pass", msg=r.error_msg)
+        self.assertEqual(r.exit_code, 200)
 
 
 if __name__ == "__main__":

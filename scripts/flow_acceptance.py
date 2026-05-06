@@ -35,6 +35,39 @@ DESIGN REFS (v0.8.1 design §6)
   smoke; T7 pins the runner-side half (timeout → status + escalate flag).
 
 ================================================================
+SAFETY-BOUNDARY HARDENING (codex R1 fixes — T7 IS the boundary)
+================================================================
+- **Process-group kill on timeout** (cmd executor): we use
+  ``subprocess.Popen(..., start_new_session=True)`` to put the child shell
+  in its own process group, then on ``TimeoutExpired`` send ``SIGTERM``
+  to the whole group via ``os.killpg`` (with a 2s drain wait), then
+  ``SIGKILL`` if anything is still alive. With plain ``subprocess.run``
+  + ``shell=True`` the timeout would only kill the shell, leaving any
+  ``&``-backgrounded child / forked test runner alive. Fixed: a
+  ``timed_out`` verdict now actually means "the criterion's process
+  tree is dead", which is what the safety boundary promises.
+- **Path containment** (file_exists + json_query): criterion ``path``
+  is normalized via ``(worktree_root / path).resolve()`` and rejected
+  with ``inconclusive`` if it lands outside the worktree. Blocks
+  ``/etc/passwd`` (absolute) and ``../../etc/passwd`` (traversal).
+  Reuse via ``_resolve_within_worktree`` helper.
+- **JSON read size cap** (json_query): files larger than
+  ``MAX_JSON_QUERY_FILE_BYTES`` (10 MB) are rejected with
+  ``inconclusive`` before ``read_text()`` materializes them. Stops
+  pathological-fixture memory exhaustion / timeout starvation.
+- **HTTP redirect scheme re-validation** (http executor): a custom
+  ``_SchemeValidatingRedirectHandler`` intercepts every redirect target
+  and refuses anything outside http(s). Stdlib's default handler
+  follows ``ftp://`` redirects, so the initial-URL scheme check was
+  bypassable via a 301-to-file-URL.
+- **HTTP wall-clock deadline** (http executor): redirects are capped
+  at 1 (most legitimate APIs don't redirect-chain), AND each redirect
+  callback checks ``time.monotonic()`` against a deadline computed at
+  request start. ``urlopen(timeout=N)`` is per-socket-op only; without
+  the wall-clock check a slow-redirect-chain attack stretches well
+  past the criterion's ``timeout_sec``.
+
+================================================================
 4-BLINDSPOT NOTES (high-risk module — every category triggers)
 ================================================================
 - **A (Python falsy / .get bypass)**: criterion fields are dataclass attributes
@@ -95,6 +128,8 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import os
+import signal
 import socket
 import subprocess
 import sys
@@ -105,7 +140,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 # T1 / T4 modules live alongside this one — flow scripts import each other
 # via a sys.path mutation that resolves to <repo>/scripts. Mirrors the
@@ -131,6 +166,78 @@ DEFAULT_TIMEOUT_BY_METHOD = {
 }
 # Design line 277: type=e2e overrides method-based default to 30 min.
 E2E_TYPE_TIMEOUT = 1800
+
+# Hard upper bound on the JSON file we'll read for `json_query`. A larger
+# file is rejected with `inconclusive` (criterion malformed / data too
+# big to be reasonable). 10 MiB easily covers config / fixture sizes; the
+# point is to cap before we materialize the whole file in memory.
+MAX_JSON_QUERY_FILE_BYTES = 10 * 1024 * 1024
+
+# Cap on HTTP redirects we'll follow. Most legitimate APIs don't
+# redirect-chain; capping at 1 (initial → one redirect target) keeps the
+# overall-deadline window tight without breaking common 301→302 cases.
+MAX_HTTP_REDIRECTS = 1
+
+# Time after SIGTERM we wait for a process group to drain before SIGKILL.
+# Short by design — the criterion's `timeout_sec` already elapsed; we
+# just want graceful termination if the tree responds promptly.
+PROCESS_GROUP_KILL_GRACE_SEC = 2
+
+
+class _SchemeValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-validate scheme + wall-clock deadline on every redirect target.
+
+    The default ``urllib.request.HTTPRedirectHandler`` happily follows
+    ``ftp://`` (and other) schemes when a redirect target switches
+    protocol. Our http executor's contract is "GET an http(s) URL"; a
+    301 to ``file:///etc/passwd`` would otherwise turn into local file
+    read with the success/failure flowing back as if it were the
+    intended verdict. We refuse anything outside http(s) here — the
+    URLError raised is caught by ``_run_http`` and produces ``fail``.
+
+    Wall-clock: ``urlopen(timeout=N)`` is per-socket-op only. By
+    checking ``time.monotonic() > deadline`` in this callback (called
+    BEFORE issuing the next request), a slow-redirect-chain attack
+    aborts at the criterion's ``timeout_sec`` rather than stretching
+    to ``N * (hops + 1)``.
+    """
+
+    # The opener stashes deadline+max_redirects on the handler instance
+    # via ``_set_request_state`` before each call to .open().
+    _deadline_monotonic: Optional[float] = None
+    _max_redirects: int = MAX_HTTP_REDIRECTS
+
+    def _set_request_state(
+        self, deadline: float, max_redirects: int,
+    ) -> None:
+        self._deadline_monotonic = deadline
+        self._max_redirects = max_redirects
+        # Stdlib counts redirects via the per-Request `redirect_dict`
+        # attribute, but it caps at `max_repeats`/`max_redirections`
+        # class attrs. Override the class attrs so our cap takes effect.
+        self.max_repeats = max_redirects
+        self.max_redirections = max_redirects
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Wall-clock check FIRST so a slow-redirect chain bails before
+        # the next socket open.
+        if (
+            self._deadline_monotonic is not None
+            and time.monotonic() > self._deadline_monotonic
+        ):
+            raise urllib.error.URLError(
+                "http executor wall-clock deadline exceeded "
+                "during redirect chain"
+            )
+        parsed = urllib.parse.urlsplit(newurl)
+        if parsed.scheme not in ("http", "https"):
+            raise urllib.error.URLError(
+                f"http executor refusing redirect to non-http(s) "
+                f"scheme: {newurl!r}"
+            )
+        return super().redirect_request(
+            req, fp, code, msg, headers, newurl,
+        )
 
 
 @dataclass
@@ -258,30 +365,86 @@ class AcceptanceRunner:
             return "true"
         return "unknown"
 
+    def _resolve_within_worktree(
+        self, rel_path: str, field_name: str,
+    ) -> Tuple[Optional[Path], Optional[str]]:
+        """Normalize a criterion-supplied path to a worktree-rooted absolute
+        path, or refuse it as malformed.
+
+        Returns ``(path, None)`` on success; ``(None, error_msg)`` if the
+        path resolves outside the worktree (absolute path or ``..`` traversal).
+
+        SAFETY-BOUNDARY: file_exists + json_query both resolve criterion
+        paths against ``self.worktree_root``. Stdlib's ``Path /`` operator
+        treats absolute right-hand operands as a REPLACEMENT (so
+        ``worktree / "/etc/passwd"`` becomes ``/etc/passwd``); ``..``
+        traversal segments aren't blocked by ``Path``. Both routes let a
+        malformed contract poke at arbitrary FS paths. We resolve the
+        candidate to an absolute path, then verify it's a descendant of
+        the resolved worktree root via ``Path.relative_to``. Anything
+        else is treated as ``inconclusive`` (the contract author needs to
+        fix the path) — NOT ``fail`` (which would be a verdict on a
+        legitimate criterion).
+        """
+        candidate = (self.worktree_root / rel_path).resolve()
+        try:
+            root = self.worktree_root.resolve()
+        except OSError as e:
+            return None, (
+                f"{field_name}={rel_path!r} could not resolve worktree "
+                f"root: {e}"
+            )
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            return None, (
+                f"{field_name}={rel_path!r} resolves to {candidate} which "
+                f"is outside worktree {root}; refuse as malformed contract."
+            )
+        return candidate, None
+
     # ------------------------------------------------------------------
     # Method executors
     # ------------------------------------------------------------------
 
     def _run_cmd(self, criterion: AcceptanceCriterion) -> RunResult:
-        """``subprocess.run`` with timeout, stdout/stderr captured to log files.
+        """``Popen`` with process-group kill on timeout, stdout/stderr to logs.
 
         Validation (C-ordering): missing/empty ``command`` → inconclusive
         BEFORE we open any file or spawn anything. Then capture command_hash
         BEFORE the subprocess runs (so even on TimeoutExpired we can still
         report the hash for audit).
 
+        SAFETY-BOUNDARY (codex R1 [P1]): ``shell=True`` means the child IS
+        the shell, not the user's command. With ``subprocess.run(timeout=N)``
+        the timeout only kills that shell — descendants (``&``-backgrounded
+        subshells, forked test runners, server processes) keep running. The
+        criterion would report ``timed_out`` while real side effects
+        continue, defeating the per-criterion timeout safety boundary.
+
+        Fix: ``Popen(..., start_new_session=True)`` puts the child in its
+        own process group (PGID == child PID). On ``TimeoutExpired`` we
+        ``os.killpg(SIGTERM)`` the WHOLE group, drain stdout/stderr for
+        ``PROCESS_GROUP_KILL_GRACE_SEC`` seconds, then escalate to
+        ``SIGKILL`` if anything is still alive. This makes ``timed_out``
+        actually mean "the criterion's process tree is dead" — what the
+        boundary promises.
+
+        Note: ``start_new_session=True`` (== ``setsid``) is POSIX. On
+        Windows you'd want ``CREATE_NEW_PROCESS_GROUP`` + ``CTRL_BREAK``.
+        Flow framework targets POSIX (Linux/macOS); Windows path can
+        layer on later if needed.
+
         D2-distinctions:
-          - ``TimeoutExpired`` (subprocess killed by timeout) → ``timed_out``.
-            ``exit_code=None`` (the process was killed; no clean rc).
-          - ``OSError`` (rare with ``shell=True``: resource exhaustion,
-            file-system errors opening the log files) → ``inconclusive``
-            with ``exit_code=None``.
+          - ``TimeoutExpired`` (process group killed) → ``timed_out``,
+            ``exit_code=None`` (the tree was killed; no clean rc).
+          - ``OSError`` / ``FileNotFoundError`` (Popen itself failed:
+            resource exhaustion, log file open failure) → ``inconclusive``.
         D3-distinctions:
           - rc==0 → ``pass``; rc!=0 → ``fail``. With ``shell=True``, rc=127
             means "command not found" — the shell's verdict; we treat it as
             a deterministic ``fail`` (the criterion's command is the thing
             being asserted; if it can't run, the assertion is unsatisfied).
-            Same posture as HTTP-refused → fail.
         """
         if not criterion.command:
             # A-aware: ``not criterion.command`` covers None AND ""; both are
@@ -302,39 +465,9 @@ class AcceptanceRunner:
         stderr_path = self.log_dir / f"{self.task_id}_{suffix}.stderr"
         t0 = time.monotonic()
         try:
-            with stdout_path.open("w") as out, stderr_path.open("w") as err:
-                proc = subprocess.run(
-                    criterion.command,
-                    shell=True,
-                    cwd=str(self.worktree_root),
-                    timeout=timeout,
-                    stdout=out,
-                    stderr=err,
-                )
-            duration_ms = int((time.monotonic() - t0) * 1000)
-            return RunResult(
-                status="pass" if proc.returncode == 0 else "fail",
-                exit_code=proc.returncode,
-                duration_ms=duration_ms,
-                stdout_log_path=str(stdout_path),
-                stderr_log_path=str(stderr_path),
-                command_hash=command_hash,
-            )
-        except subprocess.TimeoutExpired:
-            duration_ms = int((time.monotonic() - t0) * 1000)
-            return RunResult(
-                status="timed_out",
-                exit_code=None,
-                duration_ms=duration_ms,
-                stdout_log_path=str(stdout_path),
-                stderr_log_path=str(stderr_path),
-                command_hash=command_hash,
-                error_msg=f"cmd exceeded timeout_sec={timeout}",
-            )
+            out_fh = stdout_path.open("w")
+            err_fh = stderr_path.open("w")
         except OSError as e:
-            # D2: tool failed to even spawn (resource exhaustion, fs error
-            # opening the log file). NOT a verdict on the criterion — mark
-            # inconclusive so T8 routes differently from a real fail.
             duration_ms = int((time.monotonic() - t0) * 1000)
             return RunResult(
                 status="inconclusive",
@@ -345,8 +478,101 @@ class AcceptanceRunner:
                 stderr_log_path=str(stderr_path) if stderr_path.exists()
                 else None,
                 command_hash=command_hash,
-                error_msg=f"cmd OS error before/during spawn: {e}",
+                error_msg=f"cmd OS error opening log files: {e}",
             )
+        try:
+            try:
+                proc = subprocess.Popen(
+                    criterion.command,
+                    shell=True,
+                    cwd=str(self.worktree_root),
+                    stdout=out_fh,
+                    stderr=err_fh,
+                    # POSIX: new session => new process group. Lets us
+                    # killpg the entire descendant tree on timeout.
+                    start_new_session=True,
+                )
+            except OSError as e:
+                # D2: spawn-time failure (resource exhaustion, fork failure).
+                # Mark inconclusive — no verdict on the criterion.
+                duration_ms = int((time.monotonic() - t0) * 1000)
+                return RunResult(
+                    status="inconclusive",
+                    exit_code=None,
+                    duration_ms=duration_ms,
+                    stdout_log_path=str(stdout_path),
+                    stderr_log_path=str(stderr_path),
+                    command_hash=command_hash,
+                    error_msg=f"cmd OS error before/during spawn: {e}",
+                )
+            try:
+                returncode = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # SAFETY-BOUNDARY: kill the WHOLE process group, not just
+                # the shell. Two-stage kill: SIGTERM + drain + SIGKILL.
+                self._kill_process_group(proc)
+                duration_ms = int((time.monotonic() - t0) * 1000)
+                return RunResult(
+                    status="timed_out",
+                    exit_code=None,
+                    duration_ms=duration_ms,
+                    stdout_log_path=str(stdout_path),
+                    stderr_log_path=str(stderr_path),
+                    command_hash=command_hash,
+                    error_msg=f"cmd exceeded timeout_sec={timeout}",
+                )
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            return RunResult(
+                status="pass" if returncode == 0 else "fail",
+                exit_code=returncode,
+                duration_ms=duration_ms,
+                stdout_log_path=str(stdout_path),
+                stderr_log_path=str(stderr_path),
+                command_hash=command_hash,
+            )
+        finally:
+            # Always close the log file handles. Popen kept its own fds via
+            # dup2 on spawn, so closing here doesn't truncate the child's
+            # output; it just releases the parent-side handle.
+            for fh in (out_fh, err_fh):
+                try:
+                    fh.close()
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _kill_process_group(proc: "subprocess.Popen[bytes]") -> None:
+        """Send SIGTERM to the child's process group; SIGKILL if it lingers.
+
+        ``proc.pid`` IS the process group leader (because we spawned with
+        ``start_new_session=True``). ``os.killpg`` delivers the signal to
+        every process in that group — the shell, every direct child, every
+        ``&``-backgrounded grandchild that hasn't called setsid itself.
+
+        ``ProcessLookupError`` is benign — the process was already dead
+        (race between TimeoutExpired and natural exit). After SIGTERM we
+        wait briefly for graceful shutdown; processes that ignore SIGTERM
+        get SIGKILL. ``proc.wait()`` at the end reaps the zombie.
+        """
+        pgid = proc.pid
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return  # already dead — wait below is a no-op
+        except OSError:
+            # Permission / EINVAL — extremely unusual; fall through to wait.
+            pass
+        try:
+            proc.wait(timeout=PROCESS_GROUP_KILL_GRACE_SEC)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                proc.wait()
+            except OSError:
+                pass
 
     def _run_file_exists(self, criterion: AcceptanceCriterion) -> RunResult:
         """File-presence check rooted at ``self.worktree_root``.
@@ -366,7 +592,14 @@ class AcceptanceRunner:
                 status="inconclusive",
                 error_msg="file_exists method requires non-empty `path` field",
             )
-        target = self.worktree_root / criterion.path
+        # SAFETY-BOUNDARY (codex R1 [P2]): block absolute paths and ``..``
+        # traversal. Stdlib's ``Path /`` operator treats absolute RHS as a
+        # replacement, so ``self.worktree_root / "/etc/passwd"`` => /etc/passwd.
+        target, err = self._resolve_within_worktree(
+            criterion.path, "file_exists path",
+        )
+        if target is None:
+            return RunResult(status="inconclusive", error_msg=err)
         t0 = time.monotonic()
         try:
             exists = target.is_file()
@@ -406,13 +639,39 @@ class AcceptanceRunner:
                 error_msg=("json_query method requires non-empty `path` "
                            "+ `json_query` fields"),
             )
-        target = self.worktree_root / criterion.path
+        # SAFETY-BOUNDARY (codex R1 [P2]): same path-containment fix as
+        # file_exists — refuse anything that escapes the worktree.
+        target, err = self._resolve_within_worktree(
+            criterion.path, "json_query path",
+        )
+        if target is None:
+            return RunResult(status="inconclusive", error_msg=err)
         # Existence check BEFORE read so a missing file is inconclusive,
         # not an OSError surprise. C-ordering: validate, then act.
         if not target.is_file():
             return RunResult(
                 status="inconclusive",
                 error_msg=f"json file not found: {target}",
+            )
+        # SAFETY-BOUNDARY (codex R1 [P2]): cap file size BEFORE materializing
+        # via read_text(). A pathological multi-GB JSON would exhaust memory
+        # / blow the per-criterion timeout. 10 MiB easily covers config /
+        # fixture cases; anything larger is malformed contract.
+        try:
+            stat_size = target.stat().st_size
+        except OSError as e:
+            return RunResult(
+                status="inconclusive",
+                error_msg=f"json stat OS error: {e}",
+            )
+        if stat_size > MAX_JSON_QUERY_FILE_BYTES:
+            return RunResult(
+                status="inconclusive",
+                error_msg=(
+                    f"json_query file size {stat_size} bytes exceeds cap "
+                    f"{MAX_JSON_QUERY_FILE_BYTES} bytes (path={target}); "
+                    f"refuse to materialize."
+                ),
             )
         t0 = time.monotonic()
         try:
@@ -506,11 +765,23 @@ class AcceptanceRunner:
             f"GET {criterion.url}".encode("utf-8")
         ).hexdigest()
         t0 = time.monotonic()
+        # SAFETY-BOUNDARY (codex R1 [P2]):
+        #   (a) The default ``HTTPRedirectHandler`` follows ALL schemes,
+        #       including ``ftp://`` and (in some stdlib versions) ``file://``
+        #       — bypasses the initial-URL scheme check.
+        #   (b) ``urlopen(timeout=N)`` is per-socket-op, not total. A slow
+        #       redirect chain stretches well past ``timeout_sec``.
+        # Fix: custom redirect handler that re-validates scheme on every
+        # target AND checks a wall-clock deadline computed at request start.
+        # We also cap redirects at ``MAX_HTTP_REDIRECTS`` (=1) — most legit
+        # APIs don't redirect-chain.
+        deadline = time.monotonic() + timeout
+        redirect_handler = _SchemeValidatingRedirectHandler()
+        redirect_handler._set_request_state(deadline, MAX_HTTP_REDIRECTS)
+        opener = urllib.request.build_opener(redirect_handler)
         try:
             req = urllib.request.Request(criterion.url, method="GET")
-            # No custom opener — stdlib defaults: 301/302/303/307 followed
-            # up to 10 hops. v0.8.2 may add a follow_redirects knob.
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with opener.open(req, timeout=timeout) as resp:
                 status_code = resp.status
                 duration_ms = int((time.monotonic() - t0) * 1000)
                 # Drain a small amount of body so the connection closes
