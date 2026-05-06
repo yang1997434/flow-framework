@@ -66,6 +66,30 @@ SAFETY-BOUNDARY HARDENING (codex R1 fixes — T7 IS the boundary)
   request start. ``urlopen(timeout=N)`` is per-socket-op only; without
   the wall-clock check a slow-redirect-chain attack stretches well
   past the criterion's ``timeout_sec``.
+- **HTTP threaded wall-clock guard** (codex R3 [P1]): the post-call
+  ``time.monotonic() > deadline`` check above is too late — by then
+  the call already blocked (e.g., trickle attack: server sends 1 byte
+  every 9s under a 10s per-socket timeout, total wall-clock unbounded).
+  Fix: run the entire blocking ``opener.open(...)`` + body drain in a
+  daemon worker thread, and ``Thread.join(timeout=timeout_sec)`` from
+  the main thread. If the join times out we return ``timed_out``
+  immediately; the worker becomes a brief orphan (eventually unblocked
+  by socket timeouts / GC, dies as a daemon on interpreter exit). That
+  trade-off is acceptable because the boundary's promise is "the
+  CRITERION is bounded", not "no thread ever lingers". Body drain is
+  done INSIDE the worker so it shares the same wall-clock guard.
+- **HTTPException safety net** (codex R3 [P2]): ``urllib.urlopen`` can
+  re-raise ``http.client.HTTPException`` (RemoteDisconnected,
+  BadStatusLine, IncompleteRead, ...) without wrapping in URLError.
+  The previous except-tuple ``(URLError, socket.timeout, TimeoutError)``
+  let HTTPException escape, crashing ``run_one`` after it had already
+  emitted ``started`` (orphan event, no completed). Fix: include
+  ``http.client.HTTPException`` and broader ``OSError`` in the worker's
+  except-tuple. Plus a final catch-all ``except Exception``
+  (NOT ``BaseException`` — KeyboardInterrupt / SystemExit must
+  propagate) that maps anything truly unexpected to ``inconclusive``.
+  This means ``run_one`` always gets a RunResult and emits a paired
+  ``completed`` event — defense-in-depth against future urllib changes.
 
 ================================================================
 4-BLINDSPOT NOTES (high-risk module — every category triggers)
@@ -127,12 +151,15 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import http.client
 import json
 import os
+import queue as queue_mod
 import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -851,112 +878,195 @@ class AcceptanceRunner:
         redirect_handler = _SchemeValidatingRedirectHandler()
         redirect_handler._set_request_state(deadline, MAX_HTTP_REDIRECTS)
         opener = urllib.request.build_opener(redirect_handler)
-        try:
-            req = urllib.request.Request(criterion.url, method="GET")
-            with opener.open(req, timeout=timeout) as resp:
-                # SAFETY-BOUNDARY (codex R2 [P2]): the per-socket-op
-                # ``timeout`` does not bound TOTAL wall-clock time. A
-                # server that trickles headers (each socket op below
-                # ``timeout``) for >timeout_sec passes through the
-                # urlopen call but violates the criterion's stated
-                # timeout. Check the deadline immediately on return.
-                if time.monotonic() > deadline:
-                    duration_ms = int((time.monotonic() - t0) * 1000)
-                    return RunResult(
-                        status="timed_out",
-                        duration_ms=duration_ms,
-                        command_hash=command_hash,
-                        error_msg=(
-                            f"http exceeded timeout_sec={timeout} "
-                            f"(wall-clock during initial request)"
-                        ),
-                    )
-                status_code = resp.status
-                # Drain a small amount of body so the connection closes
-                # cleanly; we don't store body, just ensure the server
-                # finished sending. Bounded read so a giant body doesn't
-                # blow memory.
-                #
-                # STATUS-ALREADY-DETERMINED — body drain only.
-                # The HTTP status is already captured above; this drain
-                # is best-effort cleanup, NOT a verdict input. An OSError
-                # here (mid-stream disconnect, connection reset post-
-                # headers) cannot change pass/fail. This is the ONE
-                # justified silent OSError swallow in this module —
-                # every other OSError flows through URLError / HTTPError
-                # branches into a real verdict. Future readers: do not
-                # remove this try/except without considering that some
-                # servers close the socket aggressively after sending
-                # the status line on small responses.
-                try:
-                    resp.read(64)
-                except OSError:
-                    pass
-                # Final deadline check after body drain. A trickled body
-                # could push us past the deadline even if the headers
-                # arrived in time.
-                duration_ms = int((time.monotonic() - t0) * 1000)
-                if time.monotonic() > deadline:
-                    return RunResult(
-                        status="timed_out",
-                        duration_ms=duration_ms,
-                        command_hash=command_hash,
-                        error_msg=(
-                            f"http exceeded timeout_sec={timeout} "
-                            f"(wall-clock during body drain)"
-                        ),
-                    )
-                return RunResult(
-                    status="pass" if 200 <= status_code < 300 else "fail",
-                    exit_code=status_code,
-                    duration_ms=duration_ms,
-                    command_hash=command_hash,
+        req = urllib.request.Request(criterion.url, method="GET")
+
+        # SAFETY-BOUNDARY (codex R3 [P1]): per-socket-op timeout is NOT a
+        # wall-clock guarantee. A trickle attack (server sends 1 byte every
+        # ``timeout - 1`` seconds) keeps each individual recv under the
+        # socket timeout while total wall-clock blows up unboundedly. The
+        # post-call ``time.monotonic() > deadline`` check is too late: the
+        # call already blocked.
+        #
+        # Run the entire blocking pipeline (urlopen + body drain) in a
+        # daemon worker thread. The main thread waits via
+        # ``Thread.join(timeout=timeout_sec)``. If join times out we
+        # return ``timed_out`` immediately — the worker becomes a brief
+        # orphan (eventually unblocked by socket timeouts / GC, dies on
+        # interpreter exit because daemon=True). That orphan-thread
+        # trade-off is acceptable because the boundary's promise is
+        # "the CRITERION is wall-clock bounded", not "no thread ever
+        # lingers under server-side abuse". Body drain runs INSIDE the
+        # worker so it shares the same wall-clock guard.
+        result_q: "queue_mod.Queue[Tuple[object, ...]]" = queue_mod.Queue(
+            maxsize=1,
+        )
+
+        def _http_worker() -> None:
+            try:
+                with opener.open(req, timeout=timeout) as resp:
+                    status_code = resp.status
+                    # Body drain inside the worker so its read is also
+                    # under the same wall-clock guard. STATUS-ALREADY-
+                    # DETERMINED: the verdict is captured above; an
+                    # OSError mid-drain cannot change pass/fail. Swallow
+                    # silently — every other OSError path flows through
+                    # the except branches below into a real verdict.
+                    try:
+                        resp.read(64)
+                    except OSError:
+                        pass
+                    result_q.put(("ok", status_code))
+            except _HttpDeadlineExceeded as e:
+                # Redirect-chain wall-clock exhaustion (raised by the
+                # custom handler). Route to timed_out — matches criterion
+                # intent rather than generic URLError → fail.
+                result_q.put(("timed_out", str(e)))
+            except urllib.error.HTTPError as e:
+                # D3: server replied with non-2xx. ``e.code`` is the
+                # real status. Route to fail with code.
+                result_q.put(("http_error", e.code, str(e)))
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                socket.timeout,
+            ) as e:
+                # D2: distinguish socket timeout from connection error.
+                reason = getattr(e, "reason", None)
+                is_timeout = (
+                    isinstance(e, (TimeoutError, socket.timeout))
+                    or isinstance(reason, (TimeoutError, socket.timeout))
                 )
-        except _HttpDeadlineExceeded as e:
-            # SAFETY-BOUNDARY (codex R2 [P2]): redirect-chain wall-clock
-            # deadline exhaustion. Distinct subclass means we route to
-            # ``timed_out`` (matching the criterion's intent) rather than
-            # ``fail`` (the generic URLError bucket). This MUST be caught
-            # before the URLError branch below — _HttpDeadlineExceeded is
-            # a URLError subclass.
+                if is_timeout:
+                    result_q.put(("timed_out", str(e)))
+                else:
+                    result_q.put(("url_error", str(e)))
+            except http.client.HTTPException as e:
+                # SAFETY-BOUNDARY (codex R3 [P2]): urllib re-raises
+                # ``http.client.HTTPException`` (RemoteDisconnected,
+                # BadStatusLine, IncompleteRead, ...) WITHOUT wrapping
+                # in URLError. The previous except-tuple let these
+                # escape and crashed run_one (orphan started event).
+                # Map to fail — the server response was malformed,
+                # which from the criterion's POV IS a verdict (the
+                # endpoint isn't behaving like an http endpoint).
+                result_q.put((
+                    "url_error",
+                    f"{type(e).__name__}: {e}",
+                ))
+            except OSError as e:
+                # Defense in depth: a few stdlib versions surface plain
+                # ``OSError`` (ECONNRESET mid-headers) without a URLError
+                # wrapper. Treat as a connection-level fail, same bucket
+                # as URLError-not-timeout.
+                result_q.put(("url_error", f"OSError: {e}"))
+            except Exception as e:  # noqa: BLE001 — see comment
+                # FINAL CATCH-ALL (codex R3 [P2]): defense-in-depth. If
+                # a future urllib version raises something not in the
+                # tuple above, ``run_one`` MUST still get a RunResult
+                # so it emits the paired ``completed`` event after its
+                # ``started`` event. Mark inconclusive (not fail) —
+                # this is an executor-bug bucket, not a verdict on the
+                # criterion. NOTE: we catch ``Exception``, not
+                # ``BaseException`` — KeyboardInterrupt and SystemExit
+                # must propagate so an operator's Ctrl-C still works.
+                result_q.put((
+                    "inconclusive",
+                    f"unexpected http executor error "
+                    f"{type(e).__name__}: {e}",
+                ))
+
+        worker = threading.Thread(
+            target=_http_worker, daemon=True, name="acceptance-http-worker",
+        )
+        worker.start()
+        worker.join(timeout=timeout)
+        if worker.is_alive():
+            # Worker still blocked past wall-clock deadline. Mark
+            # timed_out and return immediately. The thread will
+            # eventually unblock on its own per-socket timeouts and
+            # exit; as a daemon it cannot prevent interpreter exit.
+            #
+            # Trade-off: we don't try to forcibly close the underlying
+            # socket from the main thread (Python provides no clean way
+            # to reach into urllib's connection pool). Under extreme
+            # abuse this leaves a brief orphan thread. The criterion
+            # result is correctly bounded — that's the boundary's
+            # contract. Worst case is many concurrent timed-out HTTP
+            # criteria stacking up daemon threads, but the per-socket
+            # ``timeout`` (= timeout_sec) ensures each one dies within
+            # 2× timeout_sec at most.
             duration_ms = int((time.monotonic() - t0) * 1000)
             return RunResult(
                 status="timed_out",
                 duration_ms=duration_ms,
                 command_hash=command_hash,
-                error_msg=f"http exceeded timeout_sec={timeout}: {e}",
+                error_msg=(
+                    f"http exceeded timeout_sec={timeout} "
+                    f"(wall-clock; worker thread orphaned)"
+                ),
             )
-        except urllib.error.HTTPError as e:
-            # D3: server replied with non-2xx. ``e.code`` is the real status.
+        # Worker finished. Pull its result tuple. If the queue is empty
+        # at this point (worker died without putting), that's an
+        # executor invariant violation — synthesize an inconclusive so
+        # run_one still emits a paired completed event.
+        try:
+            result = result_q.get_nowait()
+        except queue_mod.Empty:
             duration_ms = int((time.monotonic() - t0) * 1000)
             return RunResult(
-                status="fail",
-                exit_code=e.code,
+                status="inconclusive",
                 duration_ms=duration_ms,
                 command_hash=command_hash,
-                error_msg=f"http {e.code}",
+                error_msg=(
+                    "http worker thread exited without producing a "
+                    "result — executor invariant violation"
+                ),
             )
-        except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
-            duration_ms = int((time.monotonic() - t0) * 1000)
-            # D2: distinguish socket timeout from connection error.
-            reason = getattr(e, "reason", None)
-            is_timeout = (
-                isinstance(e, (TimeoutError, socket.timeout))
-                or isinstance(reason, (TimeoutError, socket.timeout))
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        kind = result[0]
+        if kind == "ok":
+            status_code = result[1]
+            assert isinstance(status_code, int)
+            return RunResult(
+                status="pass" if 200 <= status_code < 300 else "fail",
+                exit_code=status_code,
+                duration_ms=duration_ms,
+                command_hash=command_hash,
             )
-            if is_timeout:
-                return RunResult(
-                    status="timed_out",
-                    duration_ms=duration_ms,
-                    command_hash=command_hash,
-                    error_msg=f"http exceeded timeout_sec={timeout}",
-                )
+        if kind == "timed_out":
+            return RunResult(
+                status="timed_out",
+                duration_ms=duration_ms,
+                command_hash=command_hash,
+                error_msg=f"http exceeded timeout_sec={timeout}: {result[1]}",
+            )
+        if kind == "http_error":
+            code = result[1]
+            assert isinstance(code, int)
+            return RunResult(
+                status="fail",
+                exit_code=code,
+                duration_ms=duration_ms,
+                command_hash=command_hash,
+                error_msg=f"http {code}",
+            )
+        if kind == "url_error":
             return RunResult(
                 status="fail",
                 duration_ms=duration_ms,
                 command_hash=command_hash,
-                error_msg=f"http error: {e}",
+                error_msg=f"http error: {result[1]}",
             )
+        # kind == "inconclusive" (executor-bug bucket from final
+        # catch-all) — unknown kind here would also be a bug; route
+        # via the same bucket to keep run_one emitting its paired
+        # completed event.
+        return RunResult(
+            status="inconclusive",
+            duration_ms=duration_ms,
+            command_hash=command_hash,
+            error_msg=f"http executor: {result[1] if len(result) > 1 else kind}",
+        )
 
     # ------------------------------------------------------------------
     # Orchestration shell — emits started + completed/timeout events

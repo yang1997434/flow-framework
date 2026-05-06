@@ -1416,5 +1416,272 @@ class TestPathResolveSymlinkLoop(unittest.TestCase):
         self.assertEqual(r.status, "inconclusive")
 
 
+class _TrickleServer:
+    """[P1 codex R3] Raw-socket server that sends bytes one-at-a-time
+    with a configurable inter-byte gap.
+
+    Trickle attack: each individual recv stays under the per-socket-op
+    timeout, but total wall-clock blows past the criterion's timeout
+    arbitrarily. We need a real TCP server (not BaseHTTPRequestHandler,
+    which writes responses in one shot) to exercise the wall-clock
+    boundary. The threaded ``_run_http`` must return ``timed_out``
+    within roughly ``timeout_sec`` regardless of how slowly the server
+    drips bytes.
+    """
+
+    def __init__(self, *, inter_byte_sec: float, total_bytes: int):
+        self.inter_byte_sec = inter_byte_sec
+        self.total_bytes = total_bytes
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self._stop = threading.Event()
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self._stop.set()
+        try:
+            # Unblock accept() by connecting from inside.
+            with socket.socket() as poke:
+                poke.settimeout(0.5)
+                try:
+                    poke.connect(("127.0.0.1", self.port))
+                except OSError:
+                    pass
+        finally:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+
+    def _serve(self):
+        # The real "200 OK" response we'd send if not interrupted. Each
+        # byte emitted with ``inter_byte_sec`` between them.
+        body = b"ok"
+        response = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"\r\n"
+        ) + body
+        # Cap total bytes we'll attempt to write so a runaway test can't
+        # hang the worker forever even if the client somehow keeps
+        # reading.
+        response = response[: self.total_bytes]
+        while not self._stop.is_set():
+            try:
+                self.sock.settimeout(0.5)
+                conn, _ = self.sock.accept()
+            except (socket.timeout, OSError):
+                if self._stop.is_set():
+                    return
+                continue
+            with conn:
+                # Read request (best-effort) then trickle response.
+                conn.settimeout(2.0)
+                try:
+                    conn.recv(4096)
+                except OSError:
+                    pass
+                for byte in response:
+                    if self._stop.is_set():
+                        break
+                    try:
+                        conn.sendall(bytes([byte]))
+                    except OSError:
+                        break
+                    time.sleep(self.inter_byte_sec)
+
+
+class TestHttpTrickleWallClock(unittest.TestCase):
+    """[P1 codex R3] A trickle-attack server (1 byte every 0.5s) must
+    NOT block past the criterion timeout. The threaded wall-clock guard
+    in ``_run_http`` is what makes this true; without it,
+    ``urlopen(timeout=N)`` only bounds individual socket ops, not total.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp))
+        self.runner = _make_runner(self.tmp)
+        # Drip 1 byte every 0.5s; full ~30-byte response would take 15s.
+        self.server = _TrickleServer(inter_byte_sec=0.5, total_bytes=200)
+        self.server.start()
+        self.addCleanup(self.server.stop)
+
+    def test_trickle_response_bounded_by_wall_clock(self):
+        # criterion timeout 1s; trickle would take ~15s. Must return
+        # timed_out within ~2s wall-clock (1s deadline + small slack
+        # for thread join overhead and result-tuple plumbing).
+        crit = AcceptanceCriterion(
+            description="trickle", type="integration", method="http",
+            url=f"http://127.0.0.1:{self.server.port}/", timeout_sec=1,
+        )
+        t0 = time.monotonic()
+        r = self.runner._run_http(crit)
+        elapsed = time.monotonic() - t0
+        self.assertEqual(
+            r.status, "timed_out",
+            msg=(
+                f"trickle attack must hit wall-clock deadline, "
+                f"got {r.status} after {elapsed:.2f}s: {r.error_msg}"
+            ),
+        )
+        # Hard upper bound: trickle would naturally take ~15s. We
+        # require the executor to bail in well under that. 3.5s gives
+        # plenty of slack for slow CI without masking a regression
+        # back to per-socket-op-only bounding (which would block ~15s).
+        self.assertLess(
+            elapsed, 3.5,
+            msg=(
+                f"trickle test ran for {elapsed:.2f}s — wall-clock guard "
+                f"NOT bounding total time; per-socket-op timeout is "
+                f"insufficient against trickle attacks"
+            ),
+        )
+
+
+class _CloseOnAcceptHandler:
+    """Server-side socket that accepts a connection and immediately
+    closes it. urllib's HTTP parser sees zero bytes back, raising
+    ``http.client.RemoteDisconnected`` (an HTTPException subclass NOT
+    wrapped in URLError).
+    """
+
+    def __init__(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self._stop = threading.Event()
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self._stop.set()
+        try:
+            with socket.socket() as poke:
+                poke.settimeout(0.5)
+                try:
+                    poke.connect(("127.0.0.1", self.port))
+                except OSError:
+                    pass
+        finally:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+
+    def _serve(self):
+        while not self._stop.is_set():
+            try:
+                self.sock.settimeout(0.5)
+                conn, _ = self.sock.accept()
+            except (socket.timeout, OSError):
+                if self._stop.is_set():
+                    return
+                continue
+            # Don't read, don't respond — just close. urllib's HTTP
+            # parser observes EOF before status line → raises
+            # http.client.RemoteDisconnected (HTTPException subclass).
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+class TestHttpExceptionSafetyNet(unittest.TestCase):
+    """[P2 codex R3] urllib re-raises ``http.client.HTTPException``
+    subclasses (RemoteDisconnected, BadStatusLine, IncompleteRead, ...)
+    WITHOUT wrapping in URLError. The previous except-tuple let these
+    escape, crashing ``run_one`` AFTER it had already emitted a
+    ``started`` event (orphan event, no completed). The fix broadens
+    the worker's except-tuple to include HTTPException + OSError, with
+    a final catch-all ``except Exception`` for forward-compat against
+    future urllib changes.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp))
+        self.runner = _make_runner(self.tmp)
+        self.server = _CloseOnAcceptHandler()
+        self.server.start()
+        self.addCleanup(self.server.stop)
+
+    def test_mid_headers_close_returns_fail_not_crash(self):
+        # Server closes connection before sending status line. urllib's
+        # parser raises http.client.RemoteDisconnected (HTTPException).
+        # Must return ``fail`` (server-unreachable verdict semantic),
+        # never escape as an unhandled exception.
+        crit = AcceptanceCriterion(
+            description="mid-close", type="integration", method="http",
+            url=f"http://127.0.0.1:{self.server.port}/", timeout_sec=5,
+        )
+        # Critical: this MUST NOT raise. If the safety net isn't there,
+        # _run_http propagates HTTPException up through run_one.
+        r = self.runner._run_http(crit)
+        self.assertIn(
+            r.status, ("fail", "inconclusive"),
+            msg=(
+                f"HTTPException-on-mid-headers-close must produce a "
+                f"verdict, not crash; got {r.status}: {r.error_msg}"
+            ),
+        )
+        # Body of error_msg should reference what happened so an
+        # operator can debug.
+        self.assertIsNotNone(r.error_msg)
+
+    def test_run_one_emits_completed_when_http_raises_httpexception(self):
+        # Defense-in-depth: run_one writes ``started`` BEFORE dispatch.
+        # If _run_http crashes, run_one would skip ``completed``,
+        # producing an orphan ``started`` event in
+        # acceptance-progress.jsonl. The safety net guarantees a paired
+        # completed event. Verify by reading the progress log.
+        crit = AcceptanceCriterion(
+            description="mid-close orchestrated", type="integration",
+            method="http",
+            url=f"http://127.0.0.1:{self.server.port}/", timeout_sec=5,
+        )
+        task_dir = Path(self.tmp) / "task_dir"
+        task_dir.mkdir(parents=True)
+        # MUST NOT raise.
+        result = self.runner.run_one(
+            crit,
+            criterion_idx=0,
+            attempt_id="a-mid-close",
+            retry_idx=0,
+            task_dir=task_dir,
+        )
+        self.assertIn(result.status, ("fail", "inconclusive"))
+        # Progress log lives at task_dir/acceptance-progress.jsonl.
+        progress_log = task_dir / "acceptance-progress.jsonl"
+        self.assertTrue(progress_log.exists(), msg="progress log missing")
+        events = [
+            json.loads(line)
+            for line in progress_log.read_text().splitlines()
+            if line.strip()
+        ]
+        kinds = [e.get("event") for e in events]
+        self.assertIn(
+            "started", kinds,
+            msg=f"expected started event, kinds={kinds}",
+        )
+        self.assertTrue(
+            "completed" in kinds or "timeout" in kinds,
+            msg=(
+                f"orphan started event — completed/timeout missing "
+                f"after HTTPException; kinds={kinds}"
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
