@@ -373,6 +373,65 @@ def check_capability_clis() -> None:
         )
 
 
+def _find_project_root_from_cwd(start: Path | None = None) -> Path | None:
+    """Walk up from cwd looking for a .flow/ directory. Returns None if not
+    found (caller should treat as 'no contract checks to run')."""
+    here = (start or Path.cwd()).resolve()
+    for p in [here, *here.parents]:
+        if (p / ".flow").is_dir():
+            return p
+    return None
+
+
+def check_contract_integrity() -> tuple[bool, list[str]]:
+    """For every .flow/tasks/<slug>/ in the *user's project* (cwd-walked),
+    if progress.md sets autonomy_mode, check contract.json exists, parses,
+    and schema_version is known.
+    """
+    project_root = _find_project_root_from_cwd()
+    if project_root is None:
+        return True, []  # Not in a Flow project — nothing to check.
+
+    _scripts = str(REPO_ROOT / "scripts")
+    _common = str(REPO_ROOT / "scripts" / "common")
+    if _scripts not in sys.path:
+        sys.path.insert(0, _scripts)
+    if _common not in sys.path:
+        sys.path.insert(0, _common)
+    from flow_contract import parse_contract, ContractError, CONTRACT_SCHEMA_VERSION  # noqa: E402
+    from progress_meta import read_progress_meta  # noqa: E402
+
+    issues: list[str] = []
+    tasks_dir = project_root / ".flow" / "tasks"
+    if not tasks_dir.is_dir():
+        return True, issues
+    for slug_dir in sorted(tasks_dir.iterdir()):
+        if not slug_dir.is_dir() or slug_dir.name == "archive":
+            continue
+        progress = slug_dir / "progress.md"
+        if not progress.is_file():
+            continue
+        meta = read_progress_meta(progress)
+        contract_path = slug_dir / (meta.contract_path or "contract.json")
+        if meta.autonomy_mode == "interactive" and not contract_path.is_file():
+            continue  # No contract is fine for interactive.
+        if not contract_path.is_file():
+            issues.append(f"{slug_dir.name}: autonomy_mode={meta.autonomy_mode} "
+                          f"but {contract_path.name} missing")
+            continue
+        try:
+            c = parse_contract(contract_path)
+        except ContractError as e:
+            issues.append(f"{slug_dir.name}: contract parse failed: {e}")
+            continue
+        if c.contract_schema_version > CONTRACT_SCHEMA_VERSION:
+            issues.append(
+                f"{slug_dir.name}: contract_schema_version "
+                f"{c.contract_schema_version} > flow {CONTRACT_SCHEMA_VERSION}"
+            )
+    return (not issues), issues
+
+
 def check_wave_plans() -> int:
     """v0.7: check progress.md files for writes: hygiene."""
     section("Wave-dispatch plans")
@@ -513,6 +572,17 @@ def main():
     check_capability_clis()
     wave_plan_issues = check_wave_plans()
     check_wave_caches()
+
+    contract_ok, contract_errs = check_contract_integrity()
+    section("Contract integrity")
+    if contract_ok:
+        ok("OK — all task contracts pass integrity checks")
+    else:
+        for e in contract_errs:
+            warn(e)
+        # Contract issues are non-fatal in v0.8.0 (autonomy execution disabled
+        # anyway). Mark as warning only — don't bump the overall failure code
+        # unless caller wants strict mode (v0.8.1+ may tighten).
 
     total_missing = missing_cmds + missing_plugins + missing_external
     print()
