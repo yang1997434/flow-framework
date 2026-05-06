@@ -239,5 +239,60 @@ class TestProgressMeta(unittest.TestCase):
         self.assertIsNone(m.contract_path)  # not set
 
 
+import os
+import subprocess
+
+
+class TestContractCLI(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp))
+        self.slug = "test-cli-slug"
+        self.task_dir = self.tmp / ".flow" / "tasks" / self.slug
+        self.task_dir.mkdir(parents=True)
+
+    def _run_flow(self, *args, cwd=None):
+        cwd = cwd or self.tmp
+        env = os.environ.copy()
+        return subprocess.run(
+            ["python3", str(REPO_ROOT / "scripts" / "flow.py"), *args],
+            cwd=str(cwd), capture_output=True, text=True, env=env,
+        )
+
+    def _write_contract(self, payload):
+        (self.task_dir / "contract.json").write_text(json.dumps(payload))
+
+    def test_validate_passes_on_valid_contract(self):
+        self._write_contract({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-05T00:00:00Z",
+        })
+        result = self._run_flow("contract", "--validate", self.slug)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("OK", result.stdout)
+
+    def test_validate_fails_on_missing_field(self):
+        self._write_contract({"autonomy_mode": "interactive"})
+        result = self._run_flow("contract", "--validate", self.slug)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("contract_schema_version", result.stderr + result.stdout)
+
+    def test_validate_missing_contract_file_fails_with_clear_error(self):
+        result = self._run_flow("contract", "--validate", self.slug)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not found", result.stderr + result.stdout)
+
+    def test_validate_warns_on_auto_without_acceptance(self):
+        self._write_contract({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-05T00:00:00Z",
+        })
+        result = self._run_flow("contract", "--validate", self.slug)
+        self.assertEqual(result.returncode, 0)  # warning, not error
+        self.assertIn("[warn]", result.stdout + result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,7 @@ Usage:
   flow skill-diff <sub>  -- compare new plugins against capability registry (snapshot/diff/show/clear/reset-cache)
   flow waves <subcmd>    -- preview/inspect wave decomposition
                             (--preview / --show / --invalidate <slug>)
+  flow contract <subcmd>  -- contract.json validate/init (--validate <slug> / --init <slug>)
   flow version           -- show version
 """
 from __future__ import annotations
@@ -64,6 +65,7 @@ def main():
         "selftest": "flow_selftest.py",
         "skill-diff": "flow_skill_diff.py",
         "waves": "flow_waves.py",
+        "contract": "flow_contract.py",   # NEW
     }
 
     if cmd in ("version", "--version", "-v"):

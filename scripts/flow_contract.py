@@ -9,7 +9,9 @@ refuses to autonomously dispatch (use v0.8.1+ for that).
 """
 from __future__ import annotations
 
+import argparse
 import json
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -188,3 +190,113 @@ def validate_contract(path: Path) -> tuple[bool, list[str]]:
         )
 
     return (not any(e for e in errors if not e.startswith("[warn]"))), errors
+
+
+def _resolve_slug_dir(slug: str) -> Path:
+    """Resolve .flow/tasks/<slug>/ from cwd. Walks up from current working
+    directory looking for a `.flow/` directory (mirrors common pattern
+    used by flow_wave_planner._project_root).
+    """
+    here = Path.cwd().resolve()
+    for parent in [here, *here.parents]:
+        if (parent / ".flow").is_dir():
+            return parent / ".flow" / "tasks" / slug
+    raise SystemExit(f"ERROR: .flow/ directory not found from {here}")
+
+
+def _cmd_validate(args: argparse.Namespace) -> int:
+    slug_dir = _resolve_slug_dir(args.slug)
+    contract_path = slug_dir / "contract.json"
+    ok, errors = validate_contract(contract_path)
+    warnings = [e for e in errors if e.startswith("[warn]")]
+    hard_errors = [e for e in errors if not e.startswith("[warn]")]
+    for e in hard_errors:
+        print(f"ERROR: {e}", file=sys.stderr)
+    for w in warnings:
+        print(w)
+    if ok:
+        print(f"OK: contract.json for {args.slug} is valid"
+              + (f" ({len(warnings)} warning(s))" if warnings else ""))
+        return 0
+    return 1
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    slug_dir = _resolve_slug_dir(args.slug)
+    contract_path = slug_dir / "contract.json"
+    if contract_path.exists() and not args.force:
+        print(f"ERROR: {contract_path} already exists. Use --force to overwrite.",
+              file=sys.stderr)
+        return 1
+    template = _build_template(args.slug, slug_dir)
+    contract_path.parent.mkdir(parents=True, exist_ok=True)
+    contract_path.write_text(json.dumps(template, indent=2, ensure_ascii=False) + "\n")
+    print(f"Wrote {contract_path}")
+    print("Next: edit the file or update progress.md frontmatter, then "
+          "run `flow contract --validate <slug>`.")
+    return 0
+
+
+def _build_template(slug: str, slug_dir: Path) -> dict:
+    """Build a minimal valid contract template. v0.8.0: no auto-infer yet —
+    we ship a documented skeleton; v0.8.1+ adds prd.md/research/ inference.
+    """
+    import datetime
+    return {
+        "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+        "autonomy_mode": "interactive",
+        "created_at": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "staleness_ttl_days": 7,
+        "scope": {
+            "allowed": ["<file glob>"],
+            "forbidden": [".env", "secrets/**"],
+        },
+        "known_forks": [],
+        "escalation_triggers": [],
+        "irreversible_actions": list(KNOWN_IRREVERSIBLE),
+        "budget": {
+            "max_task_count": 20,
+            "max_files_changed": 50,
+            "max_new_deps": 0,
+            "max_retry_per_task": 2,
+            "max_elapsed_min": 240,
+        },
+        "acceptance_criteria": [],
+        "notification": {"command": None},
+        "afk_timeout_min": 240,
+        "afk_on_timeout": "wait",
+    }
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = argv or sys.argv[1:]
+    if not args:
+        print("Usage: flow contract --validate <slug>  |  --init <slug> [--force]",
+              file=sys.stderr)
+        return 1
+
+    head = args[0]
+    if head == "--validate":
+        if len(args) < 2:
+            print("ERROR: flow contract --validate <slug>", file=sys.stderr)
+            return 1
+        return _cmd_validate(argparse.Namespace(slug=args[1]))
+    if head == "--init":
+        ns = argparse.Namespace(slug=None, force=False)
+        for a in args[1:]:
+            if a == "--force":
+                ns.force = True
+            elif not a.startswith("-"):
+                ns.slug = a
+        if not ns.slug:
+            print("ERROR: flow contract --init <slug>", file=sys.stderr)
+            return 1
+        return _cmd_init(ns)
+    print(f"Unknown subcommand: {head}", file=sys.stderr)
+    print("Usage: flow contract --validate <slug>  |  --init <slug> [--force]",
+          file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
