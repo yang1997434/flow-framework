@@ -318,13 +318,16 @@ def parse_contract(path: Path) -> Contract:
         # in-flight e2e as block_in_flight regardless of any value here, so
         # accepting the field would let the contract silently lie about a
         # safety property the runtime refuses to honor. Reject at parse time.
-        idem_raw = c.get("idempotent")
-        if idem_raw is not None and c["type"] == "e2e":
+        # Use key presence (`"idempotent" in c`), not `.get() is not None`,
+        # so that an explicit `idempotent: null` is also rejected — design
+        # §6 R8 forbids ANY override on e2e, value or null included.
+        if "idempotent" in c and c["type"] == "e2e":
             raise ContractError(
                 f"acceptance_criteria[{idx}] type=e2e cannot specify "
                 f"idempotent override (T9 always blocks in-flight e2e "
                 f"regardless; design §6 R8 forbids any e2e idempotent override)"
             )
+        idem_raw = c.get("idempotent")
         idempotent = (
             _validate_idempotent_object(idem_raw, idx)
             if idem_raw is not None else None

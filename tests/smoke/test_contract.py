@@ -503,6 +503,29 @@ class TestParseContract(unittest.TestCase):
         self.assertIn("e2e", msg)
         self.assertIn("idempotent", msg)
 
+    def test_e2e_with_idempotent_null_also_rejected(self):
+        """C2 follow-up (codex re-review): explicit `idempotent: null` must
+        ALSO reject — the C2 fix must use key presence, not value-truthiness,
+        otherwise null silently bypasses the same rule. Design §6 R8 forbids
+        ANY override on e2e."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "playwright login flow",
+                "type": "e2e",
+                "method": "cmd",
+                "command": "playwright test login",
+                "idempotent": None,
+            }],
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        msg = str(ctx.exception)
+        self.assertIn("e2e", msg)
+        self.assertIn("idempotent", msg)
+
     def test_e2e_without_idempotent_field_parses_fine(self):
         """C2 control: e2e criteria with no idempotent override must still
         parse normally (proves we didn't break valid e2e contracts)."""
