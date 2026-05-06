@@ -20,6 +20,28 @@ v0.8.1 (T1) extends the schema additively (schema version stays 1):
 
 All defaults applied at parse time; missing fields never surface as None.
 Forward-compat preserved: unknown top-level fields still warn-and-keep.
+
+================================================================
+CONTRIBUTOR NOTE — schema parsing rule (T1 v0.8.1, codex round-6)
+================================================================
+RULE: schema parsing MUST NOT use `dict.get(key)` (or `obj.get(key) or X`,
+or `is None` checks) for fields where explicit `null`, empty string, wrong
+type, or other falsy values have semantic meaning. Six rounds of /codex
+review on T1 (commits be52061..51dc4d3) found the SAME bug class repeatedly:
+absent → default vs explicit-null → reject was being conflated, silently
+rescuing malformed contracts.
+
+Use the `require_field` / `optional_field` helpers + the `non_empty_str` /
+`bool_value` / `positive_int` / etc. validators defined below. They split
+"absent → default" (the only path that returns the default unvalidated) from
+"explicit value → validate" (which rejects null/wrong-type/falsy per the
+field's contract). Codex consult session: 019dfd48-634c-7720-922d-15313dcc96c7.
+
+T2-T22 implementers: any new contract field you add MUST go through these
+helpers, otherwise the next codex round WILL find a null-bypass and we
+re-do this fix yet again. If you need a validator we don't have yet, add
+it next to the others — keep the same `(key, value) -> value | raises`
+shape.
 """
 from __future__ import annotations
 
@@ -88,6 +110,101 @@ class ContractError(ValueError):
     Per fail-closed policy, callers should treat this as 'revert to interactive
     mode' rather than ignoring the contract.
     """
+
+
+# ----------------------------------------------------------------------
+# Schema validation helpers (T1 v0.8.1, codex round-6 path B).
+#
+# RULE: schema parsing MUST NOT use `.get()` for fields where explicit `null`,
+# empty string, wrong type, or falsy has semantic meaning. Use these helpers
+# instead — they distinguish "absent → default" from "explicit value →
+# validate". Codex review will keep finding bypasses if you use `.get()`.
+# See module docstring + commits be52061..51dc4d3 for the bug history.
+# ----------------------------------------------------------------------
+
+
+def require_field(obj: dict, key: str, validate):
+    """Field must be present. Raises ContractError if missing.
+
+    Delegates value validation to `validate(key, value)`.
+    """
+    if key not in obj:
+        raise ContractError(f"{key} missing")
+    return validate(key, obj[key])
+
+
+def optional_field(obj: dict, key: str, validate, default):
+    """If `key` not in `obj`, return `default` (no validation).
+
+    Otherwise validate the explicit value — `null`, `""`, wrong type are all
+    routed to the validator, which should reject them per the fail-closed
+    posture (the default applies ONLY to the absent case).
+    """
+    if key not in obj:
+        return default
+    return validate(key, obj[key])
+
+
+def non_empty_str(key: str, value):
+    if not isinstance(value, str) or not value.strip():
+        raise ContractError(f"{key} must be a non-empty string, got {value!r}")
+    return value
+
+
+def nullable_str(key: str, value):
+    """Accepts a non-empty string OR explicit `null` (both meaningful).
+
+    Used for fields like `notification.command` where `null` legitimately
+    means "no command configured" (same semantics as absent).
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ContractError(
+            f"{key} must be a non-empty string or null, got {value!r}"
+        )
+    return value
+
+
+def bool_value(key: str, value):
+    if not isinstance(value, bool):
+        raise ContractError(f"{key} must be a boolean, got {value!r}")
+    return value
+
+
+def positive_int(key: str, value):
+    # bool is a subclass of int — exclude explicitly.
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ContractError(
+            f"{key} must be a positive integer (>= 1), got {value!r}"
+        )
+    return value
+
+
+def non_negative_int(key: str, value):
+    """For fields like throttle_min where 0 is meaningful (no throttle)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ContractError(
+            f"{key} must be a non-negative integer, got {value!r}"
+        )
+    return value
+
+
+def non_empty_str_list(key: str, value):
+    if not isinstance(value, list):
+        raise ContractError(f"{key} must be a list of strings, got {value!r}")
+    for i, item in enumerate(value):
+        if not isinstance(item, str) or not item.strip():
+            raise ContractError(
+                f"{key}[{i}] must be a non-empty string, got {item!r}"
+            )
+    return list(value)
+
+
+def dict_value(key: str, value):
+    if not isinstance(value, dict):
+        raise ContractError(f"{key} must be an object, got {value!r}")
+    return value
 
 
 @dataclass
@@ -247,11 +364,9 @@ def parse_contract(path: Path) -> Contract:
         raise ContractError("scope must be an object")
 
     # T1 S3: top-level opt-in for regression suite skip.
-    pmro = raw.get("post_merge_regression_optional", False)
-    if not isinstance(pmro, bool):
-        raise ContractError(
-            f"post_merge_regression_optional must be bool, got {pmro!r}"
-        )
+    # Routed through optional_field — explicit null/non-bool reject;
+    # absent → default False.
+    pmro = optional_field(raw, "post_merge_regression_optional", bool_value, False)
 
     ac_raw = raw.get("acceptance_criteria", [])
     if not isinstance(ac_raw, list):
@@ -287,32 +402,30 @@ def parse_contract(path: Path) -> Contract:
             # _infer_method always returns a value in VALID_CRITERION_METHODS
             # (or raises) so no post-check needed here.
 
-        # M1: per-method required-field check. Without this, a criterion like
-        # {"method": "cmd"} (no `command`) would parse with command=None and
-        # blow up later in T6/T7 verification with a less actionable error.
-        required_field = REQUIRED_FIELD_BY_METHOD[method]
-        if c.get(required_field) is None:
+        # M1: per-method required-field check — routed through the
+        # require_field helper so that `cmd` with `command: ""`, `command: 0`,
+        # `command: false`, or `command: null` ALL reject at parse time
+        # (rather than parsing as command=None and exploding later in T6/T7
+        # with a less actionable error).
+        required_field_name = REQUIRED_FIELD_BY_METHOD[method]
+        try:
+            require_field(c, required_field_name, non_empty_str)
+        except ContractError as e:
+            # Re-raise with the same wording the existing tests assert on
+            # (preserves error-message stability for downstream log parsers).
             raise ContractError(
                 f"acceptance_criteria[{idx}] method={method!r} requires "
-                f"{required_field!r}"
-            )
+                f"{required_field_name!r}"
+            ) from e
 
         # R7: timeout default by method (or by type=e2e override).
-        # Codex round-4 [P2]: use key presence, not `is None`. An explicit
-        # `timeout_sec: null` is a malformed value (the field is typed int),
-        # not "absent" — fail-closed rather than silently defaulting it.
-        if "timeout_sec" not in c:
-            timeout_sec = (
-                DEFAULT_TIMEOUT_E2E if c["type"] == "e2e"
-                else DEFAULT_TIMEOUT_BY_METHOD[method]
-            )
-        else:
-            ts_raw = c["timeout_sec"]
-            if not isinstance(ts_raw, int) or isinstance(ts_raw, bool) or ts_raw <= 0:
-                raise ContractError(
-                    f"acceptance_criteria[{idx}].timeout_sec must be positive int"
-                )
-            timeout_sec = ts_raw
+        # optional_field: absent → method/type default; explicit value (incl.
+        # null/non-int/<=0) → routed through positive_int validator → reject.
+        default_timeout = (
+            DEFAULT_TIMEOUT_E2E if c["type"] == "e2e"
+            else DEFAULT_TIMEOUT_BY_METHOD[method]
+        )
+        timeout_sec = optional_field(c, "timeout_sec", positive_int, default_timeout)
 
         # R8: idempotent override object validation (when present).
         # C2: e2e criteria CANNOT carry an idempotent override at all. Per
@@ -333,20 +446,16 @@ def parse_contract(path: Path) -> Contract:
         # C2-followup-2 (codex round-3): use key presence here too. An explicit
         # `idempotent: null` on a non-e2e criterion is a malformed override,
         # not "absent" — the schema requires the field, when present, to be
-        # an object with required keys. Keep `not in c` as "absent → None"
-        # (back-compat for v0.8.0 contracts).
-        if "idempotent" in c:
-            idempotent = _validate_idempotent_object(c["idempotent"], idx)
-        else:
-            idempotent = None
+        # an object with required keys. Routed through optional_field with a
+        # closure validator so the idx is captured and absent → None.
+        def _validate_idem(_key, value, _idx=idx):
+            return _validate_idempotent_object(value, _idx)
+        idempotent = optional_field(c, "idempotent", _validate_idem, None)
 
         # Y1 + S3: post_merge_skip cross-field rule (regression type requires
-        # contract-level opt-in).
-        pms = c.get("post_merge_skip", False)
-        if not isinstance(pms, bool):
-            raise ContractError(
-                f"acceptance_criteria[{idx}].post_merge_skip must be bool"
-            )
+        # contract-level opt-in). bool_value validates type — null/non-bool
+        # reject; absent → default False.
+        pms = optional_field(c, "post_merge_skip", bool_value, False)
         if pms and c["type"] == "regression" and not pmro:
             raise ContractError(
                 "post_merge_skip illegal for type=regression unless "
@@ -378,67 +487,57 @@ def parse_contract(path: Path) -> Contract:
     notif_raw = raw.get("notification", {})
     if not isinstance(notif_raw, dict):
         raise ContractError("notification must be an object")
-    throttle_raw = notif_raw.get("throttle_min", 5)
-    if isinstance(throttle_raw, bool) or not isinstance(throttle_raw, int) or throttle_raw < 0:
-        raise ContractError(
-            f"notification.throttle_min must be non-negative int, got {throttle_raw!r}"
+    # All three sub-fields routed through helpers — explicit null on
+    # throttle_min/tier2_enabled rejects (typed int/bool); command IS
+    # nullable (legitimate "no command" value, same as absent). Inlined
+    # rather than going through optional_field so we can pass the dotted-path
+    # key (`notification.foo`) for unambiguous error messages — short keys
+    # like `command` collide with criterion-level fields otherwise.
+    if "throttle_min" in notif_raw:
+        throttle_min = non_negative_int(
+            "notification.throttle_min", notif_raw["throttle_min"],
         )
-    tier2_raw = notif_raw.get("tier2_enabled", True)
-    if not isinstance(tier2_raw, bool):
-        raise ContractError(
-            f"notification.tier2_enabled must be bool, got {tier2_raw!r}"
+    else:
+        throttle_min = 5
+    if "tier2_enabled" in notif_raw:
+        tier2_enabled = bool_value(
+            "notification.tier2_enabled", notif_raw["tier2_enabled"],
         )
+    else:
+        tier2_enabled = True
+    if "command" in notif_raw:
+        notification_command = nullable_str(
+            "notification.command", notif_raw["command"],
+        )
+    else:
+        notification_command = None
     notification = {
-        "command": notif_raw.get("command"),
-        "throttle_min": throttle_raw,
-        "tier2_enabled": tier2_raw,
+        "command": notification_command,
+        "throttle_min": throttle_min,
+        "tier2_enabled": tier2_enabled,
     }
 
     # T1 Q2.2: budget.max_codex_rounds_per_task default 3. N1: when explicitly
     # set, must be >= 1 — `0 rounds` is meaningless (it would mean "never call
     # codex", which is the wrong way to express that — disable codex hook
     # instead). throttle_min=0 IS meaningful (fire every event); they differ.
-    # Codex round-4 [P2]: key presence, not `is None`. Explicit
-    # `max_codex_rounds_per_task: null` must reject (the field is typed int);
-    # absent → default 3.
-    # Codex round-5 [P2]: parent `budget` itself must reject explicit null /
-    # falsy non-dict, mirroring `notification` and `scope`. Prior `or {}`
-    # path treated `"budget": null` as absent, silently applying defaults.
-    if "budget" in raw:
-        budget_raw = raw["budget"]
-        if not isinstance(budget_raw, dict):
-            raise ContractError(
-                f"budget must be an object, got {budget_raw!r}"
-            )
-        budget = dict(budget_raw)
-    else:
-        budget = {}
-    if "max_codex_rounds_per_task" not in budget:
-        budget["max_codex_rounds_per_task"] = 3
-    else:
-        mcr_raw = budget["max_codex_rounds_per_task"]
-        if isinstance(mcr_raw, bool) or not isinstance(mcr_raw, int) or mcr_raw < 1:
-            raise ContractError(
-                f"budget.max_codex_rounds_per_task must be int >= 1, "
-                f"got {mcr_raw!r}"
-            )
+    # Codex round-6: parent budget routed through optional_field+dict_value
+    # — explicit `budget: null` / `false` / `""` / `0` reject (mirrors
+    # notification/scope handling); absent → empty dict, then
+    # max_codex_rounds_per_task defaulted to 3 below.
+    budget = dict(optional_field(raw, "budget", dict_value, {}))
+    budget["max_codex_rounds_per_task"] = optional_field(
+        budget, "max_codex_rounds_per_task", positive_int, 3,
+    )
 
     # T1 R8: idempotent_cmd_allowlist default = built-in 8 entries. When user
-    # overrides, must be a list of strings.
-    # Codex round-4 [P2]: key presence, not `is None`. Explicit
-    # `idempotent_cmd_allowlist: null` must reject (typed list[str]); absent
-    # → built-in default. Without this, a user who *intends* to disable the
-    # allowlist by writing `null` instead silently inherits the 8-entry
-    # default and may still permit pytest/mypy as idempotent — fail-closed.
-    if "idempotent_cmd_allowlist" not in raw:
-        idempotent_cmd_allowlist = list(DEFAULT_IDEMPOTENT_CMD_ALLOWLIST)
-    else:
-        icl_raw = raw["idempotent_cmd_allowlist"]
-        if not isinstance(icl_raw, list) or not all(isinstance(x, str) for x in icl_raw):
-            raise ContractError(
-                "idempotent_cmd_allowlist must be a list of strings"
-            )
-        idempotent_cmd_allowlist = list(icl_raw)
+    # overrides, must be a list of non-empty strings. optional_field routes
+    # explicit null/non-list/empty-string-element through non_empty_str_list
+    # → reject; absent → built-in default.
+    idempotent_cmd_allowlist = optional_field(
+        raw, "idempotent_cmd_allowlist", non_empty_str_list,
+        list(DEFAULT_IDEMPOTENT_CMD_ALLOWLIST),
+    )
 
     return Contract(
         contract_schema_version=csv,

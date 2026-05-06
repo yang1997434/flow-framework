@@ -710,6 +710,258 @@ class TestParseContract(unittest.TestCase):
         c = parse_contract(path)
         self.assertIsNone(c.notification["command"])
 
+    # ------------------------------------------------------------------
+    # Codex round-6 path B: helper-extraction regression sweep. Per-method
+    # required field (M1) must reject explicit `""`, `false`, `0`, `null`
+    # — not just absent. Pins the require_field+non_empty_str path for all
+    # four method-required-field combos so a future helper refactor can't
+    # silently weaken the check.
+    # ------------------------------------------------------------------
+
+    def _criterion_payload(self, method, field_name, value):
+        crit = {"description": "x", "type": "unit", "method": method}
+        crit[field_name] = value
+        return {
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [crit],
+        }
+
+    def test_method_cmd_command_falsy_values_all_rejected(self):
+        """M1 + helper sweep: cmd with command=`""`/`0`/`False`/`None` all
+        reject (require_field + non_empty_str). Without this, a typo'd
+        contract `command: ""` would parse as command="" and explode later."""
+        for bad in ("", 0, False, None):
+            path = self._write(self._criterion_payload("cmd", "command", bad))
+            with self.assertRaises(ContractError, msg=f"cmd command={bad!r} should reject"):
+                parse_contract(path)
+
+    def test_method_file_exists_path_falsy_values_all_rejected(self):
+        for bad in ("", 0, False, None):
+            path = self._write(self._criterion_payload("file_exists", "path", bad))
+            with self.assertRaises(ContractError, msg=f"file_exists path={bad!r} should reject"):
+                parse_contract(path)
+
+    def test_method_http_url_falsy_values_all_rejected(self):
+        for bad in ("", 0, False, None):
+            path = self._write(self._criterion_payload("http", "url", bad))
+            with self.assertRaises(ContractError, msg=f"http url={bad!r} should reject"):
+                parse_contract(path)
+
+    def test_method_json_query_field_falsy_values_all_rejected(self):
+        for bad in ("", 0, False, None):
+            path = self._write(self._criterion_payload("json_query", "json_query", bad))
+            with self.assertRaises(ContractError, msg=f"json_query={bad!r} should reject"):
+                parse_contract(path)
+
+    def test_method_cmd_command_whitespace_only_rejected(self):
+        """non_empty_str rejects whitespace-only strings (.strip() == '')."""
+        path = self._write(self._criterion_payload("cmd", "command", "   "))
+        with self.assertRaises(ContractError):
+            parse_contract(path)
+
+    # ------------------------------------------------------------------
+    # Codex round-6 path B: top-level helper coverage for cases not yet
+    # exercised. Every v0.8.1 field has the full 5-case sweep:
+    #   absent → default | null → reject | "" → reject (str) |
+    #   wrong-type → reject | meaningful falsy (0/false) → accepted-or-rejected
+    #   per the field's contract.
+    # ------------------------------------------------------------------
+
+    def test_idempotent_cmd_allowlist_wrong_type_rejected(self):
+        """non_empty_str_list rejects non-list."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "idempotent_cmd_allowlist": "pytest",  # str, not list
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        self.assertIn("idempotent_cmd_allowlist", str(ctx.exception))
+
+    def test_idempotent_cmd_allowlist_with_empty_string_element_rejected(self):
+        """non_empty_str_list rejects empty/whitespace element — would otherwise
+        let an attacker put `""` in the allowlist and match every command."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "idempotent_cmd_allowlist": ["pytest", ""],
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        self.assertIn("idempotent_cmd_allowlist[1]", str(ctx.exception))
+
+    def test_idempotent_cmd_allowlist_with_non_string_element_rejected(self):
+        """non_empty_str_list rejects bool/int element (caught the duck-typing
+        gap from the old isinstance(x, str) loop)."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "idempotent_cmd_allowlist": ["pytest", 42],
+        })
+        with self.assertRaises(ContractError):
+            parse_contract(path)
+
+    def test_idempotent_cmd_allowlist_empty_list_accepted(self):
+        """Empty list is a valid override (user opted out of all built-in
+        idempotent commands). Different from null/absent."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "idempotent_cmd_allowlist": [],
+        })
+        c = parse_contract(path)
+        self.assertEqual(c.idempotent_cmd_allowlist, [])
+
+    def test_notification_throttle_min_wrong_type_string_rejected(self):
+        """non_negative_int rejects str. Pin the wrong-type branch."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "notification": {"throttle_min": "5"},
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        self.assertIn("throttle_min", str(ctx.exception))
+
+    def test_notification_throttle_min_negative_rejected(self):
+        """non_negative_int rejects negative. -1 isn't `disabled`."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "notification": {"throttle_min": -1},
+        })
+        with self.assertRaises(ContractError):
+            parse_contract(path)
+
+    def test_notification_throttle_min_bool_rejected(self):
+        """non_negative_int explicitly excludes bool (True is int subclass)."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "notification": {"throttle_min": True},
+        })
+        with self.assertRaises(ContractError):
+            parse_contract(path)
+
+    def test_notification_command_empty_string_rejected(self):
+        """nullable_str: null/absent OK, but "" is wrong (use null instead)."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "notification": {"command": ""},
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        self.assertIn("notification.command", str(ctx.exception))
+
+    def test_notification_command_wrong_type_rejected(self):
+        """nullable_str rejects non-str-non-None (int/list/dict/bool)."""
+        for bad in (42, ["x"], {"k": "v"}, False):
+            path = self._write({
+                "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+                "autonomy_mode": "interactive",
+                "created_at": "2026-05-06T00:00:00Z",
+                "notification": {"command": bad},
+            })
+            with self.assertRaises(ContractError, msg=f"command={bad!r} should reject"):
+                parse_contract(path)
+
+    def test_notification_command_explicit_string_accepted(self):
+        """Positive-control: a real command string still parses."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "notification": {"command": "notify-send 'hi'"},
+        })
+        c = parse_contract(path)
+        self.assertEqual(c.notification["command"], "notify-send 'hi'")
+
+    def test_post_merge_regression_optional_wrong_type_rejected(self):
+        """bool_value rejects int (1/0 aren't bool — explicit type)."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "post_merge_regression_optional": 1,
+        })
+        with self.assertRaises(ContractError):
+            parse_contract(path)
+
+    def test_max_codex_rounds_per_task_wrong_type_rejected(self):
+        """positive_int rejects str (caught the `isinstance(int)` fallback)."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "budget": {"max_codex_rounds_per_task": "3"},
+        })
+        with self.assertRaises(ContractError):
+            parse_contract(path)
+
+    def test_max_codex_rounds_per_task_bool_rejected(self):
+        """positive_int explicitly excludes bool (True is int subclass)."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "budget": {"max_codex_rounds_per_task": True},
+        })
+        with self.assertRaises(ContractError):
+            parse_contract(path)
+
+    def test_criterion_timeout_sec_negative_rejected(self):
+        """positive_int: negative timeout is meaningless."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "x", "type": "unit", "method": "cmd",
+                "command": "true", "timeout_sec": -1,
+            }],
+        })
+        with self.assertRaises(ContractError):
+            parse_contract(path)
+
+    def test_criterion_timeout_sec_string_rejected(self):
+        """positive_int: '600' is not 600. Strict type."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "x", "type": "unit", "method": "cmd",
+                "command": "true", "timeout_sec": "600",
+            }],
+        })
+        with self.assertRaises(ContractError):
+            parse_contract(path)
+
+    def test_criterion_post_merge_skip_int_rejected(self):
+        """bool_value: 1 is not True (explicit type, no Python truthiness)."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "x", "type": "unit", "method": "cmd",
+                "command": "true", "post_merge_skip": 1,
+            }],
+        })
+        with self.assertRaises(ContractError):
+            parse_contract(path)
+
     def test_e2e_without_idempotent_field_parses_fine(self):
         """C2 control: e2e criteria with no idempotent override must still
         parse normally (proves we didn't break valid e2e contracts)."""
