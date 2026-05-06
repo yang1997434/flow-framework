@@ -6,6 +6,20 @@ it; Phase 2/3 read it; Phase 4 carries forward unresolved warnings.
 
 v0.8.0 ships parsing + validation + CLI. Orchestrator reads contracts but
 refuses to autonomously dispatch (use v0.8.1+ for that).
+
+v0.8.1 (T1) extends the schema additively (schema version stays 1):
+- budget.max_codex_rounds_per_task (default 3) — Q2.2
+- notification.throttle_min (default 5) + tier2_enabled (default True) — R9
+- idempotent_cmd_allowlist (default 8 entries) — R8
+- post_merge_regression_optional (default False) — S3
+- acceptance_criteria[].method (orthogonal to type) — R5
+- acceptance_criteria[].timeout_sec (per-method default) — R7
+- acceptance_criteria[].idempotent (object: value/rationale/timeout_sec/
+    side_effect_class) — R8
+- acceptance_criteria[].post_merge_skip (regression cross-field check) — Y1+S3
+
+All defaults applied at parse time; missing fields never surface as None.
+Forward-compat preserved: unknown top-level fields still warn-and-keep.
 """
 from __future__ import annotations
 
@@ -25,11 +39,38 @@ VALID_AFK_ON_TIMEOUT = ("abort", "wait")
 VALID_CRITERION_TYPES = (
     "unit", "integration", "e2e", "smoke", "behavior", "regression",
 )
+VALID_CRITERION_METHODS = ("cmd", "file_exists", "json_query", "http")
+VALID_SIDE_EFFECT_CLASSES = ("pure", "read_only", "cache_only", "reversible")
 KNOWN_IRREVERSIBLE = (
     "push_main", "release_tag", "schema_migration",
     "lockfile_major_change", "public_docs_change",
     "delete_local_work", "overwrite_checkpoint", "public_api_change",
 )
+
+# T1 R7: per-method default criterion timeouts. type=e2e overrides cmd default.
+DEFAULT_TIMEOUT_BY_METHOD = {
+    "file_exists": 30,
+    "json_query": 30,
+    "cmd": 600,
+    "http": 60,
+}
+DEFAULT_TIMEOUT_E2E = 1800  # type=e2e overrides method-based default
+
+# T1 R8: built-in idempotent command allowlist. Binaries whose canonical
+# usage is read-only / pure verification (test runners, type checkers,
+# linters, flow's own validation tools).
+DEFAULT_IDEMPOTENT_CMD_ALLOWLIST = [
+    "pytest", "mypy", "eslint", "tsc", "cargo check", "go test",
+    "flow doctor", "flow contract --validate",
+]
+
+# T1 R9: notification defaults. throttle_min=0 means "no throttle, every
+# event fires" (NOT "disabled"); tier2_enabled is the kill switch.
+DEFAULT_NOTIFICATION = {
+    "command": None,
+    "throttle_min": 5,
+    "tier2_enabled": True,
+}
 
 
 class ContractError(ValueError):
@@ -43,8 +84,17 @@ class ContractError(ValueError):
 @dataclass
 class AcceptanceCriterion:
     description: str
-    type: str
-    command: str
+    type: str          # unit | integration | e2e | smoke | behavior | regression
+    method: str        # cmd | file_exists | json_query | http  (R5: orthogonal)
+    command: Optional[str] = None
+    path: Optional[str] = None
+    url: Optional[str] = None
+    json_query: Optional[str] = None
+    timeout_sec: Optional[int] = None  # R7 — never None after parse_contract
+    # R8 hardened: {value: bool, rationale: str, timeout_sec: int,
+    #               side_effect_class: pure|read_only|cache_only|reversible}
+    idempotent: Optional[dict] = None
+    post_merge_skip: bool = False      # Y1 + S3
 
 
 @dataclass
@@ -60,10 +110,70 @@ class Contract:
     irreversible_actions: list[str] = field(default_factory=list)
     budget: dict = field(default_factory=dict)
     acceptance_criteria: list[AcceptanceCriterion] = field(default_factory=list)
-    notification_command: Optional[str] = None
+    # T1 R8: project-wide idempotent command allowlist (extendable per-task).
+    idempotent_cmd_allowlist: list[str] = field(
+        default_factory=lambda: list(DEFAULT_IDEMPOTENT_CMD_ALLOWLIST)
+    )
+    # T1 S3: opt-in to allow type=regression criteria with post_merge_skip=true.
+    post_merge_regression_optional: bool = False
+    # T1 R9: notification dict supersedes the v0.8.0 standalone field.
+    # Shape: {command: str|None, throttle_min: int, tier2_enabled: bool}.
+    notification: dict = field(default_factory=lambda: dict(DEFAULT_NOTIFICATION))
     afk_timeout_min: Optional[int] = None
     afk_on_timeout: Optional[str] = None
     unknown_fields: list[str] = field(default_factory=list)
+
+
+def _infer_method(c: dict) -> str:
+    """v0.8.0 contracts wrote `command` only (no `method`). Infer for compat."""
+    if "command" in c:
+        return "cmd"
+    if "path" in c:
+        return "file_exists"
+    if "url" in c:
+        return "http"
+    if "json_query" in c:
+        return "json_query"
+    raise ContractError(
+        "acceptance_criterion missing method (and no command/path/url/json_query "
+        "to infer from)"
+    )
+
+
+def _validate_idempotent_object(idem: dict, idx: int) -> dict:
+    """R8: idempotent override must include value/rationale/timeout_sec/
+    side_effect_class. Raises ContractError on shape violation."""
+    if not isinstance(idem, dict):
+        raise ContractError(
+            f"acceptance_criteria[{idx}].idempotent must be an object"
+        )
+    required = ("value", "rationale", "timeout_sec", "side_effect_class")
+    missing = [k for k in required if k not in idem]
+    if missing:
+        raise ContractError(
+            f"acceptance_criteria[{idx}].idempotent missing keys: "
+            f"{', '.join(missing)}"
+        )
+    if not isinstance(idem["value"], bool):
+        raise ContractError(
+            f"acceptance_criteria[{idx}].idempotent.value must be bool"
+        )
+    if not isinstance(idem["rationale"], str) or not idem["rationale"].strip():
+        raise ContractError(
+            f"acceptance_criteria[{idx}].idempotent.rationale must be non-empty "
+            f"string"
+        )
+    if not isinstance(idem["timeout_sec"], int) or isinstance(idem["timeout_sec"], bool):
+        raise ContractError(
+            f"acceptance_criteria[{idx}].idempotent.timeout_sec must be int"
+        )
+    sec = idem["side_effect_class"]
+    if sec not in VALID_SIDE_EFFECT_CLASSES:
+        raise ContractError(
+            f"acceptance_criteria[{idx}].idempotent.side_effect_class must be "
+            f"one of {VALID_SIDE_EFFECT_CLASSES}, got {sec!r}"
+        )
+    return dict(idem)
 
 
 def parse_contract(path: Path) -> Contract:
@@ -85,6 +195,8 @@ def parse_contract(path: Path) -> Contract:
         "staleness_ttl_days", "scope", "known_forks", "escalation_triggers",
         "irreversible_actions", "budget", "acceptance_criteria",
         "notification", "afk_timeout_min", "afk_on_timeout",
+        # T1 v0.8.1 additive top-level fields:
+        "idempotent_cmd_allowlist", "post_merge_regression_optional",
     }
     unknown = sorted(set(raw.keys()) - known)
 
@@ -112,14 +224,21 @@ def parse_contract(path: Path) -> Contract:
     if not isinstance(scope, dict):
         raise ContractError("scope must be an object")
 
+    # T1 S3: top-level opt-in for regression suite skip.
+    pmro = raw.get("post_merge_regression_optional", False)
+    if not isinstance(pmro, bool):
+        raise ContractError(
+            f"post_merge_regression_optional must be bool, got {pmro!r}"
+        )
+
     ac_raw = raw.get("acceptance_criteria", [])
     if not isinstance(ac_raw, list):
         raise ContractError("acceptance_criteria must be an array")
-    crits = []
-    for c in ac_raw:
+    crits: list[AcceptanceCriterion] = []
+    for idx, c in enumerate(ac_raw):
         if not isinstance(c, dict):
             raise ContractError("acceptance_criteria items must be objects")
-        for k in ("description", "type", "command"):
+        for k in ("description", "type"):
             if k not in c:
                 raise ContractError(f"acceptance_criterion missing {k}")
         if c["type"] not in VALID_CRITERION_TYPES:
@@ -127,8 +246,61 @@ def parse_contract(path: Path) -> Contract:
                 f"acceptance_criterion.type must be one of "
                 f"{VALID_CRITERION_TYPES}, got {c['type']!r}"
             )
+
+        # R5: method orthogonal to type. Backward compat: infer from fields
+        # when `method` omitted (v0.8.0 contracts had `command` only).
+        method = c.get("method") or _infer_method(c)
+        if method not in VALID_CRITERION_METHODS:
+            raise ContractError(
+                f"acceptance_criterion.method must be one of "
+                f"{VALID_CRITERION_METHODS}, got {method!r}"
+            )
+
+        # R7: timeout default by method (or by type=e2e override).
+        ts_raw = c.get("timeout_sec")
+        if ts_raw is None:
+            timeout_sec = (
+                DEFAULT_TIMEOUT_E2E if c["type"] == "e2e"
+                else DEFAULT_TIMEOUT_BY_METHOD[method]
+            )
+        else:
+            if not isinstance(ts_raw, int) or isinstance(ts_raw, bool) or ts_raw <= 0:
+                raise ContractError(
+                    f"acceptance_criteria[{idx}].timeout_sec must be positive int"
+                )
+            timeout_sec = ts_raw
+
+        # R8: idempotent override object validation (when present).
+        idem_raw = c.get("idempotent")
+        idempotent = (
+            _validate_idempotent_object(idem_raw, idx)
+            if idem_raw is not None else None
+        )
+
+        # Y1 + S3: post_merge_skip cross-field rule (regression type requires
+        # contract-level opt-in).
+        pms = c.get("post_merge_skip", False)
+        if not isinstance(pms, bool):
+            raise ContractError(
+                f"acceptance_criteria[{idx}].post_merge_skip must be bool"
+            )
+        if pms and c["type"] == "regression" and not pmro:
+            raise ContractError(
+                "post_merge_skip illegal for type=regression unless "
+                "post_merge_regression_optional set"
+            )
+
         crits.append(AcceptanceCriterion(
-            description=c["description"], type=c["type"], command=c["command"],
+            description=c["description"],
+            type=c["type"],
+            method=method,
+            command=c.get("command"),
+            path=c.get("path"),
+            url=c.get("url"),
+            json_query=c.get("json_query"),
+            timeout_sec=timeout_sec,
+            idempotent=idempotent,
+            post_merge_skip=pms,
         ))
 
     afk = raw.get("afk_on_timeout")
@@ -137,9 +309,52 @@ def parse_contract(path: Path) -> Contract:
             f"afk_on_timeout must be one of {VALID_AFK_ON_TIMEOUT}, got {afk!r}"
         )
 
-    notif = raw.get("notification", {})
-    if not isinstance(notif, dict):
+    # T1 R9: notification dict — defaults applied at parse time. throttle_min=0
+    # is a sentinel for "no throttle, every event fires" (NOT "disabled").
+    # tier2_enabled is the separate kill switch.
+    notif_raw = raw.get("notification", {})
+    if not isinstance(notif_raw, dict):
         raise ContractError("notification must be an object")
+    throttle_raw = notif_raw.get("throttle_min", 5)
+    if isinstance(throttle_raw, bool) or not isinstance(throttle_raw, int) or throttle_raw < 0:
+        raise ContractError(
+            f"notification.throttle_min must be non-negative int, got {throttle_raw!r}"
+        )
+    tier2_raw = notif_raw.get("tier2_enabled", True)
+    if not isinstance(tier2_raw, bool):
+        raise ContractError(
+            f"notification.tier2_enabled must be bool, got {tier2_raw!r}"
+        )
+    notification = {
+        "command": notif_raw.get("command"),
+        "throttle_min": throttle_raw,
+        "tier2_enabled": tier2_raw,
+    }
+
+    # T1 Q2.2: budget.max_codex_rounds_per_task default 3. Must be a positive
+    # int when explicitly set.
+    budget = dict(raw.get("budget") or {})
+    mcr_raw = budget.get("max_codex_rounds_per_task")
+    if mcr_raw is None:
+        budget["max_codex_rounds_per_task"] = 3
+    else:
+        if isinstance(mcr_raw, bool) or not isinstance(mcr_raw, int) or mcr_raw < 0:
+            raise ContractError(
+                f"budget.max_codex_rounds_per_task must be non-negative int, "
+                f"got {mcr_raw!r}"
+            )
+
+    # T1 R8: idempotent_cmd_allowlist default = built-in 8 entries. When user
+    # overrides, must be a list of strings.
+    icl_raw = raw.get("idempotent_cmd_allowlist")
+    if icl_raw is None:
+        idempotent_cmd_allowlist = list(DEFAULT_IDEMPOTENT_CMD_ALLOWLIST)
+    else:
+        if not isinstance(icl_raw, list) or not all(isinstance(x, str) for x in icl_raw):
+            raise ContractError(
+                "idempotent_cmd_allowlist must be a list of strings"
+            )
+        idempotent_cmd_allowlist = list(icl_raw)
 
     return Contract(
         contract_schema_version=csv,
@@ -151,9 +366,11 @@ def parse_contract(path: Path) -> Contract:
         known_forks=list(raw.get("known_forks") or []),            # T2: harden
         escalation_triggers=list(raw.get("escalation_triggers") or []),  # T2: harden
         irreversible_actions=list(raw.get("irreversible_actions") or []),  # T2: harden
-        budget=dict(raw.get("budget") or {}),                      # T2: harden
+        budget=budget,
         acceptance_criteria=crits,
-        notification_command=notif.get("command"),
+        idempotent_cmd_allowlist=idempotent_cmd_allowlist,
+        post_merge_regression_optional=pmro,
+        notification=notification,
         afk_timeout_min=raw.get("afk_timeout_min"),
         afk_on_timeout=afk,
         unknown_fields=unknown,
@@ -260,9 +477,10 @@ def _build_template(slug: str, slug_dir: Path) -> dict:
             "max_new_deps": 0,
             "max_retry_per_task": 2,
             "max_elapsed_min": 240,
+            "max_codex_rounds_per_task": 3,
         },
         "acceptance_criteria": [],
-        "notification": {"command": None},
+        "notification": {"command": None, "throttle_min": 5, "tier2_enabled": True},
         "afk_timeout_min": 240,
         "afk_on_timeout": "wait",
     }

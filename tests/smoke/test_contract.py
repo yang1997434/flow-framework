@@ -72,6 +72,157 @@ class TestParseContract(unittest.TestCase):
             parse_contract(path)
         self.assertIn("acceptance_criteria must be an array", str(ctx.exception))
 
+    # ------------------------------------------------------------------
+    # T1 v0.8.1: schema additive fields + per-method timeout defaults +
+    # idempotent override + post_merge_skip cross-field rule.
+    # ------------------------------------------------------------------
+
+    def test_max_codex_rounds_per_task_default(self):
+        """Q2.2: missing field → default 3"""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+        })
+        c = parse_contract(path)
+        self.assertEqual(c.budget["max_codex_rounds_per_task"], 3)
+
+    def test_max_codex_rounds_per_task_explicit(self):
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "budget": {"max_codex_rounds_per_task": 5},
+        })
+        c = parse_contract(path)
+        self.assertEqual(c.budget["max_codex_rounds_per_task"], 5)
+
+    def test_notification_throttle_min_default(self):
+        """R9: missing → 5"""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+        })
+        c = parse_contract(path)
+        self.assertEqual(c.notification["throttle_min"], 5)
+        self.assertTrue(c.notification["tier2_enabled"])
+
+    def test_notification_throttle_zero_means_no_throttle_not_disabled(self):
+        """R9: 0 = fire every event; tier2_enabled separate switch"""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "notification": {"throttle_min": 0},
+        })
+        c = parse_contract(path)
+        self.assertEqual(c.notification["throttle_min"], 0)
+        self.assertTrue(c.notification["tier2_enabled"])
+
+    def test_notification_tier2_disabled(self):
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "notification": {"tier2_enabled": False},
+        })
+        c = parse_contract(path)
+        self.assertFalse(c.notification["tier2_enabled"])
+
+    def test_idempotent_cmd_allowlist_default(self):
+        """R8: missing → built-in allowlist"""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+        })
+        c = parse_contract(path)
+        self.assertIn("pytest", c.idempotent_cmd_allowlist)
+        self.assertIn("mypy", c.idempotent_cmd_allowlist)
+        self.assertIn("flow doctor", c.idempotent_cmd_allowlist)
+
+    def test_acceptance_criterion_with_idempotent_object(self):
+        """R8: per-criterion override needs rationale + timeout_sec + side_effect_class"""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "smoke pings stub",
+                "type": "smoke",
+                "method": "cmd",
+                "command": "curl http://localhost/health",
+                "timeout_sec": 30,
+                "idempotent": {
+                    "value": True,
+                    "rationale": "GET against stub; no state mutation",
+                    "timeout_sec": 30,
+                    "side_effect_class": "read_only",
+                },
+                "post_merge_skip": False,
+            }],
+        })
+        c = parse_contract(path)
+        crit = c.acceptance_criteria[0]
+        self.assertEqual(crit.method, "cmd")
+        self.assertEqual(crit.timeout_sec, 30)
+        self.assertTrue(crit.idempotent["value"])
+        self.assertEqual(crit.idempotent["side_effect_class"], "read_only")
+
+    def test_post_merge_skip_illegal_for_regression(self):
+        """S3: regression type cannot have post_merge_skip=true unless contract.post_merge_regression_optional=true"""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "main suite",
+                "type": "regression",
+                "method": "cmd",
+                "command": "bash tests/smoke/run.sh",
+                "post_merge_skip": True,
+            }],
+        })
+        with self.assertRaises(ContractError):
+            parse_contract(path)
+
+    def test_post_merge_regression_optional_unlocks_skip(self):
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "post_merge_regression_optional": True,
+            "acceptance_criteria": [{
+                "description": "main suite",
+                "type": "regression",
+                "method": "cmd",
+                "command": "bash tests/smoke/run.sh",
+                "post_merge_skip": True,
+            }],
+        })
+        c = parse_contract(path)
+        self.assertTrue(c.acceptance_criteria[0].post_merge_skip)
+
+    def test_criterion_default_timeout_by_method(self):
+        """R7: defaults — file_exists/json_query=30s, cmd=600s, http=60s, e2e=1800s"""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [
+                {"description": "f", "type": "smoke", "method": "file_exists", "path": "VERSION"},
+                {"description": "c", "type": "unit", "method": "cmd", "command": "true"},
+                {"description": "h", "type": "integration", "method": "http", "url": "http://localhost/"},
+                {"description": "e", "type": "e2e", "method": "cmd", "command": "playwright test"},
+            ],
+        })
+        c = parse_contract(path)
+        self.assertEqual(c.acceptance_criteria[0].timeout_sec, 30)   # file_exists
+        self.assertEqual(c.acceptance_criteria[1].timeout_sec, 600)  # cmd
+        self.assertEqual(c.acceptance_criteria[2].timeout_sec, 60)   # http
+        self.assertEqual(c.acceptance_criteria[3].timeout_sec, 1800) # e2e
+
 
 class TestContractInvalidCases(unittest.TestCase):
     def setUp(self):
