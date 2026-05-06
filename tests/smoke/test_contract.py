@@ -188,5 +188,56 @@ class TestValidateContract(unittest.TestCase):
         self.assertTrue(ok, msg=f"errors: {errs}")
 
 
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "common"))
+from progress_meta import read_progress_meta, ProgressMeta
+
+
+class TestProgressMeta(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp))
+
+    def _write(self, body):
+        p = self.tmp / "progress.md"
+        p.write_text(body)
+        return p
+
+    def test_no_frontmatter_returns_default_meta(self):
+        path = self._write("# progress.md\n\n(no frontmatter)\n")
+        m = read_progress_meta(path)
+        self.assertEqual(m.autonomy_mode, "interactive")  # default
+        self.assertIsNone(m.contract_path)
+
+    def test_frontmatter_with_pointer_fields(self):
+        path = self._write(
+            "---\n"
+            "contract_path: contract.json\n"
+            "contract_schema_version: 1\n"
+            "autonomy_mode: auto\n"
+            "last_checkpoint: 2026-05-05T12:00:00Z\n"
+            "---\n\n"
+            "# progress.md\n"
+        )
+        m = read_progress_meta(path)
+        self.assertEqual(m.contract_path, "contract.json")
+        self.assertEqual(m.contract_schema_version, 1)
+        self.assertEqual(m.autonomy_mode, "auto")
+
+    def test_invalid_autonomy_mode_falls_back_to_interactive(self):
+        path = self._write(
+            "---\nautonomy_mode: maybe\n---\n# x\n"
+        )
+        m = read_progress_meta(path)
+        self.assertEqual(m.autonomy_mode, "interactive")  # fail-closed
+
+    def test_partial_frontmatter_other_fields_preserved(self):
+        path = self._write(
+            "---\nautonomy_mode: auto\nslug: foo\nphase: 2\n---\n# x\n"
+        )
+        m = read_progress_meta(path)
+        self.assertEqual(m.autonomy_mode, "auto")
+        self.assertIsNone(m.contract_path)  # not set
+
+
 if __name__ == "__main__":
     unittest.main()
