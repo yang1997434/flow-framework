@@ -327,11 +327,15 @@ def parse_contract(path: Path) -> Contract:
                 f"idempotent override (T9 always blocks in-flight e2e "
                 f"regardless; design §6 R8 forbids any e2e idempotent override)"
             )
-        idem_raw = c.get("idempotent")
-        idempotent = (
-            _validate_idempotent_object(idem_raw, idx)
-            if idem_raw is not None else None
-        )
+        # C2-followup-2 (codex round-3): use key presence here too. An explicit
+        # `idempotent: null` on a non-e2e criterion is a malformed override,
+        # not "absent" — the schema requires the field, when present, to be
+        # an object with required keys. Keep `not in c` as "absent → None"
+        # (back-compat for v0.8.0 contracts).
+        if "idempotent" in c:
+            idempotent = _validate_idempotent_object(c["idempotent"], idx)
+        else:
+            idempotent = None
 
         # Y1 + S3: post_merge_skip cross-field rule (regression type requires
         # contract-level opt-in).

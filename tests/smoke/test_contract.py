@@ -526,6 +526,32 @@ class TestParseContract(unittest.TestCase):
         self.assertIn("e2e", msg)
         self.assertIn("idempotent", msg)
 
+    def test_non_e2e_with_idempotent_null_rejected(self):
+        """C2 follow-up-2 (codex round-3): non-e2e criterion with explicit
+        `idempotent: null` must also reject. The schema says when the field
+        is present it must be a valid object — `null` is malformed, not
+        absent. Use key presence on the non-e2e path too, otherwise null
+        silently bypasses _validate_idempotent_object."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "unit suite",
+                "type": "unit",
+                "method": "cmd",
+                "command": "pytest tests/unit",
+                "idempotent": None,
+            }],
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        msg = str(ctx.exception)
+        self.assertIn("idempotent", msg)
+        # Should hit the "must be an object" path (since key is present
+        # but value isn't a dict), proving the key-presence branch fired.
+        self.assertIn("object", msg)
+
     def test_e2e_without_idempotent_field_parses_fine(self):
         """C2 control: e2e criteria with no idempotent override must still
         parse normally (proves we didn't break valid e2e contracts)."""
