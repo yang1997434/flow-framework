@@ -848,7 +848,23 @@ class AcceptanceRunner:
         # contract (network probe, not arbitrary I/O). Treat as
         # ``inconclusive`` (criterion malformed) rather than ``fail``
         # (verdict): the contract author needs to fix the URL.
-        parsed = urllib.parse.urlsplit(criterion.url)
+        # Codex T7 R4 [P2]: urlsplit() raises ValueError on syntactically
+        # malformed URLs (`http://[::1`, IPv6 with no closing bracket, etc.)
+        # — that exception fires BEFORE the worker thread's safety net,
+        # which would orphan the `started` event in run_one. Catch here
+        # and route to inconclusive so run_one always paints a paired
+        # completed event.
+        try:
+            parsed = urllib.parse.urlsplit(criterion.url)
+        except ValueError as e:
+            return RunResult(
+                status="inconclusive",
+                error_msg=(
+                    f"http method received malformed URL "
+                    f"(url={criterion.url!r}): {e}. Reject as malformed "
+                    f"contract — fix the URL before re-running."
+                ),
+            )
         if parsed.scheme not in ("http", "https"):
             return RunResult(
                 status="inconclusive",

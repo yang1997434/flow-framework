@@ -1683,5 +1683,52 @@ class TestHttpExceptionSafetyNet(unittest.TestCase):
         )
 
 
+class TestHttpMalformedUrl(unittest.TestCase):
+    """Codex T7 R4 [P2]: malformed URLs (e.g. unclosed IPv6 bracket) raised
+    ValueError out of urlsplit BEFORE the worker thread's safety net,
+    orphaning the `started` event in run_one. Catch ValueError → inconclusive."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp))
+        self.runner = _make_runner(self.tmp)
+
+    def test_unclosed_ipv6_bracket_returns_inconclusive(self):
+        # `http://[::1` is syntactically invalid — urlsplit raises ValueError
+        # in some stdlib paths. The executor must not propagate.
+        crit = AcceptanceCriterion(
+            description="malformed", type="integration",
+            method="http", url="http://[::1", timeout_sec=5,
+        )
+        r = self.runner._run_http(crit)
+        self.assertEqual(r.status, "inconclusive")
+        self.assertIn("malformed URL", r.error_msg or "")
+
+    def test_run_one_emits_completed_for_malformed_url(self):
+        crit = AcceptanceCriterion(
+            description="malformed orchestrated", type="integration",
+            method="http", url="http://[::1", timeout_sec=5,
+        )
+        task_dir = Path(self.tmp) / "task_dir"
+        task_dir.mkdir(parents=True)
+        result = self.runner.run_one(
+            crit, criterion_idx=0, attempt_id="a-malformed",
+            retry_idx=0, task_dir=task_dir,
+        )
+        self.assertEqual(result.status, "inconclusive")
+        progress_log = task_dir / "acceptance-progress.jsonl"
+        self.assertTrue(progress_log.exists())
+        events = [
+            json.loads(line) for line in progress_log.read_text().splitlines()
+            if line.strip()
+        ]
+        kinds = [e.get("event") for e in events]
+        self.assertIn("started", kinds)
+        self.assertTrue(
+            "completed" in kinds or "timeout" in kinds,
+            msg=f"orphan started event for malformed URL; kinds={kinds}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
