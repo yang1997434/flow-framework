@@ -552,6 +552,134 @@ class TestParseContract(unittest.TestCase):
         # but value isn't a dict), proving the key-presence branch fired.
         self.assertIn("object", msg)
 
+    # ------------------------------------------------------------------
+    # Codex round-4 [P2]: systematic null-bypass audit. For every v0.8.1
+    # field whose schema declares a non-null type, an explicit `null` value
+    # in the contract must REJECT (fail-closed), not silently defaulted.
+    # Defaults apply ONLY when the key is absent. Catches the same
+    # `.get(key)` / `is None` idiom-vs-design gap that the method/idempotent
+    # fixes addressed earlier in T1.
+    # ------------------------------------------------------------------
+
+    def test_max_codex_rounds_per_task_explicit_null_rejected(self):
+        """Codex round-4: explicit `null` must reject — typed int field, not
+        a "use default" sentinel. Absence still gets default 3."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "budget": {"max_codex_rounds_per_task": None},
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        msg = str(ctx.exception)
+        self.assertIn("max_codex_rounds_per_task", msg)
+        self.assertIn(">= 1", msg)
+
+    def test_idempotent_cmd_allowlist_explicit_null_rejected(self):
+        """Codex round-4: explicit `null` must reject — typed list[str].
+        Without this, a user who *intends* to disable the allowlist by
+        writing `null` silently inherits the 8-entry default."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "idempotent_cmd_allowlist": None,
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        self.assertIn("idempotent_cmd_allowlist", str(ctx.exception))
+
+    def test_criterion_timeout_sec_explicit_null_rejected(self):
+        """Codex round-4: explicit `null` must reject — typed positive int.
+        Absent → method-default; null → ContractError. Without this fix,
+        a user who writes `timeout_sec: null` thinking it means "use default"
+        silently bypasses the positive-int validation."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "x", "type": "unit", "method": "cmd",
+                "command": "true", "timeout_sec": None,
+            }],
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        msg = str(ctx.exception)
+        self.assertIn("timeout_sec", msg)
+        self.assertIn("positive", msg)
+
+    def test_notification_throttle_min_explicit_null_rejected(self):
+        """Codex round-4 control: explicit `null` already rejects via the
+        existing isinstance(int) check. Pin the behavior so a future
+        refactor doesn't regress it."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "notification": {"throttle_min": None},
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        self.assertIn("throttle_min", str(ctx.exception))
+
+    def test_notification_tier2_enabled_explicit_null_rejected(self):
+        """Codex round-4 control: typed bool — null fails isinstance(bool)."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "notification": {"tier2_enabled": None},
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        self.assertIn("tier2_enabled", str(ctx.exception))
+
+    def test_post_merge_regression_optional_explicit_null_rejected(self):
+        """Codex round-4 control: typed bool — null fails isinstance(bool)."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "post_merge_regression_optional": None,
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        self.assertIn("post_merge_regression_optional", str(ctx.exception))
+
+    def test_criterion_post_merge_skip_explicit_null_rejected(self):
+        """Codex round-4 control: typed bool on criterion — null fails
+        isinstance(bool). Pin behavior so a future refactor of the
+        criterion loop doesn't regress it."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "x", "type": "unit", "method": "cmd",
+                "command": "true", "post_merge_skip": None,
+            }],
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        self.assertIn("post_merge_skip", str(ctx.exception))
+
+    def test_notification_command_explicit_null_is_accepted(self):
+        """Codex round-4 NEGATIVE control: notification.command IS allowed
+        to be null — `null` legitimately means "no notification command",
+        same as absent. This is intentional (not a bypass) and should NOT
+        regress to a rejection. If this test starts failing, the audit
+        over-tightened."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "notification": {"command": None},
+        })
+        c = parse_contract(path)
+        self.assertIsNone(c.notification["command"])
+
     def test_e2e_without_idempotent_field_parses_fine(self):
         """C2 control: e2e criteria with no idempotent override must still
         parse normally (proves we didn't break valid e2e contracts)."""

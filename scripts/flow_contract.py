@@ -298,13 +298,16 @@ def parse_contract(path: Path) -> Contract:
             )
 
         # R7: timeout default by method (or by type=e2e override).
-        ts_raw = c.get("timeout_sec")
-        if ts_raw is None:
+        # Codex round-4 [P2]: use key presence, not `is None`. An explicit
+        # `timeout_sec: null` is a malformed value (the field is typed int),
+        # not "absent" — fail-closed rather than silently defaulting it.
+        if "timeout_sec" not in c:
             timeout_sec = (
                 DEFAULT_TIMEOUT_E2E if c["type"] == "e2e"
                 else DEFAULT_TIMEOUT_BY_METHOD[method]
             )
         else:
+            ts_raw = c["timeout_sec"]
             if not isinstance(ts_raw, int) or isinstance(ts_raw, bool) or ts_raw <= 0:
                 raise ContractError(
                     f"acceptance_criteria[{idx}].timeout_sec must be positive int"
@@ -395,11 +398,14 @@ def parse_contract(path: Path) -> Contract:
     # set, must be >= 1 — `0 rounds` is meaningless (it would mean "never call
     # codex", which is the wrong way to express that — disable codex hook
     # instead). throttle_min=0 IS meaningful (fire every event); they differ.
+    # Codex round-4 [P2]: key presence, not `is None`. Explicit
+    # `max_codex_rounds_per_task: null` must reject (the field is typed int);
+    # absent → default 3.
     budget = dict(raw.get("budget") or {})
-    mcr_raw = budget.get("max_codex_rounds_per_task")
-    if mcr_raw is None:
+    if "max_codex_rounds_per_task" not in budget:
         budget["max_codex_rounds_per_task"] = 3
     else:
+        mcr_raw = budget["max_codex_rounds_per_task"]
         if isinstance(mcr_raw, bool) or not isinstance(mcr_raw, int) or mcr_raw < 1:
             raise ContractError(
                 f"budget.max_codex_rounds_per_task must be int >= 1, "
@@ -408,10 +414,15 @@ def parse_contract(path: Path) -> Contract:
 
     # T1 R8: idempotent_cmd_allowlist default = built-in 8 entries. When user
     # overrides, must be a list of strings.
-    icl_raw = raw.get("idempotent_cmd_allowlist")
-    if icl_raw is None:
+    # Codex round-4 [P2]: key presence, not `is None`. Explicit
+    # `idempotent_cmd_allowlist: null` must reject (typed list[str]); absent
+    # → built-in default. Without this, a user who *intends* to disable the
+    # allowlist by writing `null` instead silently inherits the 8-entry
+    # default and may still permit pytest/mypy as idempotent — fail-closed.
+    if "idempotent_cmd_allowlist" not in raw:
         idempotent_cmd_allowlist = list(DEFAULT_IDEMPOTENT_CMD_ALLOWLIST)
     else:
+        icl_raw = raw["idempotent_cmd_allowlist"]
         if not isinstance(icl_raw, list) or not all(isinstance(x, str) for x in icl_raw):
             raise ContractError(
                 "idempotent_cmd_allowlist must be a list of strings"
