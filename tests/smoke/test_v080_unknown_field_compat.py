@@ -38,10 +38,36 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
+def _v080_tag_available() -> bool:
+    """True iff `v0.8.0` resolves to a commit in the local repo.
+
+    Codex T3 round 1 [P2]: shallow CI clones often skip tags; if the test
+    just `git worktree add ...v0.8.0`s without checking, a missing tag turns
+    the suite red even though no production code regressed. We'd rather
+    skip with a clear reason than confuse a forward-compat regression with
+    "tags not fetched".
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", "v0.8.0^{commit}"],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+        )
+        return result.returncode == 0
+    except (OSError, FileNotFoundError):
+        return False
+
+
 class TestV080ReaderHandlesV081Contract(unittest.TestCase):
     """Run the v0.8.0 tag binary against a v0.8.1 contract."""
 
     def setUp(self):
+        if not _v080_tag_available():
+            self.skipTest(
+                "v0.8.0 tag not present in local repo (shallow clone? tags "
+                "not fetched?). Run `git fetch --tags` to enable this smoke. "
+                "Skip is environment-fragility, not a code regression."
+            )
         self.tmp = Path(tempfile.mkdtemp(prefix="t3_v080_compat_"))
         self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
 
