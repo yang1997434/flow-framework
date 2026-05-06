@@ -24,6 +24,11 @@ A composable framework that wraps your existing skill ecosystem (superpowers / i
 **v0.7+ feature highlights**:
 
 - **v0.7+: dependency-aware parallel subagent dispatch** — declare per-task `writes:` glob in plans; framework verifies disjointness, runs independent tasks in parallel waves with sequential cross-wave integration. See `docs/superpowers/specs/2026-05-05-v0.7-parallel-dispatch-design.md`.
+- **v0.8.0 — Autonomous mode foundation**: `contract.json` schema for per-task
+  autonomy configuration (scope, budget, acceptance criteria, irreversible
+  actions). New CLI: `flow contract --init / --validate`, `flow orchestrator
+  --dry-run`. Execution is gated until v0.8.1 ships the safety stack. See
+  `docs/v0.8-migration.md`.
 
 ## Quick start
 
