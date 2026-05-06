@@ -41,23 +41,27 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 def _v080_tag_available() -> bool:
     """True iff `v0.8.0` resolves to a commit in the local repo.
 
-    Codex T3 round 1 [P2]: shallow CI clones often skip tags; if the test
-    just `git worktree add ...v0.8.0`s without checking, a missing tag turns
-    the suite red even though no production code regressed.
+    Codex T3 R1 [P2]: shallow CI clones often skip tags; missing tag
+    should skip-with-reason, not turn the suite red.
 
-    Codex T3 round 2 [P2]: do NOT swallow OSError/FileNotFoundError here —
-    that would convert a broken-git environment into a silent skip, which
-    is exactly the bypass this guard is supposed to prevent. Let those
-    propagate so the test fails loudly with a real cause instead of
-    pretending the tag is missing. Only the explicit `git rev-parse` "tag
-    not found" return (rc!=0) signals "skip is fine".
+    Codex T3 R2 [P2]: do NOT swallow OSError/FileNotFoundError — broken
+    git binary should fail loud, not silent-skip.
+
+    Codex T3 R3 [P2]: `git rev-parse` rc!=0 conflates "tag missing" with
+    other git failures (corrupt repo, safe.directory, dubious-ownership,
+    permissions). Use `git tag --list v0.8.0` instead — its rc=0 always
+    when git itself works, and stdout is empty iff the tag is absent.
+    Any rc!=0 from `git tag` therefore means git itself is broken; let
+    `check=True` raise CalledProcessError so the cause surfaces.
     """
     result = subprocess.run(
-        ["git", "rev-parse", "--verify", "--quiet", "v0.8.0^{commit}"],
+        ["git", "tag", "--list", "v0.8.0"],
         cwd=str(REPO_ROOT),
         capture_output=True,
+        check=True,
+        text=True,
     )
-    return result.returncode == 0
+    return result.stdout.strip() == "v0.8.0"
 
 
 class TestV080ReaderHandlesV081Contract(unittest.TestCase):
