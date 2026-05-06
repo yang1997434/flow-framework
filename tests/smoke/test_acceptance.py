@@ -355,11 +355,18 @@ class TestHttpMethod(unittest.TestCase):
         self.assertEqual(r.exit_code, 503)
 
     def test_http_refused_fail(self):
-        # Port 1 is reserved/unbound → ConnectionRefusedError → fail
-        # per design (server unreachable IS a verdict).
+        # Bind an ephemeral port and immediately release it — the kernel
+        # won't reuse it instantly for a fresh listener, so connecting
+        # there reliably yields ECONNREFUSED. Avoids the "port 1 might
+        # be bound on rare dev machines" hazard while still proving the
+        # "server unreachable IS a verdict" path.
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
         crit = AcceptanceCriterion(
             description="dead", type="integration", method="http",
-            url="http://127.0.0.1:1/", timeout_sec=2,
+            url=f"http://127.0.0.1:{port}/", timeout_sec=2,
         )
         r = self.runner._run_http(crit)
         self.assertEqual(r.status, "fail")
@@ -388,6 +395,55 @@ class TestHttpMethod(unittest.TestCase):
         )
         r = self.runner._run_http(crit)
         self.assertEqual(r.status, "inconclusive")
+
+    def test_http_file_scheme_rejected_inconclusive(self):
+        # Defense in depth: a contract with method=http but a file://
+        # URL must NOT silently turn into local file access. The
+        # executor's contract is "network probe"; reject the URL as
+        # malformed (inconclusive), don't return a verdict.
+        crit = AcceptanceCriterion(
+            description="file scheme", type="integration", method="http",
+            url="file:///etc/passwd", timeout_sec=10,
+        )
+        r = self.runner._run_http(crit)
+        self.assertEqual(r.status, "inconclusive")
+        self.assertIsNotNone(r.error_msg)
+        self.assertIn("file", r.error_msg)
+        self.assertIn("scheme", r.error_msg)
+        self.assertIsNone(r.exit_code)
+
+    def test_http_ftp_scheme_rejected_inconclusive(self):
+        # Same guard for ftp:// — anything outside http(s) is rejected
+        # as a malformed http-method criterion.
+        crit = AcceptanceCriterion(
+            description="ftp scheme", type="integration", method="http",
+            url="ftp://example.com/", timeout_sec=10,
+        )
+        r = self.runner._run_http(crit)
+        self.assertEqual(r.status, "inconclusive")
+        self.assertIsNotNone(r.error_msg)
+        self.assertIn("ftp", r.error_msg)
+        self.assertIn("scheme", r.error_msg)
+
+    def test_http_https_scheme_passes_validation(self):
+        # Control: https URLs must NOT be rejected by the scheme guard.
+        # Point at the in-test ephemeral port — connection will refuse
+        # since the stub is plain http, but the verdict path is
+        # ``fail`` (URLError), not ``inconclusive`` (scheme reject).
+        # That asserts the guard didn't trip on https.
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        crit = AcceptanceCriterion(
+            description="https control", type="integration", method="http",
+            url=f"https://127.0.0.1:{port}/", timeout_sec=2,
+        )
+        r = self.runner._run_http(crit)
+        # Either fail (connection refused) or timed_out — both prove
+        # the guard accepted https and dispatched to urlopen.
+        self.assertIn(r.status, ("fail", "timed_out"))
+        self.assertNotEqual(r.status, "inconclusive")
 
 
 # ---------------------------------------------------------------------------

@@ -100,6 +100,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
@@ -481,6 +482,25 @@ class AcceptanceRunner:
                 status="inconclusive",
                 error_msg="http method requires non-empty `url` field",
             )
+        # Reject non-http(s) schemes BEFORE handing the URL to urllib.
+        # `urllib.request.Request` happily accepts ``file://``, ``ftp://``,
+        # and any custom-handler scheme — a contract with
+        # ``method: "http"`` + ``url: "file:///etc/passwd"`` would return
+        # ``pass`` if the file exists, defeating the executor's stated
+        # contract (network probe, not arbitrary I/O). Treat as
+        # ``inconclusive`` (criterion malformed) rather than ``fail``
+        # (verdict): the contract author needs to fix the URL.
+        parsed = urllib.parse.urlsplit(criterion.url)
+        if parsed.scheme not in ("http", "https"):
+            return RunResult(
+                status="inconclusive",
+                error_msg=(
+                    f"http method requires http(s) URL scheme, got "
+                    f"{parsed.scheme!r} (url={criterion.url!r}). Reject as "
+                    f"malformed contract — refuse non-network access via "
+                    f"the http executor."
+                ),
+            )
         timeout = self._effective_timeout(criterion)
         command_hash = hashlib.sha256(
             f"GET {criterion.url}".encode("utf-8")
@@ -497,11 +517,21 @@ class AcceptanceRunner:
                 # cleanly; we don't store body, just ensure the server
                 # finished sending. Bounded read so a giant body doesn't
                 # blow memory.
+                #
+                # STATUS-ALREADY-DETERMINED — body drain only.
+                # The HTTP status is already captured above; this drain
+                # is best-effort cleanup, NOT a verdict input. An OSError
+                # here (mid-stream disconnect, connection reset post-
+                # headers) cannot change pass/fail. This is the ONE
+                # justified silent OSError swallow in this module —
+                # every other OSError flows through URLError / HTTPError
+                # branches into a real verdict. Future readers: do not
+                # remove this try/except without considering that some
+                # servers close the socket aggressively after sending
+                # the status line on small responses.
                 try:
                     resp.read(64)
                 except OSError:
-                    # Body read failure post-headers: not a verdict
-                    # change — we already have the status code.
                     pass
                 return RunResult(
                     status="pass" if 200 <= status_code < 300 else "fail",
