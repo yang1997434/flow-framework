@@ -1063,5 +1063,358 @@ class TestHttpRedirectBoundary(unittest.TestCase):
         self.assertEqual(r.exit_code, 200)
 
 
+# ---------------------------------------------------------------------------
+# SAFETY-BOUNDARY hardening — codex R2 follow-on fixes
+# ---------------------------------------------------------------------------
+
+
+class TestCmdProcessGroupKillR2(unittest.TestCase):
+    """[P1 codex R2] Process-group kill must defeat SIGTERM-trapping
+    grandchildren even when the shell exits cleanly on SIGTERM.
+
+    The previous fix relied on ``proc.wait(timeout=...)`` to confirm the
+    group was dead, but that only observes the SHELL — a child that
+    ``trap`` 's SIGTERM and lets the shell exit cleanly will pass that
+    wait while keeping running. The fix probes the GROUP via
+    ``killpg(pgid, 0)`` and ALWAYS sends SIGKILL after the grace window
+    as defense-in-depth.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp))
+        self.runner = _make_runner(self.tmp)
+
+    def test_grandchild_traps_sigterm_dies_via_sigkill(self):
+        # The shell spawns a child Python that traps SIGTERM (ignores it),
+        # writes its PID to a sentinel file, and sleeps. The shell then
+        # exits via the same SIGTERM (we don't trap in the shell). Without
+        # the SIGKILL-the-group fallback, the grandchild Python keeps
+        # running because:
+        #   1. SIGTERM goes to the group → shell + child both receive it
+        #   2. shell exits → proc.wait() returns
+        #   3. old code returns "drain succeeded" → no SIGKILL fires
+        #   4. child Python (SIGTERM-ignored) keeps running for 60s
+        # With the fix we ALWAYS SIGKILL the group, so the child dies.
+        pidfile = Path(self.tmp) / "grandchild.pid"
+        # Use Python directly so we get a real signal handler. ``signal``
+        # at the shell level can be unreliable across shells.
+        py = sys.executable
+        # The grandchild is a Python process that ignores SIGTERM and
+        # sleeps. We run it in the SAME process group as the shell (no
+        # extra setsid) so it shares the group PID.
+        grandchild_script = (
+            f"import signal, time, os; "
+            f"signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            f"open({str(pidfile)!r}, 'w').write(str(os.getpid())); "
+            f"time.sleep(60)"
+        )
+        # Background the grandchild, then ``wait`` so the shell has
+        # something to time out on.
+        cmd = (
+            f"{py} -c {json.dumps(grandchild_script)} & "
+            f"echo $! >&2; "
+            f"wait"
+        )
+        crit = AcceptanceCriterion(
+            description="trap-grandchild", type="unit", method="cmd",
+            command=cmd, timeout_sec=2,
+        )
+        r = self.runner._run_cmd(crit)
+        self.assertEqual(r.status, "timed_out", msg=r.error_msg)
+        # The grandchild should have written its PID before the timeout
+        # fires (it does so before sleep). Wait briefly for it.
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if pidfile.exists():
+                break
+            time.sleep(0.05)
+        self.assertTrue(
+            pidfile.exists(),
+            msg="grandchild didn't write the sentinel pidfile in time",
+        )
+        gc_pid = int(pidfile.read_text().strip())
+        # Critical: the SIGTERM-ignored grandchild must NOT be alive.
+        # Wait briefly for the SIGKILL to propagate post-runner-return.
+        for _ in range(30):
+            if not _pid_alive(gc_pid):
+                break
+            time.sleep(0.1)
+        self.assertFalse(
+            _pid_alive(gc_pid),
+            msg=(
+                f"SIGTERM-ignored grandchild PID {gc_pid} survived per-"
+                f"criterion timeout — SIGKILL fallback NOT firing"
+            ),
+        )
+
+
+class TestHttpInitialDeadline(unittest.TestCase):
+    """[P2 codex R2] The HTTP initial request must respect a wall-clock
+    deadline, not just per-socket-op timeouts.
+
+    A server that delays its first byte for >timeout_sec wall-clock can
+    pass through ``opener.open(timeout=N)`` if no individual socket op
+    takes >N seconds. We add a wall-clock deadline check after the
+    open returns.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = _QuietHTTPServer(("127.0.0.1", 0), _StubHTTPHandler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(
+            target=cls.server.serve_forever, daemon=True,
+        )
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp))
+        self.runner = _make_runner(self.tmp)
+
+    def test_slow_server_exceeds_deadline_returns_timed_out(self):
+        # Server delays response by 3s; criterion timeout is 1s. With
+        # the deadline check, the verdict must be ``timed_out`` rather
+        # than ``pass`` (which would happen if we waited 3s for the
+        # response and then returned 200).
+        # Note: depending on socket timing the per-socket-op timeout
+        # may fire first → ``timed_out`` directly; OR the read may
+        # complete past deadline → wall-clock check fires. Either path
+        # MUST result in ``timed_out``, never ``pass``.
+        _StubHTTPHandler.slow_response_sec = 3.0
+        try:
+            crit = AcceptanceCriterion(
+                description="slow", type="integration", method="http",
+                url=f"http://127.0.0.1:{self.port}/slow", timeout_sec=1,
+            )
+            r = self.runner._run_http(crit)
+            self.assertEqual(
+                r.status, "timed_out",
+                msg=f"slow server should hit deadline, got {r.status}: "
+                    f"{r.error_msg}",
+            )
+            self.assertNotEqual(
+                r.status, "pass",
+                msg="MUST NOT silently pass a >timeout_sec wall-clock request",
+            )
+        finally:
+            _StubHTTPHandler.slow_response_sec = 0.0
+
+
+class _SlowChainHandler(http.server.BaseHTTPRequestHandler):
+    """Redirect chain handler that sleeps between hops to exhaust
+    wall-clock deadline mid-chain."""
+
+    delay_per_hop: float = 0.0
+
+    def do_GET(self):
+        if self.path == "/ok":
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
+        if self.path.startswith("/slow-chain"):
+            try:
+                n = int(self.path.rsplit("/", 1)[1])
+            except ValueError:
+                n = 0
+            if self.delay_per_hop > 0:
+                import time as _t
+                _t.sleep(self.delay_per_hop)
+            if n <= 0:
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+                return
+            self.send_response(301)
+            self.send_header("Location", f"/slow-chain/{n - 1}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, *_a, **_kw):
+        pass
+
+
+class TestHttpRedirectDeadlineRouting(unittest.TestCase):
+    """[P2 codex R2] When a redirect-chain wall-clock deadline fires,
+    the verdict must be ``timed_out`` (matching criterion intent), not
+    ``fail`` (the generic URLError bucket).
+
+    The fix introduces ``_HttpDeadlineExceeded`` as a dedicated URLError
+    subclass that the executor catches FIRST for clean routing.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = http.server.HTTPServer(
+            ("127.0.0.1", 0), _SlowChainHandler,
+        )
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(
+            target=cls.server.serve_forever, daemon=True,
+        )
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp))
+        self.runner = _make_runner(self.tmp)
+
+    def test_redirect_chain_deadline_routes_to_timed_out(self):
+        # Each hop sleeps 0.6s. With MAX_HTTP_REDIRECTS=1 we only get
+        # one redirect, so we can't easily blow the deadline via
+        # redirect-chain alone here — but the code path we care about
+        # (deadline-during-redirect → _HttpDeadlineExceeded → timed_out)
+        # is exercised when the chain hop sleep itself pushes us past
+        # deadline before the redirect callback. Set timeout_sec to a
+        # value just above the FIRST hop but below TWO hops; the
+        # redirect callback runs AFTER the first hop so by then deadline
+        # has elapsed → _HttpDeadlineExceeded → timed_out.
+        _SlowChainHandler.delay_per_hop = 0.6
+        try:
+            crit = AcceptanceCriterion(
+                description="slow-chain", type="integration",
+                method="http",
+                # /slow-chain/2 → /slow-chain/1 → /slow-chain/0 (200).
+                # MAX_HTTP_REDIRECTS=1 also kills this, but that path
+                # routes via stdlib HTTPError → fail. The deadline path
+                # we're testing fires when the redirect callback runs
+                # AFTER the wall-clock has already elapsed.
+                url=f"http://127.0.0.1:{self.port}/slow-chain/2",
+                timeout_sec=1,
+            )
+            r = self.runner._run_http(crit)
+            # The redirect callback's deadline check is the canonical
+            # path here. timeout_sec=1 + 0.6s first-hop delay means
+            # by the time the redirect callback fires, monotonic() >
+            # deadline → _HttpDeadlineExceeded → timed_out.
+            #
+            # Edge case: the per-socket-op timeout may also fire if
+            # the socket layer detects the slow read first → also
+            # timed_out via the URLError reason=timeout branch. Both
+            # paths produce timed_out; the assertion is on the
+            # verdict not the path.
+            self.assertEqual(
+                r.status, "timed_out",
+                msg=f"redirect-chain deadline should route to timed_out, "
+                    f"got {r.status}: {r.error_msg}",
+            )
+        finally:
+            _SlowChainHandler.delay_per_hop = 0.0
+
+
+class TestJsonQueryBoundedRead(unittest.TestCase):
+    """[P2 codex R2] json_query must enforce its size cap via a bounded
+    read, not via stat() + read(). The previous stat-then-read pattern
+    had a TOCTOU race where the file could grow between the stat and
+    the read."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp))
+        self.runner = _make_runner(self.tmp)
+
+    def test_oversize_dense_file_rejected_via_bounded_read(self):
+        # Write a real (non-sparse) file just over the cap. The cap
+        # check must trip from the BOUNDED READ (len(data) > cap+1
+        # bytes worth), not from stat().st_size. This proves we don't
+        # depend on stat — covers the TOCTOU race even though we don't
+        # exercise the race directly.
+        big = Path(self.tmp) / "huge.json"
+        # 1 MiB chunks of '{' to keep memory low while writing.
+        chunk = b"{" * (1024 * 1024)
+        with open(big, "wb") as f:
+            for _ in range(11):  # 11 MiB > 10 MiB cap
+                f.write(chunk)
+        crit = AcceptanceCriterion(
+            description="huge dense", type="smoke", method="json_query",
+            path="huge.json", json_query="x", timeout_sec=30,
+        )
+        r = self.runner._run_json_query(crit)
+        self.assertEqual(r.status, "inconclusive")
+        self.assertIn("size", (r.error_msg or "").lower())
+        self.assertIn(str(MAX_JSON_QUERY_FILE_BYTES), r.error_msg or "")
+
+    def test_under_cap_file_still_parses(self):
+        # Control: post-fix, a normal-sized JSON file still parses
+        # correctly via the new bounded-read path.
+        small = Path(self.tmp) / "small.json"
+        small.write_text(json.dumps({"ok": True, "list": [1, 2, 3]}))
+        crit = AcceptanceCriterion(
+            description="small", type="smoke", method="json_query",
+            path="small.json", json_query="ok", timeout_sec=30,
+        )
+        r = self.runner._run_json_query(crit)
+        self.assertEqual(r.status, "pass")
+
+
+class TestPathResolveSymlinkLoop(unittest.TestCase):
+    """[P2 codex R2] ``Path.resolve()`` can raise OSError(ELOOP) or
+    RuntimeError on symlink loops. Containment must catch these and
+    return inconclusive instead of crashing the runner."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp))
+        self.runner = _make_runner(self.tmp)
+
+    def test_symlink_loop_path_returns_inconclusive(self):
+        # Create a symlink loop: a -> b, b -> a. resolve() will raise
+        # on this. The containment helper must catch and return
+        # inconclusive — NOT propagate the exception to the runner.
+        a = Path(self.tmp) / "a"
+        b = Path(self.tmp) / "b"
+        a.symlink_to(b)
+        b.symlink_to(a)
+        crit = AcceptanceCriterion(
+            description="loop", type="smoke", method="file_exists",
+            path="a", timeout_sec=30,
+        )
+        # Must not raise.
+        r = self.runner._run_file_exists(crit)
+        self.assertEqual(r.status, "inconclusive")
+        self.assertIsNotNone(r.error_msg)
+        # Either ELOOP-flavored OS error or symlink-loop RuntimeError —
+        # both routed via the same helper. Just check the helper
+        # produced an operator-readable signal.
+        msg = (r.error_msg or "").lower()
+        self.assertTrue(
+            "symlink" in msg or "could not be resolved" in msg
+            or "loop" in msg,
+            msg=f"expected symlink-loop diagnostic, got: {r.error_msg!r}",
+        )
+
+    def test_symlink_loop_json_query_returns_inconclusive(self):
+        # Same race for json_query — both methods route through the
+        # same _resolve_within_worktree helper.
+        a = Path(self.tmp) / "loop_a.json"
+        b = Path(self.tmp) / "loop_b.json"
+        a.symlink_to(b)
+        b.symlink_to(a)
+        crit = AcceptanceCriterion(
+            description="loop json", type="smoke", method="json_query",
+            path="loop_a.json", json_query="x", timeout_sec=30,
+        )
+        r = self.runner._run_json_query(crit)
+        self.assertEqual(r.status, "inconclusive")
+
+
 if __name__ == "__main__":
     unittest.main()

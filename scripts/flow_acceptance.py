@@ -184,6 +184,20 @@ MAX_HTTP_REDIRECTS = 1
 PROCESS_GROUP_KILL_GRACE_SEC = 2
 
 
+class _HttpDeadlineExceeded(urllib.error.URLError):
+    """Distinct subclass so the http executor can route deadline-induced
+    aborts to ``timed_out`` instead of the generic ``fail`` bucket.
+
+    SAFETY-BOUNDARY (codex R2 [P2]): a plain ``URLError("deadline...")``
+    produces a string-typed ``.reason`` which the executor's URLError
+    handler doesn't recognize as a timeout — the verdict was being routed
+    to ``fail`` instead of ``timed_out``. Using a dedicated subclass means
+    ``isinstance(e, _HttpDeadlineExceeded)`` works regardless of how the
+    reason is represented, and is robust to future refactors of the
+    string-matching logic.
+    """
+
+
 class _SchemeValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Re-validate scheme + wall-clock deadline on every redirect target.
 
@@ -220,12 +234,14 @@ class _SchemeValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         # Wall-clock check FIRST so a slow-redirect chain bails before
-        # the next socket open.
+        # the next socket open. Use a distinct exception class so the
+        # executor routes this to ``timed_out`` rather than the generic
+        # URLError → ``fail`` bucket.
         if (
             self._deadline_monotonic is not None
             and time.monotonic() > self._deadline_monotonic
         ):
-            raise urllib.error.URLError(
+            raise _HttpDeadlineExceeded(
                 "http executor wall-clock deadline exceeded "
                 "during redirect chain"
             )
@@ -386,13 +402,21 @@ class AcceptanceRunner:
         fix the path) — NOT ``fail`` (which would be a verdict on a
         legitimate criterion).
         """
-        candidate = (self.worktree_root / rel_path).resolve()
+        # SAFETY-BOUNDARY (codex R2 [P2]): ``Path.resolve()`` can raise
+        # ``RuntimeError`` ("Symlink loop") on some platforms, or
+        # ``OSError`` (ELOOP) on others, when the candidate path traverses
+        # a symlink cycle. Don't crash — return inconclusive with an
+        # operator-readable message. We also wrap the worktree-root
+        # resolve since a poisoned worktree root (e.g. a symlink loop in
+        # a parent dir) would otherwise crash the runner before we even
+        # got to the relative_to check.
         try:
-            root = self.worktree_root.resolve()
-        except OSError as e:
+            candidate = (self.worktree_root / rel_path).resolve(strict=False)
+            root = self.worktree_root.resolve(strict=False)
+        except (OSError, RuntimeError) as e:
             return None, (
-                f"{field_name}={rel_path!r} could not resolve worktree "
-                f"root: {e}"
+                f"{field_name}={rel_path!r} could not be resolved "
+                f"(symlink loop or permission error): {e}"
             )
         try:
             candidate.relative_to(root)
@@ -511,6 +535,15 @@ class AcceptanceRunner:
                 # SAFETY-BOUNDARY: kill the WHOLE process group, not just
                 # the shell. Two-stage kill: SIGTERM + drain + SIGKILL.
                 self._kill_process_group(proc)
+                # Reap the shell so we don't leave a zombie. The group
+                # kill above guarantees the tree is dead; this just
+                # collects the rc. Bounded wait — group is already dead
+                # so this returns near-instantly, but we cap to avoid
+                # hanging forever on a wedged kernel state.
+                try:
+                    proc.wait(timeout=PROCESS_GROUP_KILL_GRACE_SEC)
+                except subprocess.TimeoutExpired:
+                    pass
                 duration_ms = int((time.monotonic() - t0) * 1000)
                 return RunResult(
                     status="timed_out",
@@ -542,37 +575,70 @@ class AcceptanceRunner:
 
     @staticmethod
     def _kill_process_group(proc: "subprocess.Popen[bytes]") -> None:
-        """Send SIGTERM to the child's process group; SIGKILL if it lingers.
+        """Kill every process in the child's group; defense-in-depth SIGKILL.
 
         ``proc.pid`` IS the process group leader (because we spawned with
         ``start_new_session=True``). ``os.killpg`` delivers the signal to
         every process in that group — the shell, every direct child, every
         ``&``-backgrounded grandchild that hasn't called setsid itself.
 
-        ``ProcessLookupError`` is benign — the process was already dead
-        (race between TimeoutExpired and natural exit). After SIGTERM we
-        wait briefly for graceful shutdown; processes that ignore SIGTERM
-        get SIGKILL. ``proc.wait()`` at the end reaps the zombie.
+        SAFETY-BOUNDARY (codex R2 [P1]): we cannot rely on
+        ``proc.wait(timeout=...)`` to confirm the group is dead — that only
+        observes the shell. A child that ``trap`` 's SIGTERM and lets the
+        shell exit cleanly will pass ``proc.wait()`` while the trapped child
+        keeps running. Instead, probe the *group* via ``killpg(pgid, 0)``
+        which raises ``ProcessLookupError`` only when ALL members are gone.
+        After the grace window we ALWAYS send SIGKILL to the group as
+        belt-and-suspenders — there is no reason to be gentle once
+        ``timeout_sec`` has elapsed. The criterion already failed; we just
+        need the tree dead.
+
+        Sequence:
+          1. SIGTERM the group (graceful request).
+          2. Up to ``PROCESS_GROUP_KILL_GRACE_SEC`` poll: probe the group
+             every 50ms via ``killpg(pgid, 0)``. Return as soon as the
+             whole group is gone (ProcessLookupError on the probe).
+          3. SIGKILL the group regardless. If everyone is already dead
+             we'll get ProcessLookupError (benign); if anything is still
+             alive (SIGTERM-trapping child, ignored signal, etc.) it dies
+             here. Either way we exit knowing the tree is gone.
+
+        ``ProcessLookupError`` is benign at every step — the process or
+        group was already dead (race between TimeoutExpired and natural
+        exit, or our SIGTERM landed and the OS reaped before we probed).
         """
         pgid = proc.pid
         try:
             os.killpg(pgid, signal.SIGTERM)
         except ProcessLookupError:
-            return  # already dead — wait below is a no-op
+            return  # whole group already gone before SIGTERM landed
         except OSError:
-            # Permission / EINVAL — extremely unusual; fall through to wait.
+            # Permission / EINVAL — extremely unusual; fall through to
+            # the SIGKILL stage anyway.
             pass
-        try:
-            proc.wait(timeout=PROCESS_GROUP_KILL_GRACE_SEC)
-        except subprocess.TimeoutExpired:
+        deadline = time.monotonic() + PROCESS_GROUP_KILL_GRACE_SEC
+        while time.monotonic() < deadline:
             try:
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
-            try:
-                proc.wait()
+                # Probe the GROUP, not the shell. signal 0 doesn't deliver
+                # anything; ProcessLookupError fires only when no process
+                # in the group is still alive.
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return  # whole group drained gracefully
             except OSError:
+                # Defensive: some platforms raise EPERM if any group member
+                # exists we can't signal. Treat as "still alive" and keep
+                # polling until the SIGKILL stage.
                 pass
+            time.sleep(0.05)
+        # Defense-in-depth: SIGKILL the group regardless of what the
+        # SIGTERM stage saw. Ignored-SIGTERM children die here.
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # raced — group died between probe and SIGKILL; fine
+        except OSError:
+            pass
 
     def _run_file_exists(self, criterion: AcceptanceCriterion) -> RunResult:
         """File-presence check rooted at ``self.worktree_root``.
@@ -653,43 +719,49 @@ class AcceptanceRunner:
                 status="inconclusive",
                 error_msg=f"json file not found: {target}",
             )
-        # SAFETY-BOUNDARY (codex R1 [P2]): cap file size BEFORE materializing
-        # via read_text(). A pathological multi-GB JSON would exhaust memory
-        # / blow the per-criterion timeout. 10 MiB easily covers config /
-        # fixture cases; anything larger is malformed contract.
+        # SAFETY-BOUNDARY (codex R2 [P2]): collapse stat() + read_text()
+        # into a single open-and-read with a hard ceiling. The previous
+        # stat-then-read pattern had a TOCTOU race — between
+        # ``target.stat()`` and ``read_text()``, the file could grow or
+        # be replaced, leaving the read unbounded. Read up to
+        # MAX_JSON_QUERY_FILE_BYTES + 1 bytes; if the read returned more
+        # than the cap, the file exceeds the limit regardless of what
+        # stat would have said. This also avoids relying on stat() at
+        # all, which on some filesystems (sparse files, network mounts)
+        # can be misleading.
+        t0 = time.monotonic()
         try:
-            stat_size = target.stat().st_size
+            with target.open("rb") as fh:
+                data = fh.read(MAX_JSON_QUERY_FILE_BYTES + 1)
         except OSError as e:
             return RunResult(
                 status="inconclusive",
-                error_msg=f"json stat OS error: {e}",
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                error_msg=f"json read OS error: {e}",
             )
-        if stat_size > MAX_JSON_QUERY_FILE_BYTES:
+        if len(data) > MAX_JSON_QUERY_FILE_BYTES:
             return RunResult(
                 status="inconclusive",
+                duration_ms=int((time.monotonic() - t0) * 1000),
                 error_msg=(
-                    f"json_query file size {stat_size} bytes exceeds cap "
+                    f"json_query file size exceeds cap "
                     f"{MAX_JSON_QUERY_FILE_BYTES} bytes (path={target}); "
                     f"refuse to materialize."
                 ),
             )
-        t0 = time.monotonic()
         try:
-            obj = json.loads(target.read_text(encoding="utf-8"))
+            obj = json.loads(data.decode("utf-8"))
         except json.JSONDecodeError as e:
             return RunResult(
                 status="inconclusive",
                 duration_ms=int((time.monotonic() - t0) * 1000),
                 error_msg=f"json parse error: {e}",
             )
-        except OSError as e:
-            # D2: file disappeared between is_file() and read_text(),
-            # or permissions changed. Don't silently treat as missing —
-            # inconclusive.
+        except UnicodeDecodeError as e:
             return RunResult(
                 status="inconclusive",
                 duration_ms=int((time.monotonic() - t0) * 1000),
-                error_msg=f"json read OS error: {e}",
+                error_msg=f"json utf-8 decode error: {e}",
             )
         # Traverse the dotted path. A missing intermediate key is a fail
         # (the data shape doesn't match the contract author's expectation),
@@ -782,8 +854,24 @@ class AcceptanceRunner:
         try:
             req = urllib.request.Request(criterion.url, method="GET")
             with opener.open(req, timeout=timeout) as resp:
+                # SAFETY-BOUNDARY (codex R2 [P2]): the per-socket-op
+                # ``timeout`` does not bound TOTAL wall-clock time. A
+                # server that trickles headers (each socket op below
+                # ``timeout``) for >timeout_sec passes through the
+                # urlopen call but violates the criterion's stated
+                # timeout. Check the deadline immediately on return.
+                if time.monotonic() > deadline:
+                    duration_ms = int((time.monotonic() - t0) * 1000)
+                    return RunResult(
+                        status="timed_out",
+                        duration_ms=duration_ms,
+                        command_hash=command_hash,
+                        error_msg=(
+                            f"http exceeded timeout_sec={timeout} "
+                            f"(wall-clock during initial request)"
+                        ),
+                    )
                 status_code = resp.status
-                duration_ms = int((time.monotonic() - t0) * 1000)
                 # Drain a small amount of body so the connection closes
                 # cleanly; we don't store body, just ensure the server
                 # finished sending. Bounded read so a giant body doesn't
@@ -804,12 +892,40 @@ class AcceptanceRunner:
                     resp.read(64)
                 except OSError:
                     pass
+                # Final deadline check after body drain. A trickled body
+                # could push us past the deadline even if the headers
+                # arrived in time.
+                duration_ms = int((time.monotonic() - t0) * 1000)
+                if time.monotonic() > deadline:
+                    return RunResult(
+                        status="timed_out",
+                        duration_ms=duration_ms,
+                        command_hash=command_hash,
+                        error_msg=(
+                            f"http exceeded timeout_sec={timeout} "
+                            f"(wall-clock during body drain)"
+                        ),
+                    )
                 return RunResult(
                     status="pass" if 200 <= status_code < 300 else "fail",
                     exit_code=status_code,
                     duration_ms=duration_ms,
                     command_hash=command_hash,
                 )
+        except _HttpDeadlineExceeded as e:
+            # SAFETY-BOUNDARY (codex R2 [P2]): redirect-chain wall-clock
+            # deadline exhaustion. Distinct subclass means we route to
+            # ``timed_out`` (matching the criterion's intent) rather than
+            # ``fail`` (the generic URLError bucket). This MUST be caught
+            # before the URLError branch below — _HttpDeadlineExceeded is
+            # a URLError subclass.
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            return RunResult(
+                status="timed_out",
+                duration_ms=duration_ms,
+                command_hash=command_hash,
+                error_msg=f"http exceeded timeout_sec={timeout}: {e}",
+            )
         except urllib.error.HTTPError as e:
             # D3: server replied with non-2xx. ``e.code`` is the real status.
             duration_ms = int((time.monotonic() - t0) * 1000)
