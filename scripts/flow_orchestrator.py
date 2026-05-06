@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -82,6 +83,38 @@ def build_plan(slug: str) -> OrchestratorPlan:
         plan.fallback_reason = "contract.json not found — falling back to interactive"
         return plan
 
+    # T2 R11 (codex P1 fix): PRE-PARSE raw-JSON ceiling check.
+    # The post-parse_contract ceiling check below is bypassed when a v=999
+    # contract ALSO uses future-incompatible field values (e.g. a new
+    # `autonomy_mode` value, a new criterion `method`, a new `type`) that
+    # this v0.8.1 parser doesn't know — parse_contract raises ContractError,
+    # the except branch sets fallback_reason, and we silently degrade to
+    # interactive. R11 mandates fail-closed even when the contract is
+    # otherwise unparseable: a too-new schema means the runtime CANNOT know
+    # the field semantics, so degrading is unsafe (we'd be guessing).
+    #
+    # Rule: only ceiling-check if the version is a clean int > known max.
+    # Every other shape error (missing/wrong-type/negative/bool subclass/
+    # malformed JSON) is deferred to parse_contract's existing rich error
+    # paths so error messages stay consistent with the documented schema.
+    try:
+        raw = json.loads(contract_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        raw = None  # parse_contract will surface the proper error
+    if isinstance(raw, dict):
+        raw_v = raw.get("contract_schema_version")
+        if (
+            isinstance(raw_v, int)
+            and not isinstance(raw_v, bool)
+            and raw_v > CONTRACT_SCHEMA_VERSION
+        ):
+            raise SystemExit(
+                f"ERROR: contract.json declares contract_schema_version="
+                f"{raw_v} but this flow runtime knows up to "
+                f"{CONTRACT_SCHEMA_VERSION}. Upgrade flow OR downgrade "
+                f"the contract."
+            )
+
     try:
         contract = parse_contract(contract_path)
     except ContractError as e:
@@ -89,11 +122,12 @@ def build_plan(slug: str) -> OrchestratorPlan:
         plan.fallback_reason = f"contract parse failed ({e}) — falling back to interactive"
         return plan
 
-    # T2 R11: hard-reject contracts whose schema_version exceeds what this
-    # runtime knows. v0.8.0 only warned via the validator and let the
-    # orchestrator proceed; codex round-3 R11 caught the silent-accept gap.
-    # Fail-closed at the orchestrator boundary covers BOTH --dry-run and
-    # --auto-execute (the caller routes through build_plan in both paths).
+    # T2 R11: post-parse defense-in-depth ceiling check. Kept (not removed)
+    # so that any future code path that calls parse_contract directly and
+    # then trusts the result still catches a too-new schema if (somehow)
+    # the pre-parse check above is bypassed. Redundant on the happy path
+    # but cheap and self-documenting. If parse_contract starts being more
+    # permissive about version typing, this guard stays in force.
     if contract.contract_schema_version > CONTRACT_SCHEMA_VERSION:
         raise SystemExit(
             f"ERROR: contract.json declares contract_schema_version="
