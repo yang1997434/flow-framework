@@ -519,6 +519,15 @@ def _has_auto_engaged_for(
         # and silently restart — exactly the silent-degeneration mode
         # the §6 contradiction-fix prohibits).
         raise
+    # Codex T5 R2 [P2] — scan EVERY line before returning. Original code
+    # short-circuited on first matching `auto_engaged` event, which meant a
+    # corruption AFTER a valid match was silently ignored. That bypass let
+    # `clean_post_engagement` win when the journal actually has an integrity
+    # problem the operator must see. Track match in a flag, fall through to
+    # the end-of-loop, and return the match only after every line has been
+    # validated. Any malformed line raises JournalCorruptError before we
+    # return — caller routes to `interrupted_journal_corrupt`.
+    matched = False
     for line_no, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
         if not line:
@@ -544,8 +553,10 @@ def _has_auto_engaged_for(
         if (rec.get("event") == "auto_engaged"
                 and rec.get("run_id") == run_id
                 and rec.get("task_id") == task_id):
-            return True
-    return False
+            matched = True
+            # Do NOT return early — keep scanning so a corruption after the
+            # match still fails closed.
+    return matched
 
 
 def detect_auto_prepare_state(

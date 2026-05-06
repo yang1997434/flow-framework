@@ -568,6 +568,24 @@ class TestJournalCorruptFailClosed(unittest.TestCase):
         self.assertTrue(r.get("journal_corrupt"))
         self.assertIn("parse_error", r)
 
+    def test_corruption_after_match_still_raises(self):
+        """Codex T5 R2 [P2]: a valid match followed by a corrupt line
+        used to short-circuit (return True before reaching the corruption).
+        That bypassed `interrupted_journal_corrupt` and let
+        `clean_post_engagement` win even though the journal has an
+        integrity problem the operator must see. Now scans the whole
+        file and raises after seeing the corruption, regardless of
+        match position."""
+        path = self.task_dir / "decisions.jsonl"
+        path.write_text(
+            json.dumps({"event": "auto_engaged", "run_id": "run-1",
+                        "task_id": "T1"}) + "\n"
+            + '{"event": "trailing_corrupt"',  # truncated
+            encoding="utf-8",
+        )
+        with self.assertRaises(JournalCorruptError):
+            _has_auto_engaged_for(self.task_dir, "run-1", "T1")
+
     def test_control_clean_journal_no_auto_engaged_returns_false(self):
         """Control: a clean journal containing other events but no
         `auto_engaged` returns False normally (no spurious raise)."""
