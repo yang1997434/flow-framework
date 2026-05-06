@@ -207,6 +207,31 @@ class TestAppendAcceptanceProgress(unittest.TestCase):
         with self.assertRaises(ValueError):
             append_acceptance_progress(self.task_dir, ev)
 
+    def test_rejects_started_with_any_outcome_field(self):
+        """Codex T4 R1 [P2]: `started` must reject ALL outcome fields,
+        not just completed_at/status/duration_ms. A caller using
+        `dataclasses.replace(completed_ev, event="started")` could
+        leak exit_code / log paths / command_hash into a "started"
+        line, confusing T9's tail reader."""
+        leak_cases = [
+            ("exit_code", 0),
+            ("stdout_log_path", "/tmp/log.out"),
+            ("stderr_log_path", "/tmp/log.err"),
+            ("command_hash", "abc123"),
+        ]
+        for field_name, value in leak_cases:
+            with self.subTest(field=field_name):
+                kwargs = {field_name: value}
+                ev = replace(_make_started_event(), **kwargs)
+                with self.assertRaises(ValueError) as ctx:
+                    append_acceptance_progress(self.task_dir, ev)
+                msg = str(ctx.exception)
+                self.assertIn(field_name, msg)
+                # File must not be created
+                self.assertFalse(
+                    (self.task_dir / "acceptance-progress.jsonl").exists()
+                )
+
     def test_rejects_completed_without_status(self):
         ev = _make_completed_event(status=None)
         with self.assertRaises(ValueError):

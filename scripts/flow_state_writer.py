@@ -214,14 +214,28 @@ def _validate_progress_event(ev: AcceptanceProgressEvent) -> None:
             f"idempotent must be in {VALID_PROGRESS_IDEMPOTENT}, "
             f"got {ev.idempotent!r}"
         )
-    # Lifecycle invariants (Q6.1 schema):
+    # Lifecycle invariants (Q6.1 schema): `started` events MUST have ALL
+    # outcome fields = None. Codex T4 R1 [P2]: original check only covered
+    # 3 of 7 outcome fields; a caller using `dataclasses.replace(completed_ev,
+    # event="started")` could write a "started" line carrying exit_code /
+    # log paths / command_hash — confusing T9's tail reader. Reject all 7.
+    _OUTCOME_FIELDS = (
+        "completed_at", "status", "duration_ms",
+        "exit_code", "stdout_log_path", "stderr_log_path", "command_hash",
+    )
     if ev.event == "started":
-        if (ev.completed_at is not None or ev.status is not None
-                or ev.duration_ms is not None):
+        leaked = [
+            f for f in _OUTCOME_FIELDS if getattr(ev, f) is not None
+        ]
+        if leaked:
             raise ValueError(
-                "started event must have completed_at/status/duration_ms = None"
+                f"started event must have all outcome fields = None; "
+                f"got non-None: {leaked}"
             )
     else:  # completed | timeout
+        # Required outcome fields: completed_at + status + duration_ms.
+        # exit_code / log paths / command_hash remain optional per design
+        # (e.g., file_exists method has no exit code). Don't over-tighten.
         if (ev.completed_at is None or ev.status is None
                 or ev.duration_ms is None):
             raise ValueError(
