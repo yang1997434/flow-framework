@@ -49,7 +49,7 @@ class TestOrchestratorRejectsTooNewSchema(unittest.TestCase):
         )
         # Hard-reject, exit non-zero, message names the version mismatch.
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("schema_version", r.stderr.lower())
+        self.assertIn("contract_schema_version", r.stderr.lower())
         self.assertIn("999", r.stderr)
 
     def test_dry_run_also_rejects_too_new(self):
@@ -62,6 +62,7 @@ class TestOrchestratorRejectsTooNewSchema(unittest.TestCase):
             text=True,
         )
         self.assertNotEqual(r.returncode, 0)
+        self.assertIn("contract_schema_version", r.stderr.lower())
         self.assertIn("999", r.stderr)
 
 

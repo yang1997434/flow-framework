@@ -95,14 +95,12 @@ def build_plan(slug: str) -> OrchestratorPlan:
     # Fail-closed at the orchestrator boundary covers BOTH --dry-run and
     # --auto-execute (the caller routes through build_plan in both paths).
     if contract.contract_schema_version > CONTRACT_SCHEMA_VERSION:
-        print(
+        raise SystemExit(
             f"ERROR: contract.json declares contract_schema_version="
             f"{contract.contract_schema_version} but this flow runtime "
             f"knows up to {CONTRACT_SCHEMA_VERSION}. Upgrade flow OR "
-            f"downgrade the contract.",
-            file=sys.stderr,
+            f"downgrade the contract."
         )
-        sys.exit(1)
 
     plan.contract = contract
     plan.autonomy_mode = contract.autonomy_mode
@@ -185,9 +183,10 @@ def _cmd_auto_execute(slug: str) -> int:
     # T2 R11: parse + ceiling-check the contract FIRST so a too-new schema
     # fails closed with a precise version-mismatch message rather than the
     # generic "v0.8.0 disabled" stub. build_plan() does the parse + ceiling
-    # enforcement and sys.exit(1)'s on a too-new schema; if it returns we
-    # know the contract is parseable and ≤ runtime version, then we still
-    # refuse v0.8.0 dispatch with the long-standing not-yet-implemented msg.
+    # enforcement and raises SystemExit on a too-new schema; if it returns
+    # we know the contract is parseable and ≤ runtime version, then we
+    # still refuse v0.8.0 dispatch with the long-standing not-yet-implemented msg.
+    # Parse + R11 ceiling check; raises SystemExit on too-new schema before we hit the v0.8.0 stub.
     build_plan(slug)
     print(
         "ERROR: v0.8.0 does not support autonomous dispatch. "
