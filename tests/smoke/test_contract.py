@@ -204,6 +204,131 @@ class TestParseContract(unittest.TestCase):
         c = parse_contract(path)
         self.assertTrue(c.acceptance_criteria[0].post_merge_skip)
 
+    # ------------------------------------------------------------------
+    # M1: per-method required-field check (cmd→command, file_exists→path,
+    # http→url, json_query→json_query). Without this a misconfigured
+    # criterion parses as command=None and explodes later in T6/T7.
+    # ------------------------------------------------------------------
+
+    def test_method_cmd_requires_command(self):
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "x", "type": "unit", "method": "cmd",
+            }],
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        msg = str(ctx.exception)
+        self.assertIn("method='cmd'", msg)
+        self.assertIn("'command'", msg)
+
+    def test_method_file_exists_requires_path(self):
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "x", "type": "smoke", "method": "file_exists",
+            }],
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        self.assertIn("method='file_exists'", str(ctx.exception))
+        self.assertIn("'path'", str(ctx.exception))
+
+    def test_method_http_requires_url(self):
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "x", "type": "integration", "method": "http",
+            }],
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        self.assertIn("method='http'", str(ctx.exception))
+        self.assertIn("'url'", str(ctx.exception))
+
+    def test_method_json_query_requires_json_query(self):
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "x", "type": "smoke", "method": "json_query",
+            }],
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        self.assertIn("method='json_query'", str(ctx.exception))
+        self.assertIn("'json_query'", str(ctx.exception))
+
+    # ------------------------------------------------------------------
+    # M2: _infer_method error must include criterion index, like all other
+    # criterion errors. The index makes the error actionable when many
+    # criteria are present.
+    # ------------------------------------------------------------------
+
+    def test_infer_method_error_includes_criterion_index(self):
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [
+                {"description": "ok", "type": "unit", "method": "cmd",
+                 "command": "true"},
+                {"description": "broken", "type": "unit"},  # idx=1
+            ],
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        self.assertIn("acceptance_criteria[1]", str(ctx.exception))
+
+    # ------------------------------------------------------------------
+    # L1: idempotent.timeout_sec must be > 0 (matches criterion-level rule).
+    # ------------------------------------------------------------------
+
+    def test_idempotent_timeout_zero_rejected(self):
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "x", "type": "smoke", "method": "cmd",
+                "command": "true", "timeout_sec": 30,
+                "idempotent": {
+                    "value": True, "rationale": "stub",
+                    "timeout_sec": 0,
+                    "side_effect_class": "read_only",
+                },
+            }],
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        self.assertIn("idempotent.timeout_sec", str(ctx.exception))
+        self.assertIn("positive", str(ctx.exception))
+
+    # ------------------------------------------------------------------
+    # N1: budget.max_codex_rounds_per_task must be >= 1. 0 is meaningless;
+    # to disable codex review, remove the codex hook instead.
+    # ------------------------------------------------------------------
+
+    def test_max_codex_rounds_per_task_zero_rejected(self):
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "interactive",
+            "created_at": "2026-05-06T00:00:00Z",
+            "budget": {"max_codex_rounds_per_task": 0},
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        self.assertIn("max_codex_rounds_per_task", str(ctx.exception))
+        self.assertIn(">= 1", str(ctx.exception))
+
     def test_criterion_default_timeout_by_method(self):
         """R7: defaults — file_exists/json_query=30s, cmd=600s, http=60s, e2e=1800s"""
         path = self._write({

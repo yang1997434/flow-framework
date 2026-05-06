@@ -40,6 +40,15 @@ VALID_CRITERION_TYPES = (
     "unit", "integration", "e2e", "smoke", "behavior", "regression",
 )
 VALID_CRITERION_METHODS = ("cmd", "file_exists", "json_query", "http")
+# T1 M1: per-method required-field map. Enforced after method validation so a
+# criterion like {method: "cmd"} without `command` fails-closed at parse time
+# rather than blowing up later in T6/T7 with a less actionable error.
+REQUIRED_FIELD_BY_METHOD = {
+    "cmd": "command",
+    "file_exists": "path",
+    "http": "url",
+    "json_query": "json_query",
+}
 VALID_SIDE_EFFECT_CLASSES = ("pure", "read_only", "cache_only", "reversible")
 KNOWN_IRREVERSIBLE = (
     "push_main", "release_tag", "schema_migration",
@@ -90,7 +99,11 @@ class AcceptanceCriterion:
     path: Optional[str] = None
     url: Optional[str] = None
     json_query: Optional[str] = None
-    timeout_sec: Optional[int] = None  # R7 — never None after parse_contract
+    # R7: parse_contract always overwrites this with a positive value via
+    # _default_timeout_for_method or the explicit field. The 0 placeholder
+    # exists only because dataclass requires a default for fields after this
+    # one; reading 0 in production is a parser bug.
+    timeout_sec: int = 0
     # R8 hardened: {value: bool, rationale: str, timeout_sec: int,
     #               side_effect_class: pure|read_only|cache_only|reversible}
     idempotent: Optional[dict] = None
@@ -118,14 +131,19 @@ class Contract:
     post_merge_regression_optional: bool = False
     # T1 R9: notification dict supersedes the v0.8.0 standalone field.
     # Shape: {command: str|None, throttle_min: int, tier2_enabled: bool}.
+    # NOTE: the standalone top-level `notification_command` field was removed
+    # in v0.8.1 (no shim). CHANGELOG breaking-change note added at T23 release.
     notification: dict = field(default_factory=lambda: dict(DEFAULT_NOTIFICATION))
     afk_timeout_min: Optional[int] = None
     afk_on_timeout: Optional[str] = None
     unknown_fields: list[str] = field(default_factory=list)
 
 
-def _infer_method(c: dict) -> str:
-    """v0.8.0 contracts wrote `command` only (no `method`). Infer for compat."""
+def _infer_method(c: dict, idx: int) -> str:
+    """v0.8.0 contracts wrote `command` only (no `method`). Infer for compat.
+
+    M2: idx is included in the error message so it matches sibling validators.
+    """
     if "command" in c:
         return "cmd"
     if "path" in c:
@@ -135,8 +153,8 @@ def _infer_method(c: dict) -> str:
     if "json_query" in c:
         return "json_query"
     raise ContractError(
-        "acceptance_criterion missing method (and no command/path/url/json_query "
-        "to infer from)"
+        f"acceptance_criteria[{idx}] missing method (and no command/path/url/"
+        f"json_query to infer from)"
     )
 
 
@@ -163,9 +181,13 @@ def _validate_idempotent_object(idem: dict, idx: int) -> dict:
             f"acceptance_criteria[{idx}].idempotent.rationale must be non-empty "
             f"string"
         )
-    if not isinstance(idem["timeout_sec"], int) or isinstance(idem["timeout_sec"], bool):
+    # L1: timeout_sec must be a positive int — zero/negative verification
+    # timeouts are nonsense and match the constraint at the criterion level.
+    its = idem["timeout_sec"]
+    if isinstance(its, bool) or not isinstance(its, int) or its <= 0:
         raise ContractError(
-            f"acceptance_criteria[{idx}].idempotent.timeout_sec must be int"
+            f"acceptance_criteria[{idx}].idempotent.timeout_sec must be "
+            f"positive int"
         )
     sec = idem["side_effect_class"]
     if sec not in VALID_SIDE_EFFECT_CLASSES:
@@ -249,11 +271,21 @@ def parse_contract(path: Path) -> Contract:
 
         # R5: method orthogonal to type. Backward compat: infer from fields
         # when `method` omitted (v0.8.0 contracts had `command` only).
-        method = c.get("method") or _infer_method(c)
+        method = c.get("method") or _infer_method(c, idx)
         if method not in VALID_CRITERION_METHODS:
             raise ContractError(
-                f"acceptance_criterion.method must be one of "
+                f"acceptance_criteria[{idx}].method must be one of "
                 f"{VALID_CRITERION_METHODS}, got {method!r}"
+            )
+
+        # M1: per-method required-field check. Without this, a criterion like
+        # {"method": "cmd"} (no `command`) would parse with command=None and
+        # blow up later in T6/T7 verification with a less actionable error.
+        required_field = REQUIRED_FIELD_BY_METHOD[method]
+        if c.get(required_field) is None:
+            raise ContractError(
+                f"acceptance_criteria[{idx}] method={method!r} requires "
+                f"{required_field!r}"
             )
 
         # R7: timeout default by method (or by type=e2e override).
@@ -331,16 +363,18 @@ def parse_contract(path: Path) -> Contract:
         "tier2_enabled": tier2_raw,
     }
 
-    # T1 Q2.2: budget.max_codex_rounds_per_task default 3. Must be a positive
-    # int when explicitly set.
+    # T1 Q2.2: budget.max_codex_rounds_per_task default 3. N1: when explicitly
+    # set, must be >= 1 — `0 rounds` is meaningless (it would mean "never call
+    # codex", which is the wrong way to express that — disable codex hook
+    # instead). throttle_min=0 IS meaningful (fire every event); they differ.
     budget = dict(raw.get("budget") or {})
     mcr_raw = budget.get("max_codex_rounds_per_task")
     if mcr_raw is None:
         budget["max_codex_rounds_per_task"] = 3
     else:
-        if isinstance(mcr_raw, bool) or not isinstance(mcr_raw, int) or mcr_raw < 0:
+        if isinstance(mcr_raw, bool) or not isinstance(mcr_raw, int) or mcr_raw < 1:
             raise ContractError(
-                f"budget.max_codex_rounds_per_task must be non-negative int, "
+                f"budget.max_codex_rounds_per_task must be int >= 1, "
                 f"got {mcr_raw!r}"
             )
 
