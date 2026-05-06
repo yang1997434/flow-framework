@@ -390,12 +390,21 @@ def _get_base_commit(repo_root: Path) -> str:
     ).strip()
 
 
+def _project_root(start: Path | None = None) -> Path:
+    cur = (start or Path.cwd()).resolve()
+    while cur != cur.parent:
+        if (cur / ".flow").is_dir():
+            return cur
+        cur = cur.parent
+    return Path.cwd()
+
+
 def _cache_path_for_slug(slug: str) -> Path:
-    return REPO_ROOT / ".flow" / "tasks" / slug / "wave-decomposition.json"
+    return _project_root() / ".flow" / "tasks" / slug / "wave-decomposition.json"
 
 
 def _progress_md_for_slug(slug: str) -> Path:
-    return REPO_ROOT / ".flow" / "tasks" / slug / "progress.md"
+    return _project_root() / ".flow" / "tasks" / slug / "progress.md"
 
 
 def cli_cache_check(args) -> int:
@@ -403,7 +412,7 @@ def cli_cache_check(args) -> int:
     if cache is None:
         return 1
     plan_hash = _compute_plan_hash(_progress_md_for_slug(args.task_slug))
-    base_commit = _get_base_commit(REPO_ROOT)
+    base_commit = _get_base_commit(_project_root())
     valid = is_cache_valid(
         cache, plan_hash, base_commit, args.controller_model, PLANNER_VERSION, args.cap
     )
@@ -428,7 +437,7 @@ def cli_decompose(args) -> int:
 def cli_write_cache(args) -> int:
     progress_md = _progress_md_for_slug(args.task_slug)
     plan_hash = _compute_plan_hash(progress_md)
-    base_commit = _get_base_commit(REPO_ROOT)
+    base_commit = _get_base_commit(_project_root())
     parsed = json.loads(args.waves_json)
     # Reconstruct task objects from id list (writes/reads not needed in cache)
     tasks_from_plan = parse_plan_tasks(progress_md.read_text(encoding="utf-8"))

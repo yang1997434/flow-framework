@@ -19,6 +19,7 @@ if _common not in sys.path:
     sys.path.insert(0, _common)
 
 from glob_overlap import _matches  # reuse the regex matcher  # noqa: E402
+from flow_wave_planner import _project_root  # noqa: E402
 
 
 def diff_names_between_shas(repo_dir: str | Path, pre_sha: str, post_sha: str) -> list[str]:
@@ -59,7 +60,7 @@ def append_waiver(waiver_log_path: Path, *, task_id: str, state: str, rationale:
 
 
 def cli_diff_names(args) -> int:
-    repo = args.repo or REPO_ROOT
+    repo = args.repo or _project_root()
     files = diff_names_between_shas(repo, args.pre, args.post)
     print("\n".join(files))
     return 0
@@ -76,7 +77,7 @@ def cli_verify_subset(args) -> int:
 
 
 def cli_waive(args) -> int:
-    log_path = REPO_ROOT / ".flow" / "tasks" / args.task_slug / "wave-decisions.log"
+    log_path = _project_root() / ".flow" / "tasks" / args.task_slug / "wave-decisions.log"
     append_waiver(log_path, task_id=args.task_id, state=args.state, rationale=args.rationale)
     return 0
 

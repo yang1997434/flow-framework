@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.7.1 — 2026-05-05
+
+### Fixed
+
+- **`flow waves` + `flow_wave_runner` user-data path resolution**
+  (`scripts/flow_wave_planner.py`, `scripts/flow_wave_runner.py`):
+  six callsites resolved against the framework `REPO_ROOT`
+  (= `Path(__file__).parent.parent`, i.e. flow-framework's own checkout)
+  instead of the user's project:
+  - `_progress_md_for_slug()` and `_cache_path_for_slug()` (planner)
+  - the two `_get_base_commit()` calls in `cli_cache_check` / `cli_write_cache` (planner)
+  - the `--repo` default in `cli_diff_names` (runner) — per-task git-diff verifier
+  - the waiver log path in `cli_waive` (runner) — `wave-decisions.log` writer
+
+  Symptoms: `flow waves --preview <slug>` invoked from any project other than
+  flow-framework itself failed with `ERROR: progress.md not found for <slug>`;
+  `cli_write_cache` and `cli_waive` would write artifacts under the framework
+  directory rather than the project's `.flow/tasks/<slug>/`; `cli_diff_names`
+  would diff the framework's git history when `--repo` was omitted.
+
+  Fix: introduce `_project_root()` in `flow_wave_planner.py` that walks
+  `Path.cwd()` up looking for a `.flow/` directory (mirrors
+  `common.paths.get_project_root()` behavior), then route the six user-data
+  path/git lookups through it. `flow_wave_runner.py` imports the helper from
+  the planner module to stay DRY. SHARED_ARTIFACTS and `sys.path` setup
+  continue to use framework `REPO_ROOT` (correctly — they refer to
+  framework-shipped assets).
+
+### Tests
+
+- New `TestProjectRoot` in `tests/smoke/test_wave_planner.py`: 5 cases
+  covering project-dir cwd, nested-subdir cwd, fallback when no `.flow`
+  ancestor exists (skipped automatically if the OS tempdir itself sits under
+  a `.flow` chain), and explicit assertions that progress.md / cache paths
+  do **not** leak into the framework directory. Uses `addCleanup` to
+  restore cwd and `shutil.rmtree` the tmpdir.
+- New `TestWaveRunnerCLIPathResolution` in
+  `tests/smoke/test_wave_runner_helpers.py`: 2 cases covering the two
+  runner CLI fixes — `cli_diff_names` defaults to project root when
+  `--repo` is omitted (drives a real throwaway git repo), and `cli_waive`
+  writes its log under the project (not the framework).
+- Suite total grows 18 → 23 (planner) and 6 → 8 (runner); full smoke
+  247 → 249 passing; `flow_selftest.py` PASSED.
+
+### Migration
+
+Pure bugfix — no schema, capability, or CLI surface changes. Re-run
+`flow install render-prompts` is **not** required (no rendered prompts
+touched). After upgrading, `flow waves --preview <slug>` works from any
+project containing a `.flow/` directory.
+
 ## v0.7.0 — 2026-05-05
 
 ### Major: Dependency-aware parallel subagent dispatch

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -10,7 +11,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from flow_wave_planner import parse_plan_tasks, Task, PlanError, _parse_task_yaml  # noqa: E402
+from flow_wave_planner import (  # noqa: E402
+    parse_plan_tasks,
+    Task,
+    PlanError,
+    _parse_task_yaml,
+    _project_root,
+    _progress_md_for_slug,
+    _cache_path_for_slug,
+)
 
 
 class TestParsePlanTasks(unittest.TestCase):
@@ -242,6 +251,78 @@ class TestWaveCache(unittest.TestCase):
         self.assertFalse(is_cache_valid(cached, "abc", "def", "m2", "1.0.0", 3))   # model upgrade
         self.assertFalse(is_cache_valid(cached, "abc", "def", "m1", "2.0.0", 3))   # planner version
         self.assertFalse(is_cache_valid(cached, "abc", "def", "m1", "1.0.0", 4))   # cap changed
+
+
+class TestProjectRoot(unittest.TestCase):
+    """Regression tests for v0.7.1 — `flow waves --preview` resolved
+    user-data paths against the framework REPO_ROOT instead of the user's
+    project, so it could not find progress.md when invoked from any project
+    other than flow-framework itself.
+    """
+
+    def setUp(self):
+        import shutil
+        self._cwd = Path.cwd()
+        self.tmpdir = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.addCleanup(os.chdir, self._cwd)
+
+    def _has_flow_ancestor(self, p: Path) -> bool:
+        cur = p.resolve()
+        while cur != cur.parent:
+            if (cur / ".flow").is_dir():
+                return True
+            cur = cur.parent
+        return False
+
+    def test_project_root_from_project_dir(self):
+        (self.tmpdir / ".flow").mkdir()
+        os.chdir(self.tmpdir)
+        self.assertEqual(_project_root(), self.tmpdir)
+
+    def test_project_root_from_nested_subdir(self):
+        (self.tmpdir / ".flow").mkdir()
+        nested = self.tmpdir / "apps" / "eval-engine"
+        nested.mkdir(parents=True)
+        os.chdir(nested)
+        self.assertEqual(_project_root(), self.tmpdir)
+
+    def test_project_root_falls_back_to_cwd_when_no_flow_ancestor(self):
+        # No .flow anywhere in the chain — fall back to cwd. Skip if the
+        # OS tempdir itself is nested under a `.flow`-containing project
+        # (rare but possible if TMPDIR points inside a flow workspace).
+        leaf = self.tmpdir / "no-flow-here"
+        leaf.mkdir()
+        if self._has_flow_ancestor(leaf.parent):
+            self.skipTest("tempdir nested under a `.flow` ancestor; cannot test fallback")
+        os.chdir(leaf)
+        self.assertEqual(_project_root(), leaf.resolve())
+
+    def test_progress_md_resolves_to_project_not_framework(self):
+        (self.tmpdir / ".flow").mkdir()
+        os.chdir(self.tmpdir)
+        path = _progress_md_for_slug("my-task")
+        self.assertEqual(
+            path, self.tmpdir / ".flow" / "tasks" / "my-task" / "progress.md"
+        )
+        # Must NOT be under flow-framework's REPO_ROOT
+        self.assertFalse(
+            str(path).startswith(str(REPO_ROOT) + os.sep),
+            f"path leaked into framework dir: {path}",
+        )
+
+    def test_cache_path_resolves_to_project_not_framework(self):
+        (self.tmpdir / ".flow").mkdir()
+        os.chdir(self.tmpdir)
+        path = _cache_path_for_slug("my-task")
+        self.assertEqual(
+            path,
+            self.tmpdir / ".flow" / "tasks" / "my-task" / "wave-decomposition.json",
+        )
+        self.assertFalse(
+            str(path).startswith(str(REPO_ROOT) + os.sep),
+            f"path leaked into framework dir: {path}",
+        )
 
 
 if __name__ == "__main__":
