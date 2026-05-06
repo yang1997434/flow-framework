@@ -348,6 +348,181 @@ class TestParseContract(unittest.TestCase):
         self.assertEqual(c.acceptance_criteria[2].timeout_sec, 60)   # http
         self.assertEqual(c.acceptance_criteria[3].timeout_sec, 1800) # e2e
 
+    # ------------------------------------------------------------------
+    # C1 (codex review): explicit invalid `method` values must NOT fall
+    # through to v0.8.0-compat inference. Only a missing `method` KEY
+    # triggers inference. Fail-closed posture: `""`, `0`, `False`, `None`
+    # are explicit values, not "absent". Each must raise the standard
+    # "method must be one of …" ContractError, NOT the inference-path
+    # "missing method" message.
+    # ------------------------------------------------------------------
+
+    def test_method_empty_string_rejected_no_inference(self):
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "x", "type": "unit",
+                "method": "",
+                "command": "true",  # would-be inferable
+            }],
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        msg = str(ctx.exception)
+        self.assertIn("method must be one of", msg)
+        self.assertIn("acceptance_criteria[0]", msg)
+        self.assertNotIn("missing method", msg)  # not the inference-path msg
+
+    def test_method_zero_rejected_no_inference(self):
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "x", "type": "unit",
+                "method": 0,
+                "command": "true",
+            }],
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        msg = str(ctx.exception)
+        self.assertIn("method must be one of", msg)
+        self.assertNotIn("missing method", msg)
+
+    def test_method_false_rejected_no_inference(self):
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "x", "type": "unit",
+                "method": False,
+                "command": "true",
+            }],
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        msg = str(ctx.exception)
+        self.assertIn("method must be one of", msg)
+        self.assertNotIn("missing method", msg)
+
+    def test_method_null_rejected_no_inference(self):
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "x", "type": "unit",
+                "method": None,
+                "command": "true",
+            }],
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        msg = str(ctx.exception)
+        self.assertIn("method must be one of", msg)
+        self.assertNotIn("missing method", msg)
+
+    def test_explicit_valid_method_still_parses(self):
+        """C1 control: explicit valid method + correct field still works."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "x", "type": "unit",
+                "method": "cmd", "command": "true",
+            }],
+        })
+        c = parse_contract(path)
+        self.assertEqual(c.acceptance_criteria[0].method, "cmd")
+        self.assertEqual(c.acceptance_criteria[0].command, "true")
+
+    # ------------------------------------------------------------------
+    # C2 (codex review): e2e criteria CANNOT carry idempotent overrides.
+    # Per design v0.8.1-execution-semantics §6 R8 table row `e2e`:
+    # "always non-idempotent | NO override accepted". T9 always blocks
+    # in-flight e2e regardless; accepting the field would let the contract
+    # silently lie about a safety property the runtime refuses to honor.
+    # ------------------------------------------------------------------
+
+    def test_e2e_with_idempotent_true_override_rejected(self):
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "playwright login flow",
+                "type": "e2e",
+                "method": "cmd",
+                "command": "playwright test login",
+                "timeout_sec": 1800,
+                "idempotent": {
+                    "value": True,
+                    "rationale": "claims to be read-only",
+                    "timeout_sec": 60,
+                    "side_effect_class": "read_only",
+                },
+            }],
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        msg = str(ctx.exception)
+        self.assertIn("e2e", msg)
+        self.assertIn("idempotent", msg)
+        self.assertIn("acceptance_criteria[0]", msg)
+
+    def test_e2e_with_idempotent_false_override_also_rejected(self):
+        """Design says NO override accepted — even value=false is forbidden,
+        because the field's mere presence implies the contract is trying
+        to negotiate the rule. Runtime always blocks regardless."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "playwright login flow",
+                "type": "e2e",
+                "method": "cmd",
+                "command": "playwright test login",
+                "timeout_sec": 1800,
+                "idempotent": {
+                    "value": False,
+                    "rationale": "explicit non-idempotent",
+                    "timeout_sec": 60,
+                    "side_effect_class": "reversible",
+                },
+            }],
+        })
+        with self.assertRaises(ContractError) as ctx:
+            parse_contract(path)
+        msg = str(ctx.exception)
+        self.assertIn("e2e", msg)
+        self.assertIn("idempotent", msg)
+
+    def test_e2e_without_idempotent_field_parses_fine(self):
+        """C2 control: e2e criteria with no idempotent override must still
+        parse normally (proves we didn't break valid e2e contracts)."""
+        path = self._write({
+            "contract_schema_version": CONTRACT_SCHEMA_VERSION,
+            "autonomy_mode": "auto",
+            "created_at": "2026-05-06T00:00:00Z",
+            "acceptance_criteria": [{
+                "description": "playwright login flow",
+                "type": "e2e",
+                "method": "cmd",
+                "command": "playwright test login",
+            }],
+        })
+        c = parse_contract(path)
+        crit = c.acceptance_criteria[0]
+        self.assertEqual(crit.type, "e2e")
+        self.assertIsNone(crit.idempotent)
+        self.assertEqual(crit.timeout_sec, 1800)  # e2e default
+
 
 class TestContractInvalidCases(unittest.TestCase):
     def setUp(self):

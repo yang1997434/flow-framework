@@ -270,13 +270,22 @@ def parse_contract(path: Path) -> Contract:
             )
 
         # R5: method orthogonal to type. Backward compat: infer from fields
-        # when `method` omitted (v0.8.0 contracts had `command` only).
-        method = c.get("method") or _infer_method(c, idx)
-        if method not in VALID_CRITERION_METHODS:
-            raise ContractError(
-                f"acceptance_criteria[{idx}].method must be one of "
-                f"{VALID_CRITERION_METHODS}, got {method!r}"
-            )
+        # ONLY when `method` key is absent (v0.8.0 contracts had `command`
+        # only). C1 fail-closed: an explicit falsy/invalid value (`""`, `0`,
+        # `False`, `None`, etc.) must NOT fall through to inference — that
+        # silently rescues a typo'd contract. Only a missing key triggers
+        # v0.8.0-compat inference.
+        if "method" in c:
+            method = c["method"]
+            if method not in VALID_CRITERION_METHODS:
+                raise ContractError(
+                    f"acceptance_criteria[{idx}].method must be one of "
+                    f"{VALID_CRITERION_METHODS}, got {method!r}"
+                )
+        else:
+            method = _infer_method(c, idx)
+            # _infer_method always returns a value in VALID_CRITERION_METHODS
+            # (or raises) so no post-check needed here.
 
         # M1: per-method required-field check. Without this, a criterion like
         # {"method": "cmd"} (no `command`) would parse with command=None and
@@ -303,7 +312,19 @@ def parse_contract(path: Path) -> Contract:
             timeout_sec = ts_raw
 
         # R8: idempotent override object validation (when present).
+        # C2: e2e criteria CANNOT carry an idempotent override at all. Per
+        # design v0.8.1-execution-semantics §6 R8 table row `e2e`: "always
+        # non-idempotent | NO override accepted". T9 will always treat
+        # in-flight e2e as block_in_flight regardless of any value here, so
+        # accepting the field would let the contract silently lie about a
+        # safety property the runtime refuses to honor. Reject at parse time.
         idem_raw = c.get("idempotent")
+        if idem_raw is not None and c["type"] == "e2e":
+            raise ContractError(
+                f"acceptance_criteria[{idx}] type=e2e cannot specify "
+                f"idempotent override (T9 always blocks in-flight e2e "
+                f"regardless; design §6 R8 forbids any e2e idempotent override)"
+            )
         idempotent = (
             _validate_idempotent_object(idem_raw, idx)
             if idem_raw is not None else None
