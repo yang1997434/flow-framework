@@ -56,6 +56,25 @@ def section(title: str) -> None:
     print(f"\n>> {title}")
 
 
+def _safe_print_str(s: object, max_len: int = 200) -> str:
+    """[Codex round-1 P2 R-class] Escape disk-derived strings before
+    printing to terminal. Strips ANSI escape sequences and other control
+    bytes that a malicious worktree name / slug / contract field could
+    inject (e.g. `\\x1b[31m...` to recolor doctor output, or BEL/OSC
+    sequences). Truncates to `max_len`.
+
+    Same pattern as the T16 OSC 9 sanitizer applied to notification
+    payloads — extends it to the doctor output layer.
+    """
+    if not isinstance(s, str):
+        return repr(s)[:max_len]
+    safe = "".join(
+        ch for ch in s
+        if (0x20 <= ord(ch) < 0x7f) or ch == "\t"
+    )
+    return safe[:max_len]
+
+
 def check_system_commands(deps: dict) -> int:
     section("System commands")
     missing_required = 0
@@ -562,7 +581,10 @@ def check_staleness() -> int:
         try:
             contract_data = json.loads(contract_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as e:
-            warn(f"{slug}: contract.json unreadable — {type(e).__name__}: {e}")
+            warn(
+                f"{_safe_print_str(slug)}: contract.json unreadable — "
+                f"{type(e).__name__}: {e}"
+            )
             continue
 
         # L-class guard (code-review [85]): defend every `.get()` chain
@@ -573,7 +595,10 @@ def check_staleness() -> int:
         # Same defensive pattern flow_staleness.py uses internally;
         # this extends it to the doctor wire-up that reads the contract.
         if not isinstance(contract_data, dict):
-            warn(f"{slug}: contract.json top-level is not a dict; skipping")
+            warn(
+                f"{_safe_print_str(slug)}: "
+                f"contract.json top-level is not a dict; skipping"
+            )
             continue
 
         integration_target = contract_data.get("integration_target")
@@ -652,28 +677,46 @@ def check_staleness() -> int:
             baseline_was_passing=True,
             baseline_timeout_sec=300,
         )
-        # R-class: do not echo unfiltered slug content (slugs are
-        # validated upstream but defense-in-depth — repr() prevents
-        # control chars).
-        slug_safe = repr(slug)[1:-1]  # strip surrounding quotes
+        # R-class: every disk-derived string (slug, wt.name,
+        # integration_target, contract field strings) is run through
+        # `_safe_print_str` before terminal output to strip ANSI / BEL
+        # / control bytes a malicious worktree dir name or slug could
+        # carry.
+        slug_safe = _safe_print_str(slug)
+        wt_name_safe = _safe_print_str(wt.name)
         if verdict.stale:
             stale_count += 1
             warn(
                 f"{slug_safe}: STALE — triggers: "
                 f"{', '.join(verdict.triggered)}",
-                detail=f"worktree: {wt.name}",
+                detail=f"worktree: {wt_name_safe}",
             )
             for trig, det in verdict.details.items():
                 if not isinstance(det, dict):
                     continue
+                # If detector skipped (empty-snapshot path), surface
+                # that explicitly so the operator knows v0.8.1
+                # doctor-only mode is the reason there's no signal.
+                if "skipped" in det:
+                    print(
+                        f"      {trig}: skipped — "
+                        f"{_safe_print_str(det.get('skipped', ''))}"
+                    )
+                    continue
                 if trig == "base_branch":
+                    target_safe = _safe_print_str(
+                        det.get("integration_target", "?")
+                    )
                     print(f"      base_branch: "
                           f"{det.get('from_commit', '?')[:7]} → "
                           f"{det.get('to_commit', '?')[:7]} "
-                          f"({det.get('integration_target', '?')})")
+                          f"({target_safe})")
                 elif trig in ("lockfile", "dep_version"):
                     changed = det.get("changed", [])
-                    print(f"      {trig}: {', '.join(repr(x)[1:-1] for x in changed)}")
+                    print(
+                        f"      {trig}: "
+                        f"{', '.join(_safe_print_str(x) for x in changed)}"
+                    )
                 elif trig == "prd_mtime":
                     print(f"      prd_mtime: snapshot="
                           f"{det.get('snapshot_mtime', 0):.0f} "
@@ -684,8 +727,18 @@ def check_staleness() -> int:
         else:
             ok(
                 f"{slug_safe}: clean",
-                detail=f"worktree: {wt.name}",
+                detail=f"worktree: {wt_name_safe}",
             )
+            # Surface any "skipped" trigger details even on the clean
+            # branch so the operator can tell whether triggers 2/3/4
+            # actually ran or skipped due to the v0.8.1 empty-snapshot
+            # mode (codex round-1 P2 visibility).
+            for trig, det in verdict.details.items():
+                if isinstance(det, dict) and "skipped" in det:
+                    print(
+                        f"      {trig}: skipped — "
+                        f"{_safe_print_str(det.get('skipped', ''))}"
+                    )
 
     if active_count == 0:
         ok("no active task worktrees — nothing to check")

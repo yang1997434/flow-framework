@@ -248,6 +248,15 @@ class StalenessChecker:
         self.repo_root = repo_root
         self.ctx = ctx
         self.task_dir = task_dir
+        # L-class (codex round-1 P3): reject corrupt persistence input
+        # before dict() coerces a str/list into something silently wrong.
+        # None / empty-dict remain valid (doctor passes empty in v0.8.1
+        # while orchestrator wire-up is deferred to v0.8.2).
+        if baseline_snapshot is not None and not isinstance(baseline_snapshot, dict):
+            raise TypeError(
+                "baseline_snapshot must be dict or None; got "
+                f"{type(baseline_snapshot).__name__}"
+            )
         # Defensive copy — snapshot is read-only inside the checker.
         self.baseline_snapshot = dict(baseline_snapshot or {})
 
@@ -330,12 +339,28 @@ class StalenessChecker:
     ) -> tuple[bool, dict]:
         """Compare current lockfile hashes against `snapshot` dict.
 
-        L-class type-check: the snapshot value MUST be a str before we
-        compare — a corrupt entry (e.g. None / int / list) does NOT
-        silently equal a hex hash and trigger a false negative. We treat
-        non-str entries as "no recorded hash" → a present current file
-        with no recorded hash counts as "added".
+        [Codex round-1 P2] If `snapshot` is empty / missing, we cannot
+        distinguish "newly added" from "always existed" — every present
+        lockfile would otherwise be reported as "added" and the v0.8.1
+        doctor (which currently passes empty snapshots because task-start
+        snapshot capture is v0.8.2 orchestrator scope) would false-
+        positive on every active task. Skip with explicit detail rather
+        than spam.
+
+        L-class type-check: when a baseline IS present, snapshot value
+        MUST be a str before we compare — a corrupt entry (e.g. None /
+        int / list) does NOT silently equal a hex hash and trigger a
+        false negative. Non-str entries are treated as "no recorded
+        hash" → a present current file with no recorded hash counts as
+        "added".
         """
+        if not snapshot:
+            return (False, {
+                "skipped": (
+                    "no task-start snapshot available "
+                    "(v0.8.2 orchestrator wire-up deferred)"
+                ),
+            })
         current = cls.snapshot_lockfiles(repo_root)
         changed: list[str] = []
         for name, recorded in snapshot.items():
@@ -367,6 +392,12 @@ class StalenessChecker:
     ) -> tuple[bool, dict]:
         """True iff prd.md mtime advanced past `snapshot_mtime`.
 
+        [Codex round-1 P2] When `snapshot_mtime <= 0.0` we have no
+        baseline (v0.8.1 doctor-only mode passes 0.0 because task-start
+        snapshot capture is v0.8.2 orchestrator scope). Any existing
+        prd.md would otherwise satisfy `current_mtime > 0.0` and
+        false-positive every active task. Skip with explicit detail.
+
         D5 typed except: missing prd.md is reported with `reason`
         instead of trigger-firing — a deleted prd.md is a different
         anomaly the doctor surfaces separately (and `<= snapshot` would
@@ -374,6 +405,17 @@ class StalenessChecker:
         """
         if not isinstance(prd_path, Path):
             return (False, {"reason": "prd_path not a Path"})
+        # L-class: snapshot must be numeric — anything else means "no
+        # recorded mtime", treat as zero (then skip below).
+        if not isinstance(snapshot_mtime, (int, float)):
+            snapshot_mtime = 0.0
+        if snapshot_mtime <= 0.0:
+            return (False, {
+                "skipped": (
+                    "no task-start snapshot available "
+                    "(v0.8.2 orchestrator wire-up deferred)"
+                ),
+            })
         try:
             if not prd_path.is_file():
                 return (False, {"reason": "prd.md missing"})
@@ -383,10 +425,6 @@ class StalenessChecker:
                 "reason": "prd stat failed",
                 "error": f"{type(e).__name__}: {e}",
             })
-        # L-class: snapshot must be numeric — anything else means "no
-        # recorded mtime", treat as zero so any present file is "newer".
-        if not isinstance(snapshot_mtime, (int, float)):
-            snapshot_mtime = 0.0
         if current_mtime <= snapshot_mtime:
             return (False, {})
         return (True, {
@@ -422,7 +460,20 @@ class StalenessChecker:
     def check_dep_versions_changed(
         cls, repo_root: Path, snapshot: dict,
     ) -> tuple[bool, dict]:
-        """Same shape as `check_lockfile_changed` but for DEP_FILES."""
+        """Same shape as `check_lockfile_changed` but for DEP_FILES.
+
+        [Codex round-1 P2] Same empty-snapshot skip semantics as
+        `check_lockfile_changed`: in v0.8.1 doctor-only mode the
+        snapshot is empty, so every present dep-file would otherwise
+        report "added" and false-positive every active task.
+        """
+        if not snapshot:
+            return (False, {
+                "skipped": (
+                    "no task-start snapshot available "
+                    "(v0.8.2 orchestrator wire-up deferred)"
+                ),
+            })
         current = cls.snapshot_dep_versions(repo_root)
         changed: list[str] = []
         for name, recorded in snapshot.items():
@@ -480,10 +531,15 @@ class StalenessChecker:
             return (False, {
                 "reason": "worktree_root missing or not a directory",
             })
-        # Late import: avoid circular module load at top-level (some
-        # callers import flow_staleness without flow_orchestrator) and
-        # tolerate test environments where flow_orchestrator might not
-        # be importable (smoke runner adds scripts/ to sys.path).
+        # Late import [codex round-1 P3 doc-fix]: keeps the legacy
+        # `flow staleness` CLI lightweight. The v0.7 memory-files
+        # scanner doesn't need `flow_orchestrator`'s subprocess helpers
+        # — only trigger 5 (baseline_now_fails) does, and that's a
+        # doctor-only path. Hoisting would force every `flow staleness`
+        # invocation to load the full orchestrator module + its
+        # imports. (No circular dependency exists between
+        # flow_orchestrator and flow_staleness — `flow_orchestrator`
+        # does not import `flow_staleness`.)
         try:
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             from flow_orchestrator import _run_shell_with_pgkill  # type: ignore

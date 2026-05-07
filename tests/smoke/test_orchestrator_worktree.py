@@ -2613,13 +2613,37 @@ class TestStalenessTrigger2LockfileChanged(unittest.TestCase):
         self.assertIn("package-lock.json", details["changed"])
 
     def test_lockfile_added_triggers(self) -> None:
-        snapshot: dict = {}
+        """A lockfile present in `current` but absent from a *non-empty*
+        snapshot fires "added". Codex round-1 P2 changed empty-snapshot
+        semantics — we now use a placeholder snapshot entry for a
+        DIFFERENT lockfile so the snapshot is non-empty (no skip), then
+        verify that the freshly added Cargo.lock triggers."""
+        snapshot: dict = {
+            "package-lock.json": (
+                "0" * 64
+            ),  # non-empty placeholder for unrelated file
+        }
         (self.tmp / "Cargo.lock").write_text("hello\n")
         stale, details = StalenessChecker.check_lockfile_changed(
             self.tmp, snapshot,
         )
         self.assertTrue(stale)
         self.assertIn("Cargo.lock", details["changed"])
+
+    def test_empty_snapshot_skips_with_detail(self) -> None:
+        """[Codex round-1 P2] Empty snapshot → no trigger fires.
+        v0.8.1 doctor-only mode lacks task-start snapshot capture
+        (orchestrator wire-up deferred to v0.8.2); without a baseline
+        we cannot distinguish "newly added" from "always existed", so
+        the detector skips with a `skipped` detail rather than
+        false-positive on every active task."""
+        (self.tmp / "package-lock.json").write_text('{"v": 1}')
+        (self.tmp / "Cargo.lock").write_text("hello\n")
+        stale, details = StalenessChecker.check_lockfile_changed(
+            self.tmp, {},
+        )
+        self.assertFalse(stale)
+        self.assertIn("skipped", details)
 
     def test_corrupt_snapshot_value_falls_back_to_added(self) -> None:
         """L-class: a non-string snapshot entry (e.g. None) MUST NOT
@@ -2670,13 +2694,30 @@ class TestStalenessTrigger3PrdEdited(unittest.TestCase):
         self.assertGreater(details["current_mtime"], details["snapshot_mtime"])
 
     def test_prd_missing_does_not_trigger(self) -> None:
-        """Plan-defined: missing prd.md reports reason, doesn't trigger."""
+        """Plan-defined: missing prd.md reports reason, doesn't trigger.
+        Uses a real (non-zero) snapshot_mtime to bypass the [Codex
+        round-1 P2] empty-snapshot skip path so we exercise the
+        prd-missing path itself."""
         missing = self.task_dir / "prd.md"
         stale, details = StalenessChecker.check_prd_edited(
-            prd_path=missing, snapshot_mtime=0.0,
+            prd_path=missing, snapshot_mtime=1.0,
         )
         self.assertFalse(stale)
         self.assertIn("reason", details)
+
+    def test_prd_zero_mtime_snapshot_skips(self) -> None:
+        """[Codex round-1 P2] snapshot_mtime <= 0.0 means no baseline
+        was captured (v0.8.1 doctor-only mode passes 0.0 because
+        task-start snapshot capture is v0.8.2 orchestrator scope). Any
+        existing prd.md has mtime > 0 and would otherwise false-
+        positive every active task; we now skip with detail."""
+        prd = self.task_dir / "prd.md"
+        prd.write_text("# spec\n")
+        stale, details = StalenessChecker.check_prd_edited(
+            prd_path=prd, snapshot_mtime=0.0,
+        )
+        self.assertFalse(stale)
+        self.assertIn("skipped", details)
 
 
 class TestStalenessTrigger4DepVersionsChanged(unittest.TestCase):
@@ -2709,6 +2750,21 @@ class TestStalenessTrigger4DepVersionsChanged(unittest.TestCase):
         )
         self.assertTrue(stale)
         self.assertIn("package.json", details["changed"])
+
+    def test_empty_snapshot_skips_with_detail(self) -> None:
+        """[Codex round-1 P2] Empty snapshot → no trigger fires.
+        Mirror of the lockfile equivalent — see that test for full
+        rationale. Without a baseline (v0.8.1 doctor-only mode), every
+        present dep-file would otherwise be "added" and false-
+        positive every active task with a package.json."""
+        (self.tmp / "package.json").write_text(
+            json.dumps({"dependencies": {"foo": "^1.0.0"}})
+        )
+        stale, details = StalenessChecker.check_dep_versions_changed(
+            self.tmp, {},
+        )
+        self.assertFalse(stale)
+        self.assertIn("skipped", details)
 
 
 class TestStalenessTrigger5BaselineNowFails(unittest.TestCase):
@@ -2801,15 +2857,18 @@ class TestStalenessCheckAllAggregator(unittest.TestCase):
     def test_aggregator_lists_multiple_triggers(self) -> None:
         # Trigger 1: advance master.
         _commit_empty(self.tmp)
-        # Trigger 3: bump prd.md mtime past zero snapshot.
+        # Trigger 3: bump prd.md mtime past a real snapshot mtime.
+        # [Codex round-1 P2] snapshot_mtime=0.0 now skips, so we use a
+        # real past mtime (1.0 = epoch+1s; current prd > that always).
         prd = self.task_dir / "prd.md"
         prd.write_text("# spec\n")
-        # Use a snapshot mtime that is in the distant past so the trigger fires.
         checker = StalenessChecker(
             repo_root=self.tmp, ctx=self.ctx, task_dir=self.task_dir,
             baseline_snapshot={
                 "lockfiles": {},
-                "prd_mtime": 0.0,                # any present prd.md > 0 → trigger
+                # 1.0 = real (past) mtime, so any present prd.md > 1.0
+                # fires the trigger (vs. 0.0 which now skips).
+                "prd_mtime": 1.0,
                 "dep_versions": {},
             },
         )
@@ -2819,6 +2878,54 @@ class TestStalenessCheckAllAggregator(unittest.TestCase):
         self.assertIn("prd_mtime", verdict.triggered)
         self.assertIn("base_branch", verdict.details)
         self.assertIn("prd_mtime", verdict.details)
+
+    def test_aggregator_empty_snapshot_skips_triggers_2_3_4(self) -> None:
+        """[Codex round-1 P2] Aggregator with v0.8.1 doctor-shaped
+        empty snapshot must NOT false-positive on existing
+        lockfile/dep-file/prd.md. Triggers 1 (base_branch) + 5
+        (baseline_fail) are independent of snapshot and still run.
+        """
+        # Add a lockfile + dep-file + prd.md so triggers 2/3/4 would
+        # pre-fix fire ("added" or "current > 0").
+        (self.tmp / "package-lock.json").write_text('{"v": 1}')
+        (self.tmp / "package.json").write_text('{"name": "x"}')
+        (self.task_dir / "prd.md").write_text("# spec\n")
+        checker = StalenessChecker(
+            repo_root=self.tmp, ctx=self.ctx, task_dir=self.task_dir,
+            baseline_snapshot={
+                "lockfiles": {},
+                "prd_mtime": 0.0,
+                "dep_versions": {},
+            },
+        )
+        verdict = checker.check_all(include_baseline=False)
+        # Base branch unchanged; nothing should trigger.
+        self.assertFalse(verdict.stale)
+        self.assertEqual(verdict.triggered, [])
+
+    def test_init_rejects_non_dict_baseline_snapshot(self) -> None:
+        """[Codex round-1 P3 L-class] Constructor must isinstance-check
+        baseline_snapshot before dict()-coercing — corrupt persistence
+        (str/list) raises TypeError instead of silent reshape."""
+        with self.assertRaises(TypeError):
+            StalenessChecker(
+                repo_root=self.tmp, ctx=self.ctx, task_dir=self.task_dir,
+                baseline_snapshot="bad",  # type: ignore[arg-type]
+            )
+        with self.assertRaises(TypeError):
+            StalenessChecker(
+                repo_root=self.tmp, ctx=self.ctx, task_dir=self.task_dir,
+                baseline_snapshot=[1, 2, 3],  # type: ignore[arg-type]
+            )
+        # None and empty dict remain valid (doctor uses both).
+        StalenessChecker(
+            repo_root=self.tmp, ctx=self.ctx, task_dir=self.task_dir,
+            baseline_snapshot=None,
+        )
+        StalenessChecker(
+            repo_root=self.tmp, ctx=self.ctx, task_dir=self.task_dir,
+            baseline_snapshot={},
+        )
 
     def test_aggregator_skips_baseline_when_not_requested(self) -> None:
         """S-class: when include_baseline=False, baseline_command is
