@@ -1398,15 +1398,35 @@ class GateRunner:
             OSError,
             ValueError,
         ) as e:
+            # Codex round-3 [P2]: this halt is BEFORE gate 3 runs, not
+            # AT it. Label the verdict with a dedicated phase name so
+            # `Phase2Verdict.halted_at_gate` is structurally accurate
+            # for downstream routing + audit logs.
+            # Codex round-3 [P3]: ``str(CalledProcessError)`` only
+            # produces the "Command ... returned non-zero" message —
+            # the actual git stderr (missing .git / inode exhaustion /
+            # submodule divergence) is the actionable clue. Capture it
+            # explicitly when the exception type carries it.
+            error_msg = f"{type(e).__name__}: {e}"
+            stderr_payload = getattr(e, "stderr", None)
+            if isinstance(stderr_payload, bytes):
+                stderr_tail = stderr_payload.decode(
+                    "utf-8", errors="replace"
+                )
+            elif isinstance(stderr_payload, str):
+                stderr_tail = stderr_payload
+            else:
+                stderr_tail = ""
             return Phase2Verdict(
                 status="blocked",
-                halted_at_gate="gate3_manifest",
+                halted_at_gate="post_baseline_fact_refresh",
                 gate_result=GateResult(
                     status="inconclusive",
                     details={
-                        "gate": "gate3_manifest",
+                        "gate": "post_baseline_fact_refresh",
                         "reason": "post_baseline_fact_refresh_failed",
-                        "error": f"{type(e).__name__}: {e}",
+                        "error": error_msg,
+                        "stderr_tail": stderr_tail[-2000:],
                     },
                 ),
             )

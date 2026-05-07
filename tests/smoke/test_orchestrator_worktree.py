@@ -1171,7 +1171,9 @@ class TestRunPhase2Chain(unittest.TestCase):
 
         # Must produce a verdict (no exception escape).
         self.assertEqual(v.status, "blocked")
-        self.assertEqual(v.halted_at_gate, "gate3_manifest")
+        # Codex round-3 [P2]: halt site is BEFORE gate3 — must label
+        # accordingly so audit logs point at the real failure step.
+        self.assertEqual(v.halted_at_gate, "post_baseline_fact_refresh")
         self.assertEqual(v.gate_result.status, "inconclusive")
         self.assertEqual(
             v.gate_result.details["reason"],
@@ -1179,6 +1181,12 @@ class TestRunPhase2Chain(unittest.TestCase):
         )
         self.assertIn(
             "CalledProcessError", v.gate_result.details["error"]
+        )
+        # Codex round-3 [P3]: git stderr is the actionable clue — must
+        # be preserved in details, not dropped by str(CalledProcessError).
+        self.assertIn(
+            "fatal: not a git repository",
+            v.gate_result.details["stderr_tail"],
         )
 
     def test_run_phase2_rederive_catches_baseline_side_effects(self) -> None:
