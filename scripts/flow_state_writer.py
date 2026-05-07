@@ -183,6 +183,56 @@ _FRONTMATTER_RESERVED: frozenset[str] = frozenset({
 _FRONTMATTER_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+# Frontmatter line-separator class (codex round-3 [P2]+[P3] — extends original
+# `\n`-only / `\n|\r`-only checks across both `block_type` and
+# `frontmatter_extra` validators). Members:
+#   \n / \r          ASCII LF/CR — long-known frontmatter row separators.
+#   \x00             NUL — some YAML 1.1 parsers terminate the document
+#                    stream here; downstream tools that read `blocked.md`
+#                    via `open(..., 'r')` may also see a truncated buffer.
+#   \x85             NEL (Unicode Next-Line). YAML 1.2 §5.4 explicitly lists
+#                    NEL as a line break; PyYAML in default mode honors it.
+#     /    Unicode LINE / PARAGRAPH SEPARATOR. Python's
+#                    `str.splitlines()` treats both as line breaks (and
+#                    several YAML parsers follow Python's lead), so an
+#                    operator script that splits frontmatter line-by-line
+#                    with the stdlib helper would see forged rows even
+#                    when PyYAML itself is strict.
+# tuple form (not regex) keeps the rule readable and avoids regex
+# meta-character escape footguns; `in` membership across a tuple of
+# fixed-length strings is O(n) over a 6-element list — fine here.
+_FRONTMATTER_LINE_SEPARATORS: tuple[str, ...] = (
+    "\n", "\r", "\x00", "\x85", " ", " ",
+)
+
+
+def _reject_frontmatter_line_separators(value: str, *, field_name: str) -> None:
+    """Raise ``ValueError`` if ``value`` contains any line-break-class char.
+
+    Shared by ``block_type`` validation (in ``write_blocked``) and the
+    ``frontmatter_extra`` str-value branch (in
+    ``_format_frontmatter_extra``). Codex round-3 fix-pass:
+
+    - [P2] block_type previously rejected only ``\\n``; ``\\r`` slipped
+      through and forged frontmatter rows in YAML parsers that respect
+      CR (every spec-conformant 1.2 parser does).
+    - [P3] frontmatter_extra str values previously rejected only
+      ``\\n`` / ``\\r``; ``\\x00`` / ``\\x85`` / ``\\u2028`` / ``\\u2029``
+      passed through to disk and could still be treated as line breaks
+      by Python's ``str.splitlines`` and several YAML parsers.
+
+    Two callers, one rule — extracting the helper de-duplicates the
+    check and prevents drift if a future round adds another separator.
+    """
+    for sep in _FRONTMATTER_LINE_SEPARATORS:
+        if sep in value:
+            raise ValueError(
+                f"{field_name} must not contain line-separator chars "
+                f"({_FRONTMATTER_LINE_SEPARATORS!r}); "
+                f"frontmatter injection guard"
+            )
+
+
 def _format_frontmatter_extra(extra: Optional[dict]) -> str:
     """Validate + emit zero-or-more frontmatter ``key: value`` lines.
 
@@ -201,10 +251,15 @@ def _format_frontmatter_extra(extra: Optional[dict]) -> str:
     3. Each value MUST be a scalar of type ``str``/``int``/``bool``/
        ``float``. Lists / dicts / None are rejected — these are exactly
        the shapes that would tempt a "just stringify it" silent bypass.
-    4. ``str`` values MUST NOT contain ``\\n`` or ``\\r`` — otherwise an
-       attacker-controlled value could break out of the `key: value`
-       line into adjacent frontmatter rows (the same defense already
-       applied to ``block_type`` above).
+    4. ``str`` values MUST NOT contain any line-break-class char
+       (``\\n`` ``\\r`` ``\\x00`` ``\\x85`` ``\\u2028`` ``\\u2029``).
+       The full class is enforced via ``_reject_frontmatter_line_separators``
+       which is shared with ``block_type`` validation. Codex round-3
+       [P3] extension: the original ``\\n``/``\\r`` reject left
+       Python-``splitlines``-recognized separators (NEL / LSEP / PSEP)
+       and the YAML-stream-terminator NUL on the path to disk; the full
+       class rejection is the J-class injection defense for both
+       parser families.
 
     Emission order: caller's dict insertion order (Python 3.7+ guarantees
     insertion-preserving iteration). String values are JSON-encoded so
@@ -232,14 +287,22 @@ def _format_frontmatter_extra(extra: Optional[dict]) -> str:
         if isinstance(v, bool):
             lines.append(f"{k}: {'true' if v else 'false'}")
         elif isinstance(v, str):
-            if "\n" in v or "\r" in v:
-                raise ValueError(
-                    f"frontmatter_extra value for {k!r} must not contain "
-                    f"newline/carriage-return (frontmatter injection guard)"
-                )
+            _reject_frontmatter_line_separators(
+                v, field_name=f"frontmatter_extra value for {k!r}",
+            )
             # JSON-encode to safely escape quotes / backslashes; the
             # surrounding double-quotes are valid YAML for scalar strings.
-            lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
+            #
+            # Codex round-3 [P3] defense in depth: ensure_ascii=True
+            # forces every non-ASCII char to ``\uXXXX`` form. Even if a
+            # future Unicode line-separator escapes
+            # ``_reject_frontmatter_line_separators`` (e.g. some new code
+            # point that Python's ``str.splitlines`` learns to honor),
+            # it cannot reach the on-disk YAML stream as raw bytes. The
+            # operator-grep contract (`block_row: 4`, ASCII-key extras)
+            # is unaffected — only non-ASCII payloads escape, and
+            # frontmatter is machine-read, not human-read.
+            lines.append(f"{k}: {json.dumps(v, ensure_ascii=True)}")
         elif isinstance(v, (int, float)):
             lines.append(f"{k}: {v}")
         else:
@@ -270,8 +333,12 @@ def write_blocked(
     as a frontmatter line so operators can grep without parsing the
     body. Validation of the value is the caller's responsibility —
     here we only guard against frontmatter injection by rejecting
-    values that contain a newline (which would break out of the
-    `block_type:` line into adjacent frontmatter rows).
+    values that contain any line-break-class char (``\\n`` ``\\r``
+    ``\\x00`` ``\\x85`` ``\\u2028`` ``\\u2029`` — see
+    ``_reject_frontmatter_line_separators``); a CR alone would
+    otherwise let an attacker-controlled value break out of the
+    ``block_type:`` line into adjacent frontmatter rows on any
+    YAML parser that respects CR (codex round-3 [P2]).
 
     ``frontmatter_extra`` (codex round-2 [P2] regression fix) accepts
     operator-critical extra metadata that must land in blocked.md
@@ -285,10 +352,15 @@ def write_blocked(
     """
     bt_line = ""
     if block_type is not None:
-        if not isinstance(block_type, str) or "\n" in block_type:
+        if not isinstance(block_type, str):
             raise ValueError(
-                f"block_type must be a single-line str; got {block_type!r}"
+                f"block_type must be a str; got {type(block_type).__name__}"
             )
+        # Codex round-3 [P2]: extend the line-separator reject from `\n`
+        # only to the full class (CR / NUL / NEL / LSEP / PSEP). Without
+        # CR rejection in particular, `block_type="x\rts: forged"` writes
+        # two YAML rows on parsers that honor CR.
+        _reject_frontmatter_line_separators(block_type, field_name="block_type")
         bt_line = f"block_type: {block_type}\n"
     # Validate + format BEFORE any disk write — invalid extras must not
     # leave a partial blocked.md (D5: explicit ValueError propagates;

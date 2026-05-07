@@ -100,6 +100,41 @@ class TestStateWriter(unittest.TestCase):
                   "safe_resume_command"):
             self.assertIn(f, body)
 
+    def test_blocked_md_block_type_rejects_carriage_return(self):
+        """Codex round-3 [P2]: ``block_type`` validation must reject ``\\r``,
+        not just ``\\n``. With CR allowed, ``block_type="x\\rts: forged"``
+        forges a second frontmatter row on every YAML 1.2 parser (and
+        Python's own ``str.splitlines``). The shared helper
+        ``_reject_frontmatter_line_separators`` covers the full class,
+        but pin the CR case explicitly here because it was the original
+        regression.
+        """
+        with self.assertRaises(ValueError) as ctx:
+            write_blocked(
+                self.task_dir,
+                phase=2, task="t1", why_blocked="x",
+                required_choice=["a"], safe_resume_command="r",
+                block_type="manifest_violation\rts: forged",
+            )
+        self.assertIn("line-separator", str(ctx.exception).lower())
+        # Fail-closed — no partial blocked.md leaked.
+        self.assertFalse((self.task_dir / "blocked.md").exists())
+
+    def test_blocked_md_block_type_rejects_unicode_line_separator(self):
+        """[P2] — ensure the full helper class also covers U+2028 on
+        block_type, not only on frontmatter_extra. Same rationale as
+        the CR case: ``str.splitlines`` treats LSEP as a break, so a
+        forged-row attack vector exists on any tool that uses the
+        stdlib helper."""
+        with self.assertRaises(ValueError):
+            write_blocked(
+                self.task_dir,
+                phase=2, task="t1", why_blocked="x",
+                required_choice=["a"], safe_resume_command="r",
+                block_type="manifest_violation ts: forged",
+            )
+        self.assertFalse((self.task_dir / "blocked.md").exists())
+
 
 def _make_started_event(**overrides) -> AcceptanceProgressEvent:
     """Valid 24-field `started` event with sensible defaults; override per test."""

@@ -846,8 +846,12 @@ class TestCodexRound2FrontmatterExtraPassThrough(unittest.TestCase):
                 self.assertIn("scalar", msg)
 
     def test_frontmatter_extra_rejects_newline_in_str_value(self):
-        """Frontmatter injection guard: a newline in a str value would
-        break out of the `key: value` line into adjacent rows."""
+        """Frontmatter injection guard: a newline / CR in a str value
+        would break out of the `key: value` line into adjacent rows.
+        Codex round-3 [P3] extended the message — the test now matches
+        the new wording (`line-separator`) across the original 4
+        ASCII-newline shapes; non-ASCII separators have dedicated
+        cases below."""
         n = self._notifier()
         for bad in ("a\nb", "a\rb", "leading\n", "\r\n"):
             with self.subTest(value=bad):
@@ -860,12 +864,123 @@ class TestCodexRound2FrontmatterExtraPassThrough(unittest.TestCase):
                         frontmatter_extra={"k": bad},
                     )
                 msg = str(ctx.exception)
-                self.assertIn("newline", msg)
+                self.assertIn("line-separator", msg.lower())
                 # Fail-closed — no partial blocked.md.
                 self.assertFalse(
                     (Path(self.tmp) / "blocked.md").exists(),
                     f"blocked.md leaked for value {bad!r}",
                 )
+
+    def test_frontmatter_extra_rejects_nul_byte_in_value(self):
+        """Codex round-3 [P3]: ``\\x00`` is a YAML 1.1 stream terminator
+        on several parsers and a buffer truncator on plain ``open()``
+        readers. Reject up-front — without this, a quoted JSON-encoded
+        scalar containing NUL still reaches disk because ``json.dumps``
+        passes NUL through (escapes it as ``\\u0000`` only with
+        ``ensure_ascii=True``, which is now on, but defense-in-depth)."""
+        n = self._notifier()
+        with self.assertRaises(ValueError) as ctx:
+            n.fire_block(
+                block_type="x", phase=2, task_id="T1",
+                issue_id="i1", why_blocked="x",
+                required_choice=["abort"],
+                safe_resume_command="flow resume d",
+                frontmatter_extra={"note": "a\x00b"},
+            )
+        self.assertIn("line-separator", str(ctx.exception).lower())
+        self.assertFalse((Path(self.tmp) / "blocked.md").exists())
+
+    def test_frontmatter_extra_rejects_unicode_line_separator(self):
+        """Codex round-3 [P3]: U+2028 is on YAML 1.2 §5.4's break list,
+        and Python's ``str.splitlines`` treats it as a break. With only
+        ``\\n``/``\\r`` rejection, an operator script that uses
+        ``splitlines`` to grep frontmatter would see forged rows even
+        though PyYAML strict mode would parse correctly — exactly the
+        D1/J-class blindspot the helper now closes.
+
+        We construct the test value via ``\\u2028`` escape (NOT a literal
+        Unicode char) so the source file itself stays ASCII-clean and
+        editors / merge tools don't silently normalize the separator
+        away.
+        """
+        n = self._notifier()
+        with self.assertRaises(ValueError) as ctx:
+            n.fire_block(
+                block_type="x", phase=2, task_id="T1",
+                issue_id="i1", why_blocked="x",
+                required_choice=["abort"],
+                safe_resume_command="flow resume d",
+                frontmatter_extra={"note": "a b"},
+            )
+        self.assertIn("line-separator", str(ctx.exception).lower())
+        self.assertFalse((Path(self.tmp) / "blocked.md").exists())
+
+    def test_frontmatter_extra_rejects_paragraph_separator(self):
+        """Codex round-3 [P3]: U+2029 same family as U+2028 —
+        ``str.splitlines`` and several YAML parsers honor it. Tested
+        separately from LSEP so a regression that only patches LSEP
+        gets caught. Source uses ``\\u2029`` escape (see LSEP test for
+        rationale)."""
+        n = self._notifier()
+        with self.assertRaises(ValueError) as ctx:
+            n.fire_block(
+                block_type="x", phase=2, task_id="T1",
+                issue_id="i1", why_blocked="x",
+                required_choice=["abort"],
+                safe_resume_command="flow resume d",
+                frontmatter_extra={"note": "a b"},
+            )
+        self.assertIn("line-separator", str(ctx.exception).lower())
+        self.assertFalse((Path(self.tmp) / "blocked.md").exists())
+
+    def test_frontmatter_extra_rejects_nel(self):
+        """Codex round-3 [P3]: U+0085 NEL is YAML 1.2 §5.4's listed
+        break char. A bare-rejection check on ``\\n``/``\\r`` would not
+        catch ``\\x85``; pin it explicitly here."""
+        n = self._notifier()
+        with self.assertRaises(ValueError) as ctx:
+            n.fire_block(
+                block_type="x", phase=2, task_id="T1",
+                issue_id="i1", why_blocked="x",
+                required_choice=["abort"],
+                safe_resume_command="flow resume d",
+                frontmatter_extra={"note": "a\x85b"},
+            )
+        self.assertIn("line-separator", str(ctx.exception).lower())
+        self.assertFalse((Path(self.tmp) / "blocked.md").exists())
+
+    def test_frontmatter_extra_unicode_text_escaped_via_ensure_ascii(self):
+        """Codex round-3 [P3] defense in depth: ``ensure_ascii=True``
+        forces every non-ASCII char into ``\\uXXXX`` form. Even legal
+        non-ASCII text (e.g. CJK) round-trips through JSON escapes —
+        raw multi-byte UTF-8 bytes never enter the on-disk YAML stream.
+
+        Operator-grep contract is unaffected: ``block_row: 4`` (the
+        production caller's payload shape) is ASCII-only and emits
+        verbatim; only non-ASCII payloads (rare for frontmatter_extra
+        in practice) take the escape form.
+        """
+        n = self._notifier()
+        # CJK chars 中文 supplied via chr() so this source file stays
+        # ASCII-only on disk (some editors silently normalize raw
+        # high-byte sequences; chr is round-trip stable).
+        cjk = chr(0x4E2D) + chr(0x6587)  # "中文"
+        path = n.fire_block(
+            block_type="x", phase=2, task_id="T1", issue_id="i1",
+            why_blocked="x", required_choice=["abort"],
+            safe_resume_command="flow resume d",
+            frontmatter_extra={"note": cjk},
+        )
+        body = path.read_text()
+        # Expected on-disk bytes are the literal 12-char ASCII sequence
+        # `中文` (backslash + u + 4 hex per char) — NOT the
+        # 6-byte UTF-8 form of 中文. We construct the expected string
+        # from char codes so the test source remains ASCII-clean.
+        expected_escape = "\\u" + "4e2d" + "\\u" + "6587"
+        self.assertIn(expected_escape, body)
+        # Negative: the raw CJK chars must NOT appear in the file body —
+        # if they did, ensure_ascii=True regressed.
+        self.assertNotIn(cjk, body)
 
     def test_frontmatter_extra_block_type_preserved_through_notifier(self):
         """Regression guard: pass-through must NOT drop ``block_type`` —
