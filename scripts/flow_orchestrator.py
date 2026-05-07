@@ -39,6 +39,7 @@ from progress_meta import read_progress_meta, ProgressMeta  # type: ignore
 from flow_state_writer import (  # type: ignore
     EVENT_AUTO_ENGAGED, append_autonomy_event, _new_event_id,
     write_blocked,
+    append_review_issue, ReviewIssueRecord,
 )
 
 
@@ -889,6 +890,146 @@ def auto_dispatch_task(
 # contract author knows their suite is slower.
 _DEFAULT_GATE_TIMEOUT_SEC = 600
 
+
+# ----------------------------------------------------------------------
+# T13 — canonical issue id (S7) for cross-round churn detection.
+#
+# Design §6 S7: same issue across codex rounds must collide on a stable
+# id so we can count appearances and halt on the CHURN_THRESHOLD-th hit
+# (§3 line 141: do NOT consume more retry budget on churn — escalate).
+#
+# Whitespace-insensitive on the message so a re-worded but semantically
+# identical complaint still collides. file/line_range/class are tightly
+# scoped — different file or line range is a different issue.
+# ----------------------------------------------------------------------
+
+
+def canonical_issue_id(
+    file_path: str, line_range: str,
+    issue_class: str, issue_message: str,
+) -> str:
+    """Return a 12-char hex id derived from sha256 of pipe-joined fields
+    with the message normalized (lowercased, whitespace-collapsed). Same
+    issue across codex rounds yields the same id; different file / class
+    / line range yields a different id.
+    """
+    norm_msg = " ".join(issue_message.lower().split())
+    raw = f"{file_path}|{line_range}|{issue_class}|{norm_msg}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+# ----------------------------------------------------------------------
+# T13 — semantic-diff retry-whitelist violation detection.
+#
+# Design §3 line 141: after a Phase 2 retry, compare BEFORE-retry diff
+# vs AFTER-retry diff. If the retry suppressed verification (deleted
+# tests, added skip decorators, narrowed fixtures, suppressed CI flags),
+# escalate without consuming retry budget — the retry was an evasion,
+# not a real fix.
+#
+# Helper is pure: no I/O. Caller (gate 4 / retry orchestrator) supplies
+# already-collected file lists + diff strings. G-class watch: when the
+# caller sources these from disk, it MUST pull from a single coherent
+# snapshot (e.g. one ``git status --porcelain -z`` invocation per
+# before/after side, not stitched from multiple layers).
+# H-class watch: caller is responsible for splitting porcelain output
+# correctly (rename arrows, NUL boundaries) BEFORE handing the lists
+# to this helper. The helper trusts its inputs as already-cleaned.
+# ----------------------------------------------------------------------
+
+
+# CI / Makefile / package.json flag patterns that suppress test-failure
+# signal. Matched as plain substrings against the diff text. Case-
+# sensitive — these flags are literal CLI strings.
+_SUPPRESS_FLAG_PATTERNS = (
+    "--no-fail-fast", "--ignore", "--skip", "-k 'not ", "skipif",
+)
+
+# Decorator patterns used to disable tests in pytest / unittest.
+_SKIP_DECORATOR_PATTERNS = ("@unittest.skip", "@pytest.mark.skip", "@skip")
+
+
+@dataclass
+class SemanticViolations:
+    """Result of `detect_semantic_violations`.
+
+    `escalate` is True iff at least one violation pattern fired; the
+    `violations` list names which patterns hit (for blocked.md /
+    decisions.jsonl forensics).
+    """
+    escalate: bool
+    violations: list[str]
+
+
+def detect_semantic_violations(
+    *,
+    before_files: list[str], after_files: list[str],
+    before_diff: str, after_diff: str,
+) -> SemanticViolations:
+    """Detect 4 retry-whitelist violation patterns (§3 line 141).
+
+    Patterns:
+      1. ``test_file_deleted`` — a path under ``tests/`` ending in
+         ``.py`` was present BEFORE and absent AFTER.
+      2. ``test_skipped`` — a skip decorator (`@unittest.skip`,
+         `@pytest.mark.skip`, `@skip`) appears in the AFTER diff but
+         NOT in the BEFORE diff.
+      3. ``flag_suppression`` — a verification-suppressing CLI flag
+         (`--no-fail-fast`, `--ignore`, `--skip`, `-k 'not `, `skipif`)
+         appears AFTER but not BEFORE.
+      4. ``fixture_narrowing`` — a path containing "fixture" or "data"
+         present in both lists shrank by more than 2× AND the post-
+         diff is small (< 1024 bytes), indicating substantive content
+         removal rather than incidental edits.
+
+    Returns ``escalate=True`` iff at least one pattern fired, with the
+    detected pattern names in ``violations``.
+    """
+    violations: list[str] = []
+
+    # 1. Test files deleted.
+    before_tests = {
+        f for f in before_files
+        if f.startswith("tests/") and f.endswith(".py")
+    }
+    after_tests = {
+        f for f in after_files
+        if f.startswith("tests/") and f.endswith(".py")
+    }
+    if before_tests - after_tests:
+        violations.append("test_file_deleted")
+
+    # 2. Skip decorator newly introduced. We loop and break to record
+    # the violation only once even if multiple decorator forms appear.
+    for decorator in _SKIP_DECORATOR_PATTERNS:
+        if decorator not in before_diff and decorator in after_diff:
+            violations.append("test_skipped")
+            break
+
+    # 3. Verification-suppressing CLI flag newly introduced.
+    for flag in _SUPPRESS_FLAG_PATTERNS:
+        if flag not in before_diff and flag in after_diff:
+            violations.append("flag_suppression")
+            break
+
+    # 4. Fixture narrowing. Heuristic: a path with "fixture" or "data"
+    # in its name present in both before/after lists, where the diff
+    # bytes shrank more than 2× and the post-diff is < 1024 bytes
+    # (cap prevents false positives on large refactors that legitimately
+    # modify large fixtures).
+    common_fixtures = [
+        f for f in (set(before_files) & set(after_files))
+        if "fixture" in f or "data" in f
+    ]
+    if common_fixtures:
+        if len(before_diff) > 2 * len(after_diff) and len(after_diff) < 1024:
+            violations.append("fixture_narrowing")
+
+    return SemanticViolations(
+        escalate=bool(violations),
+        violations=violations,
+    )
+
 # Codex T12 round-1 [P2]: bare ``subprocess.run(..., shell=True,
 # timeout=...)`` only kills the SHELL on timeout — child processes (test
 # servers, file watchers, ``&``-backgrounded jobs spawned by the test
@@ -1169,6 +1310,229 @@ class GateRunner:
         )
 
     # ------------------------------------------------------------------
+    # Gate 4 — per-task codex review (T13).
+    #
+    # Wraps the codex CLI; parses GREEN / YELLOW / RED verdict + issues.
+    # On RED, persists each issue into review-issues.jsonl via the T6
+    # `append_review_issue` helper using the S7 canonical issue id, then
+    # checks churn: an issue id appearing CHURN_THRESHOLD+ times across
+    # the task's history triggers `escalate=True` (per design §3 line
+    # 141 — escalation does NOT consume more retry budget; the next-step
+    # review-rejection rationale path owns operator override).
+    #
+    # Pitfall coverage:
+    #   A get/in:    `output.get("verdict", "INCONCLUSIVE")` is safe
+    #                because the entire output is treated as advisory
+    #                metadata; falsy/missing → INCONCLUSIVE → fail-closed.
+    #                Each issue field uses ``key in issue`` semantics
+    #                (via the F fail-closed guard below) so absent vs
+    #                explicit-empty are distinguished.
+    #   D5 catch-all: codex CLI rc != 0 OR JSON parse failure → routes
+    #                to ``inconclusive`` (operator review) rather than
+    #                silent pass.
+    #   E shell=True: ``codex_command`` is treated as TRUSTED INTERNAL.
+    #                Tests inject ``echo '...'`` shell strings; production
+    #                callers wire a fixed CLI invocation. Caller MUST NOT
+    #                interpolate user-controlled data into this string.
+    #   F fail-closed: missing issue fields (``file`` / ``line_range`` /
+    #                ``class`` / ``message``) → return inconclusive,
+    #                NOT silent substitution of empty strings (which
+    #                would collide all malformed issues onto the same
+    #                canonical id and short-circuit churn detection).
+    # ------------------------------------------------------------------
+
+    # Same id appearing CHURN_THRESHOLD+ times across a task's review
+    # history → escalate without consuming retry budget. 3 matches the
+    # design's "rounds 1-3 then escalate" cadence.
+    CHURN_THRESHOLD = 3
+
+    # Required keys on each codex-emitted issue. Missing any → inconclusive
+    # (F fail-closed). We do NOT default to empty string because that
+    # collides every malformed issue onto the same canonical id, which
+    # would silently mask churn detection on real issues.
+    _REQUIRED_ISSUE_KEYS = ("file", "line_range", "class", "message")
+
+    def _count_issue_id_in_history(self, issue_id: str) -> int:
+        """Count appearances of ``issue_id`` in this task's
+        review-issues.jsonl. Missing file → 0; malformed lines skipped
+        (T6 writer is the canonical producer; manual edits are best-effort).
+        """
+        path = self.task_dir / "review-issues.jsonl"
+        if not path.is_file():
+            return 0
+        count = 0
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("id") == issue_id:
+                count += 1
+        return count
+
+    def gate4_codex_review(
+        self, *,
+        codex_command: str = "codex review --diff-only --json",
+    ) -> GateResult:
+        """Run codex CLI, parse verdict, persist RED issues, detect churn.
+
+        Returns a `GateResult`:
+          - GREEN verdict        → status=pass.
+          - YELLOW verdict       → status=pass (advisory issues persisted).
+          - RED verdict          → status=fail; details include `block_row`
+                                    is NOT set here (caller routes via
+                                    `escalate` flag — churn → escalate).
+          - codex CLI rc != 0    → status=inconclusive (D5).
+          - non-JSON output      → status=inconclusive (F fail-closed).
+          - issue missing fields → status=inconclusive (F fail-closed).
+        """
+        # E-class trust boundary: codex_command is INTERNAL — never build
+        # this string from external / codex-emitted / user-controlled data.
+        #
+        # Pitfall I (reuse prior helper): T7/T12 use ``_run_shell_with_
+        # pgkill`` for gate-test commands because those are
+        # contract-author-supplied shell strings that can fork test
+        # servers / watchers / & background jobs. ``codex_command`` is
+        # different — it's a fixed CLI invocation owned by gate 4
+        # itself, with no expected child-process tree, and per plan
+        # T13 Step 13.4 the documented invocation is plain
+        # ``subprocess.run`` (timeouts are codex's own responsibility,
+        # not the harness'). Reusing pgkill here would add an unused
+        # process-group dance with no observed leak risk.
+        proc = subprocess.run(
+            codex_command, shell=True, cwd=str(self.ctx.worktree_path),
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0:
+            return GateResult(
+                status="inconclusive",
+                details={
+                    "gate": "gate4_codex_review",
+                    "reason": "codex_cli_failed",
+                    "error": "codex CLI failed",
+                    "returncode": proc.returncode,
+                    "stderr_tail": proc.stderr[-1000:],
+                },
+            )
+        try:
+            output = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return GateResult(
+                status="inconclusive",
+                details={
+                    "gate": "gate4_codex_review",
+                    "reason": "codex_output_not_json",
+                    "error": "codex output not JSON",
+                    "stdout_tail": proc.stdout[-1000:],
+                },
+            )
+        if not isinstance(output, dict):
+            # F fail-closed: a list/string/null at the top level isn't
+            # the documented shape — treat as inconclusive.
+            return GateResult(
+                status="inconclusive",
+                details={
+                    "gate": "gate4_codex_review",
+                    "reason": "codex_output_not_object",
+                    "stdout_tail": proc.stdout[-1000:],
+                },
+            )
+
+        verdict = output.get("verdict", "INCONCLUSIVE")
+        if verdict == "GREEN":
+            return GateResult(
+                status="pass", details={"verdict": "GREEN"},
+            )
+
+        # YELLOW + RED both can carry issues; persist them all with S7
+        # canonical ids so churn detection sees the full history.
+        issues = output.get("issues", [])
+        if not isinstance(issues, list):
+            return GateResult(
+                status="inconclusive",
+                details={
+                    "gate": "gate4_codex_review",
+                    "reason": "issues_not_list",
+                    "stdout_tail": proc.stdout[-1000:],
+                },
+            )
+
+        issue_ids: list[str] = []
+        for issue in issues:
+            if not isinstance(issue, dict):
+                return GateResult(
+                    status="inconclusive",
+                    details={
+                        "gate": "gate4_codex_review",
+                        "reason": "issue_not_object",
+                        "stdout_tail": proc.stdout[-1000:],
+                    },
+                )
+            # F fail-closed: every required key MUST be present. We do
+            # not silently substitute "" for missing fields — that would
+            # collide every malformed issue onto the same canonical id
+            # and mask real churn. Use ``key in issue`` (A-class).
+            missing = [k for k in self._REQUIRED_ISSUE_KEYS if k not in issue]
+            if missing:
+                return GateResult(
+                    status="inconclusive",
+                    details={
+                        "gate": "gate4_codex_review",
+                        "reason": "issue_missing_required_field",
+                        "missing": missing,
+                        "stdout_tail": proc.stdout[-1000:],
+                    },
+                )
+            issue_id = canonical_issue_id(
+                issue["file"], issue["line_range"],
+                issue["class"], issue["message"],
+            )
+            issue_ids.append(issue_id)
+            # Severity is optional with a sane default (T6 enum allows
+            # "med"); reviewer is fixed to "codex" since this gate IS
+            # the codex review.
+            severity = issue.get("severity", "med")
+            if severity not in ("critical", "high", "med", "low", "info"):
+                severity = "med"
+            append_review_issue(self.task_dir, ReviewIssueRecord(
+                id=issue_id,
+                ts=datetime.datetime.now(datetime.UTC).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ",
+                ),
+                task=self.task_id,
+                severity=severity,
+                reviewer="codex",
+                description=issue["message"],
+                disposition="open",
+            ))
+
+        # Churn detection — issue ids that have appeared
+        # CHURN_THRESHOLD+ times across this task's review history.
+        # Counts include the row we JUST appended, so the threshold is
+        # the inclusive Nth round (matches the §3 line 141 spec
+        # "after 3 rounds, escalate").
+        churn_ids = [
+            iid for iid in issue_ids
+            if self._count_issue_id_in_history(iid) >= self.CHURN_THRESHOLD
+        ]
+        existing_details: dict = {
+            "verdict": verdict,
+            "issue_count": len(issues),
+            "issue_ids": issue_ids,
+        }
+        if churn_ids:
+            # Add `churn` key ONLY when non-empty so the GREEN /
+            # no-churn paths' `assertNotIn("churn", ...)` checks keep
+            # working (J-class watch — fixed-shape returns are easy to
+            # break by adding fields unconditionally).
+            existing_details["churn"] = churn_ids
+        return GateResult(
+            status="fail" if verdict == "RED" else "pass",
+            escalate=bool(churn_ids),
+            details=existing_details,
+        )
+
+    # ------------------------------------------------------------------
     # Gate 5 — acceptance criteria (wires T7 run_one + T8 evaluate).
     # ------------------------------------------------------------------
 
@@ -1333,8 +1697,9 @@ class GateRunner:
         )
 
     # ------------------------------------------------------------------
-    # Phase 2 chain — gates 1 → 3 → 5 → 6 (T13 inserts gate 4 between 3
-    # and 5; T15 inserts gate 2 before gate 1 + gates 7/8 after gate 6).
+    # Phase 2 chain — gates 1 → 3 → 4 → 5 → 6 (T13 inserts gate 4
+    # between 3 and 5; T15 inserts gate 2 before gate 1 + gates 7/8
+    # after gate 6).
     # ------------------------------------------------------------------
 
     def run_phase2(
@@ -1347,10 +1712,12 @@ class GateRunner:
         retry_idx: int,
         baseline_command: str,
         smoke_command: str,
+        codex_command: str = "codex review --diff-only --json",
         baseline_timeout_sec: int = _DEFAULT_GATE_TIMEOUT_SEC,
         smoke_timeout_sec: int = _DEFAULT_GATE_TIMEOUT_SEC,
     ) -> Phase2Verdict:
-        """Chain the four T12-owned gates in declared order.
+        """Chain the five Phase 2 gates in declared order:
+        ``1 → 3 → 4 → 5 → 6``.
 
         First non-pass result halts and returns a `Phase2Verdict` with
         `halted_at_gate` naming the gate. Caller branches on
@@ -1366,6 +1733,12 @@ class GateRunner:
         it directly to gate 3 would let any baseline-introduced manifest
         violation slip through. Refresh the snapshot now that gate 1 has
         confirmed the suite is green.
+
+        T13: ``codex_command`` is forwarded to gate 4 (per-task codex
+        review). It defaults to the production CLI invocation; tests
+        inject deterministic ``echo '...'`` shell strings. Trust
+        boundary same as ``baseline_command`` — caller-supplied,
+        contract-author-trusted.
         """
         r = self.gate1_baseline(
             test_command=baseline_command,
@@ -1436,6 +1809,14 @@ class GateRunner:
             return Phase2Verdict(
                 status="blocked",
                 halted_at_gate="gate3_manifest",
+                gate_result=r,
+            )
+
+        r = self.gate4_codex_review(codex_command=codex_command)
+        if r.status != "pass":
+            return Phase2Verdict(
+                status="blocked",
+                halted_at_gate="gate4_codex_review",
                 gate_result=r,
             )
 

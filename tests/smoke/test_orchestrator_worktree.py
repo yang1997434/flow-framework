@@ -25,6 +25,7 @@ from flow_orchestrator import (  # type: ignore
     GateResult, BaselineRecord, Phase2Verdict, GateRunner,
     create_task_worktree, derive_task_facts, auto_dispatch_task,
     verify_manifest_against_facts,
+    canonical_issue_id,
 )
 from flow_state_writer import EVENT_AUTO_ENGAGED  # type: ignore
 from flow_contract import (  # type: ignore
@@ -1053,11 +1054,16 @@ class TestRunPhase2Chain(unittest.TestCase):
             ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
             run_id="r1", task_id="T0",
         )
+        # T13 chain extension: full pass now traverses 1 → 3 → 4 → 5 → 6.
+        # gate 4 wraps the codex CLI; tests inject a deterministic GREEN
+        # stub so the chain reaches gate 5 + 6 without depending on a
+        # real codex install.
         v = gr.run_phase2(
             manifest=self.manifest, facts=self.clean_facts,
             criteria=self.criteria,
             attempt_id="a1", retry_idx=0,
             baseline_command="true", smoke_command="true",
+            codex_command="echo '{\"verdict\":\"GREEN\",\"issues\":[]}'",
         )
         self.assertEqual(v.status, "pass")
         self.assertIsNone(v.halted_at_gate)
@@ -1223,6 +1229,211 @@ class TestRunPhase2Chain(unittest.TestCase):
         self.assertIn(
             "secrets/key.pem", v.gate_result.details["violations"]
         )
+
+
+# ----------------------------------------------------------------------
+# T13 — gate 4 codex review + churn detection + run_phase2 chain extension.
+# Design refs §3 line 129/141 + §6 S7 (canonical issue_id).
+# ----------------------------------------------------------------------
+
+
+class TestCanonicalIssueId(unittest.TestCase):
+    """S7: sha256(file|line_range|class|msg-normalized)[:12].
+
+    Same issue across codex rounds collides on id (whitespace-insensitive
+    message normalization), enabling churn detection. Different files /
+    classes / line ranges yield distinct ids.
+    """
+
+    def test_same_issue_same_id(self) -> None:
+        a = canonical_issue_id(
+            "src/foo.py", "L10-15", "sql_safety",
+            "  Possible SQL injection.  ",
+        )
+        b = canonical_issue_id(
+            "src/foo.py", "L10-15", "sql_safety",
+            "Possible SQL injection.",
+        )
+        self.assertEqual(a, b)
+        self.assertEqual(len(a), 12)
+
+    def test_different_files_different_id(self) -> None:
+        a = canonical_issue_id("src/foo.py", "L10-15", "sql", "x")
+        b = canonical_issue_id("src/bar.py", "L10-15", "sql", "x")
+        self.assertNotEqual(a, b)
+
+
+class TestGate4CodexReview(unittest.TestCase):
+    """Gate 4 wraps codex CLI; parses GREEN / YELLOW / RED verdict and
+    persists issues with S7 canonical ids. RED + churn (same issue id 3+
+    rounds) escalates without consuming retry budget (§3 line 141).
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="t13-gate4-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ctx, self.contract, self.task_dir = _make_gate_runner_ctx(
+            self.tmp,
+        )
+
+    def _make_runner(self) -> GateRunner:
+        return GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r1", task_id="T0",
+        )
+
+    def test_gate4_red_writes_review_issues_jsonl(self) -> None:
+        gr = self._make_runner()
+        stub_output = json.dumps({"verdict": "RED", "issues": [
+            {"file": "src/foo.py", "line_range": "L10-15",
+             "class": "sql_safety", "message": "SQL injection",
+             "severity": "critical"},
+        ]})
+        # Single-quote the JSON for shell echo; stub_output JSON contains
+        # only safe characters (no single quotes inside the canned payload).
+        r = gr.gate4_codex_review(codex_command=f"echo '{stub_output}'")
+        self.assertEqual(r.status, "fail")
+        self.assertEqual(r.details["verdict"], "RED")
+        jsonl = (gr.task_dir / "review-issues.jsonl").read_text()
+        issues = [json.loads(l) for l in jsonl.splitlines()]
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(len(issues[0]["id"]), 12)  # S7
+
+    def test_gate4_green_passes(self) -> None:
+        gr = self._make_runner()
+        stub_output = json.dumps({"verdict": "GREEN", "issues": []})
+        r = gr.gate4_codex_review(codex_command=f"echo '{stub_output}'")
+        self.assertEqual(r.status, "pass")
+        self.assertEqual(r.details["verdict"], "GREEN")
+        # No churn key when no issues hit the threshold (J-class watch:
+        # callers may rely on `assertNotIn("churn", ...)` semantics).
+        self.assertNotIn("churn", r.details)
+
+    def test_gate4_churn_escalates_after_repeat(self) -> None:
+        """Same issue_id appearing 3+ times → churn → escalate flag set."""
+        gr = self._make_runner()
+        stub_output = json.dumps({
+            "verdict": "RED",
+            "issues": [{"file": "x.py", "line_range": "L1",
+                         "class": "c", "message": "m",
+                         "severity": "high"}],
+        })
+        gr.gate4_codex_review(codex_command=f"echo '{stub_output}'")
+        gr.gate4_codex_review(codex_command=f"echo '{stub_output}'")
+        r = gr.gate4_codex_review(codex_command=f"echo '{stub_output}'")
+        # Third hit triggers churn.
+        self.assertEqual(r.status, "fail")
+        self.assertTrue(r.escalate)
+        self.assertIn("churn", r.details)
+        self.assertEqual(len(r.details["churn"]), 1)
+
+    def test_gate4_codex_cli_failure_returns_inconclusive(self) -> None:
+        """D5 catch-all: codex CLI rc != 0 → inconclusive, not silent
+        pass. Operator review owns the resolution path (§3 line 141)."""
+        gr = self._make_runner()
+        # `false` exits non-zero without producing JSON.
+        r = gr.gate4_codex_review(codex_command="false")
+        self.assertEqual(r.status, "inconclusive")
+        self.assertIn("error", r.details)
+
+    def test_gate4_non_json_output_returns_inconclusive(self) -> None:
+        """F fail-closed: malformed codex output must not be silently
+        treated as GREEN. Routes to inconclusive with stdout_tail."""
+        gr = self._make_runner()
+        r = gr.gate4_codex_review(codex_command="echo not-json")
+        self.assertEqual(r.status, "inconclusive")
+        self.assertIn("stdout_tail", r.details)
+
+
+class TestRunPhase2InsertsGate4(unittest.TestCase):
+    """T13 chain extension: full Phase 2 sequence is 1 → 3 → 4 → 5 → 6.
+    Pins both ordering (gate 4 between 3 and 5) and halt semantics
+    (gate 4 RED halts before gate 5 + 6 fire).
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="t13-phase2-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ctx, self.contract, self.task_dir = _make_gate_runner_ctx(
+            self.tmp,
+        )
+        self.manifest = TaskManifest(
+            id="T0", writes_declared=["src/foo.py"],
+            allowed_writes=["src/foo.py"],
+            out_of_scope=[], forbidden_hits=[], shared_hits=[],
+        )
+        self.facts = TaskFacts(
+            changed_files=["src/foo.py"], newly_added_files=[],
+            diff_hash="x", target_commit_pre_merge="y",
+        )
+
+    def _stub_runner_with_calls(
+        self,
+        gr: GateRunner,
+        calls: list,
+        gate4_result: GateResult,
+    ) -> None:
+        """Replace each gate method with a stub that records its name and
+        returns a configured GateResult. Gate 4 result is parameterized
+        to drive ordering vs halt-semantics tests with the same stub."""
+        gr.gate1_baseline = (
+            lambda **_: (calls.append("1") or GateResult(status="pass"))
+        )
+        gr.gate3_manifest = (
+            lambda **_: (calls.append("3") or GateResult(status="pass"))
+        )
+        gr.gate4_codex_review = (
+            lambda **_: (calls.append("4") or gate4_result)
+        )
+        gr.gate5_acceptance = (
+            lambda **_: (calls.append("5") or GateResult(status="pass"))
+        )
+        gr.gate6_regression = (
+            lambda **_: (calls.append("6") or GateResult(status="pass"))
+        )
+
+    def test_gate4_runs_between_gate3_and_gate5(self) -> None:
+        """Pass-all dry-run records gate execution order = [1,3,4,5,6]."""
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r", task_id="T0",
+        )
+        calls: list = []
+        self._stub_runner_with_calls(
+            gr, calls, GateResult(status="pass"),
+        )
+        v = gr.run_phase2(
+            manifest=self.manifest, facts=self.facts,
+            criteria=[], attempt_id="a", retry_idx=0,
+            baseline_command="true",
+            codex_command="echo '{\"verdict\":\"GREEN\",\"issues\":[]}'",
+            smoke_command="true",
+        )
+        self.assertEqual(v.status, "pass")
+        self.assertEqual(calls, ["1", "3", "4", "5", "6"])
+
+    def test_gate4_red_halts_before_gate5_and_gate6(self) -> None:
+        """Gate 4 RED → run_phase2 returns blocked + halted_at_gate
+        ='gate4_codex_review'; gates 5 + 6 must NOT execute."""
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r", task_id="T0",
+        )
+        calls: list = []
+        self._stub_runner_with_calls(
+            gr, calls,
+            GateResult(status="fail", details={"verdict": "RED"}),
+        )
+        v = gr.run_phase2(
+            manifest=self.manifest, facts=self.facts,
+            criteria=[], attempt_id="a", retry_idx=0,
+            baseline_command="true",
+            codex_command="codex review",
+            smoke_command="true",
+        )
+        self.assertEqual(v.status, "blocked")
+        self.assertEqual(v.halted_at_gate, "gate4_codex_review")
+        self.assertEqual(calls, ["1", "3", "4"])
 
 
 if __name__ == "__main__":
