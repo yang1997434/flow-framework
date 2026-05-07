@@ -834,6 +834,483 @@ def auto_dispatch_task(
     return DispatchOutcome(status="ok", ctx=ctx, facts=facts)
 
 
+# ----------------------------------------------------------------------
+# T12 — gate harness: gates 1, 3, 5, 6 (baseline / manifest / acceptance /
+# regression). Gates 2, 4, 7, 8 land in T13/T14/T15 and slot into
+# `run_phase2` between the gates T12 owns.
+#
+# Design refs:
+#   §3 gate 1 (baseline tests inside worktree per Q3.1)
+#   §3 gate 3 (manifest verify — wires T11)
+#   §3 gate 5 (acceptance criteria — wires T7+T8)
+#   §3 gate 6 (final regression smoke)
+#   §1 row 7 (baseline newly fail → block)
+#   §1 row 8 (post-regression smoke fail — plan §12.8 maps to row 5 for
+#     orchestrator routing parity with gate 5 BLOCK_ROW5; design alignment
+#     is a T13 follow-up)
+#
+# Q3.1: baseline runs INSIDE the worktree (not the main checkout) so it
+# catches state drift the worktree itself induced (lockfile diverged,
+# submodule init missing). v0.8.1 cost: extra baseline run per worktree.
+#
+# Pitfall coverage:
+#   D5 catch-all: every subprocess call has typed except handling for
+#     `subprocess.TimeoutExpired` + `OSError` (spawn failures). Other
+#     exceptions propagate to the caller — the harness is run inside the
+#     orchestrator where unexpected exceptions are surfaced (no silent
+#     swallow into "pass").
+#   D6 status guard: gate5 maps EVERY EvalDecision branch explicitly so a
+#     new variant added to the enum surfaces as an unknown-decision
+#     `inconclusive` rather than silently routing to a default.
+#   E shell=True: `gate1_baseline` and `gate6_regression` execute strings
+#     supplied by the caller (which originate from contract.json — author-
+#     trusted by definition). The trust boundary is the contract author;
+#     untrusted user input MUST NOT reach these methods without contract-
+#     level validation. Documented at the call sites.
+#   F fail-closed: "no prior baseline" treats any current failure as
+#     "newly broken" (block row 7), not silently passing.
+#   G facts-from-disk: gate3 delegates to T11's verifier, which already
+#     covers all 4 git disk layers (HEAD diff / staged / unstaged /
+#     untracked). T12 does not short-circuit by reading only some.
+#   subprocess timeout: `baseline_timeout_sec` / `regression_timeout_sec`
+#     default to 600s (10 min). A hung subagent baseline must NOT hang
+#     the harness forever; on timeout we return `inconclusive` so the
+#     orchestrator can route to operator review rather than silently
+#     pass or fail.
+# ----------------------------------------------------------------------
+
+
+# Default gate-1 / gate-6 subprocess timeout. Long enough for a typical
+# project test suite, short enough that a runaway harness still hits the
+# operator-review path in under 15 minutes. Override per call when a
+# contract author knows their suite is slower.
+_DEFAULT_GATE_TIMEOUT_SEC = 600
+
+
+@dataclass
+class GateResult:
+    """Per-gate outcome consumed by `run_phase2`.
+
+    `status`:
+      - "pass": gate satisfied; chain continues.
+      - "fail": gate failed; chain halts. `details["block_row"]` carries
+        the §1 routing row (3, 4, 5, 6, 7) so the caller can write the
+        appropriate blocked.md frontmatter.
+      - "inconclusive": gate could not produce a verdict (subprocess
+        timeout / spawn failure). Chain halts. Caller routes to operator
+        review (T9 owns the resume path).
+
+    `escalate`: Y1 — set True when the gate's failure must surface the
+    `{abort, interactive, split}` menu (gate 5 e2e fails, etc.). Caller's
+    blocked.md writer reads this flag.
+    """
+    status: str
+    escalate: bool = False
+    details: dict = field(default_factory=dict)
+
+
+@dataclass
+class BaselineRecord:
+    """v0.8.1 naive baseline: a flat list of test ids known to fail at task
+    start. Per-test diffing (compare current fails vs prior fails) is
+    deferred — gate1 currently uses returncode equality alone. This means
+    any non-zero baseline returncode blocks if no prior baseline OR if any
+    prior baseline existed but suite-level pass status flipped from green
+    to red. Acceptable v0.8.1 trade-off; T19+ may upgrade.
+    """
+    failing: list[str]
+
+
+@dataclass
+class Phase2Verdict:
+    """Aggregate verdict from `GateRunner.run_phase2`.
+
+    `status`: "pass" | "blocked".
+    `halted_at_gate`: the method name of the gate that halted the chain
+      (e.g. "gate3_manifest"); None on full pass.
+    `gate_result`: the GateResult that halted; None on full pass.
+    """
+    status: str
+    halted_at_gate: Optional[str] = None
+    gate_result: Optional[GateResult] = None
+
+
+class GateRunner:
+    """Phase 2 in-worktree gate harness. T12 wires gates 1, 3, 5, 6;
+    T13/T14/T15 wire 2, 4, 7, 8 by extending `run_phase2`.
+
+    Each gate method is pure-by-side-effect-on-disk (subprocess + log
+    files in `task_dir/logs/...`); none of them mutate `self`. The chain
+    in `run_phase2` is sequential — first non-pass result halts.
+    """
+
+    def __init__(
+        self,
+        *,
+        ctx: WorktreeContext,
+        contract: Contract,
+        task_dir: Path,
+        run_id: str,
+        task_id: str,
+        prior_baseline: Optional[BaselineRecord] = None,
+    ):
+        self.ctx = ctx
+        self.contract = contract
+        self.task_dir = task_dir
+        self.run_id = run_id
+        self.task_id = task_id
+        self.prior_baseline = prior_baseline
+
+    # ------------------------------------------------------------------
+    # Gate 1 — baseline tests inside the worktree (Q3.1).
+    # ------------------------------------------------------------------
+
+    def gate1_baseline(
+        self, *, test_command: str,
+        timeout_sec: int = _DEFAULT_GATE_TIMEOUT_SEC,
+    ) -> GateResult:
+        """Run `test_command` inside `ctx.worktree_path`. Exit code 0
+        passes; non-zero blocks on §1 row 7 (newly broken baseline).
+
+        E-class (shell=True trust boundary): `test_command` is passed to
+        a shell. The caller is responsible for ensuring it originates
+        from a trusted source (contract.json `baseline_command` field
+        authored by the contract author). Untrusted user input MUST NOT
+        reach this method.
+
+        D5 catch-all: subprocess timeouts and spawn failures route to
+        `inconclusive` (not silent pass). Operator review handles them.
+
+        F fail-closed: when there's no prior baseline OR the prior was
+        clean, any current failure blocks. Naive equality on returncode
+        — full per-test diffing is deferred (see BaselineRecord).
+        """
+        try:
+            proc = subprocess.run(
+                test_command,
+                shell=True,
+                cwd=str(self.ctx.worktree_path),
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+        except subprocess.TimeoutExpired as e:
+            return GateResult(
+                status="inconclusive",
+                details={
+                    "gate": "gate1_baseline",
+                    "reason": "timeout",
+                    "timeout_sec": timeout_sec,
+                    "stderr_tail": (e.stderr or b"").decode(
+                        "utf-8", errors="replace"
+                    )[-2000:] if isinstance(e.stderr, (bytes, bytearray))
+                    else (e.stderr or "")[-2000:],
+                },
+            )
+        except OSError as e:
+            return GateResult(
+                status="inconclusive",
+                details={
+                    "gate": "gate1_baseline",
+                    "reason": "spawn_failed",
+                    "error": f"{type(e).__name__}: {e}",
+                },
+            )
+
+        if proc.returncode == 0:
+            return GateResult(
+                status="pass",
+                details={"pre_existing_fails": []},
+            )
+        # Newly failing relative to integration target. v0.8.1 cost:
+        # naive returncode equality (no per-test diffing yet).
+        return GateResult(
+            status="fail",
+            details={
+                "block_row": 7,
+                "stderr_tail": proc.stderr[-2000:],
+                "returncode": proc.returncode,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Gate 3 — manifest verification (wires T11).
+    # ------------------------------------------------------------------
+
+    def gate3_manifest(
+        self, *, manifest: TaskManifest, facts: TaskFacts,
+    ) -> GateResult:
+        """Delegate to T11's `verify_manifest_against_facts`. T11 already
+        covers all 4 git disk layers (HEAD diff / staged / unstaged /
+        untracked) via `derive_task_facts`; T12 must NOT short-circuit by
+        reading a subset.
+
+        Translates `ManifestVerdict` → `GateResult`:
+          - decision=pass  → status=pass, details["shared"] populated
+          - decision=block → status=fail, block_row + violations preserved
+        """
+        verdict = verify_manifest_against_facts(
+            self.contract, manifest, facts,
+        )
+        if verdict.decision == "pass":
+            return GateResult(
+                status="pass",
+                details={
+                    "shared_artifacts_touched":
+                        list(verdict.shared_artifacts_touched),
+                },
+            )
+        return GateResult(
+            status="fail",
+            details={
+                "block_row": verdict.block_row,
+                "violations": list(verdict.violations),
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Gate 5 — acceptance criteria (wires T7 run_one + T8 evaluate).
+    # ------------------------------------------------------------------
+
+    def gate5_acceptance(
+        self,
+        *,
+        criteria: list,  # list[AcceptanceCriterion]; runtime-typed
+        attempt_id: str,
+        retry_idx: int,
+    ) -> GateResult:
+        """Iterate `criteria` in declared order. For each:
+          1. `AcceptanceRunner.run_one` executes the criterion.
+          2. `evaluate_criterion(phase=2)` produces an `EvalDecision`.
+
+        First non-PASS decision halts and returns a `GateResult`.
+
+        D6 status guard — explicit branch for every EvalDecision value:
+          PASS                    → continue to next criterion
+          LOCAL_FIX_ALLOWED       → fail / escalate=False / block_row=5
+                                    (T15 retry-loop reads decision tag)
+          BLOCK_ROW5              → fail / escalate=False / block_row=5
+          BLOCKED_ESCALATE_ROW6   → fail / escalate=True  / block_row=6
+          INCONCLUSIVE            → inconclusive / escalate=False
+                                    (T9 owns the resume path)
+
+        A new EvalDecision variant added later without updating this
+        mapping falls into the explicit ``else`` branch which routes to
+        ``inconclusive`` so the regression is surfaced (not silently
+        treated as ``pass``).
+        """
+        # Lazy import — flow_acceptance pulls in heavier modules and we
+        # don't want to import-couple the orchestrator's dry-run path.
+        from flow_acceptance import (  # type: ignore
+            AcceptanceRunner, EvalDecision,
+        )
+
+        runner = AcceptanceRunner(
+            worktree_root=self.ctx.worktree_path,
+            log_dir=self.task_dir / "logs" / "acceptance",
+            slug=self.ctx.slug,
+            task_id=self.task_id,
+            run_id=self.run_id,
+            worktree_id=self.ctx.worktree_id,
+        )
+
+        for idx, crit in enumerate(criteria):
+            result = runner.run_one(
+                crit,
+                criterion_idx=idx,
+                attempt_id=attempt_id,
+                retry_idx=retry_idx,
+                task_dir=self.task_dir,
+            )
+            decision = runner.evaluate_criterion(
+                crit, phase=2, runner_result=result,
+            )
+
+            if decision == EvalDecision.PASS:
+                continue
+
+            base_details = {
+                "halted_at_idx": idx,
+                "criterion_description": crit.description,
+                "decision": decision.value,
+                "run_status": result.status,
+            }
+
+            if decision == EvalDecision.LOCAL_FIX_ALLOWED:
+                # T15 retry-loop reads the `decision` tag and may attempt
+                # a local fix + retry. Block row 5 keeps the routing
+                # parity with the operator-review fallback if the retry
+                # budget is exhausted.
+                return GateResult(
+                    status="fail",
+                    escalate=False,
+                    details={**base_details, "block_row": 5},
+                )
+            if decision == EvalDecision.BLOCK_ROW5:
+                return GateResult(
+                    status="fail",
+                    escalate=False,
+                    details={**base_details, "block_row": 5},
+                )
+            if decision == EvalDecision.BLOCKED_ESCALATE_ROW6:
+                return GateResult(
+                    status="fail",
+                    escalate=True,
+                    details={**base_details, "block_row": 6},
+                )
+            if decision == EvalDecision.INCONCLUSIVE:
+                return GateResult(
+                    status="inconclusive",
+                    escalate=False,
+                    details=base_details,
+                )
+            # D6 defense-in-depth: an EvalDecision variant added later
+            # without an explicit branch above lands here. Don't silently
+            # pass; surface as inconclusive so operator review catches it.
+            return GateResult(
+                status="inconclusive",
+                escalate=False,
+                details={
+                    **base_details,
+                    "reason": "unknown_eval_decision",
+                },
+            )
+
+        return GateResult(
+            status="pass",
+            details={"criteria_count": len(criteria)},
+        )
+
+    # ------------------------------------------------------------------
+    # Gate 6 — final regression smoke.
+    # ------------------------------------------------------------------
+
+    def gate6_regression(
+        self, *, smoke_command: str,
+        timeout_sec: int = _DEFAULT_GATE_TIMEOUT_SEC,
+    ) -> GateResult:
+        """Run `smoke_command` inside `ctx.worktree_path`. Mirrors gate 1
+        in shape but lands LATER in the chain (post-acceptance). Failure
+        blocks on §1 row 5 (regular block, no escalate menu) per plan
+        §12.8; design §1 row 8 alignment is a T13 follow-up.
+
+        Same trust boundary + timeout semantics as gate 1.
+        """
+        try:
+            proc = subprocess.run(
+                smoke_command,
+                shell=True,
+                cwd=str(self.ctx.worktree_path),
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+        except subprocess.TimeoutExpired as e:
+            return GateResult(
+                status="inconclusive",
+                details={
+                    "gate": "gate6_regression",
+                    "reason": "timeout",
+                    "timeout_sec": timeout_sec,
+                    "stderr_tail": (e.stderr or b"").decode(
+                        "utf-8", errors="replace"
+                    )[-2000:] if isinstance(e.stderr, (bytes, bytearray))
+                    else (e.stderr or "")[-2000:],
+                },
+            )
+        except OSError as e:
+            return GateResult(
+                status="inconclusive",
+                details={
+                    "gate": "gate6_regression",
+                    "reason": "spawn_failed",
+                    "error": f"{type(e).__name__}: {e}",
+                },
+            )
+
+        if proc.returncode == 0:
+            return GateResult(status="pass")
+        return GateResult(
+            status="fail",
+            details={
+                "block_row": 5,
+                "stderr_tail": proc.stderr[-2000:],
+                "returncode": proc.returncode,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 2 chain — gates 1 → 3 → 5 → 6 (T13 inserts gate 4 between 3
+    # and 5; T15 inserts gate 2 before gate 1 + gates 7/8 after gate 6).
+    # ------------------------------------------------------------------
+
+    def run_phase2(
+        self,
+        *,
+        manifest: TaskManifest,
+        facts: TaskFacts,
+        criteria: list,  # list[AcceptanceCriterion]
+        attempt_id: str,
+        retry_idx: int,
+        baseline_command: str,
+        smoke_command: str,
+        baseline_timeout_sec: int = _DEFAULT_GATE_TIMEOUT_SEC,
+        smoke_timeout_sec: int = _DEFAULT_GATE_TIMEOUT_SEC,
+    ) -> Phase2Verdict:
+        """Chain the four T12-owned gates in declared order.
+
+        First non-pass result halts and returns a `Phase2Verdict` with
+        `halted_at_gate` naming the gate. Caller branches on
+        `gate_result.escalate` for blocked.md routing.
+
+        ``inconclusive`` from any gate also halts (it's "could not
+        produce a verdict" — operator review owns the resolution).
+        """
+        r = self.gate1_baseline(
+            test_command=baseline_command,
+            timeout_sec=baseline_timeout_sec,
+        )
+        if r.status != "pass":
+            return Phase2Verdict(
+                status="blocked",
+                halted_at_gate="gate1_baseline",
+                gate_result=r,
+            )
+
+        r = self.gate3_manifest(manifest=manifest, facts=facts)
+        if r.status != "pass":
+            return Phase2Verdict(
+                status="blocked",
+                halted_at_gate="gate3_manifest",
+                gate_result=r,
+            )
+
+        r = self.gate5_acceptance(
+            criteria=criteria,
+            attempt_id=attempt_id,
+            retry_idx=retry_idx,
+        )
+        if r.status != "pass":
+            return Phase2Verdict(
+                status="blocked",
+                halted_at_gate="gate5_acceptance",
+                gate_result=r,
+            )
+
+        r = self.gate6_regression(
+            smoke_command=smoke_command,
+            timeout_sec=smoke_timeout_sec,
+        )
+        if r.status != "pass":
+            return Phase2Verdict(
+                status="blocked",
+                halted_at_gate="gate6_regression",
+                gate_result=r,
+            )
+
+        return Phase2Verdict(status="pass")
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="flow orchestrator")
     parser.add_argument("--dry-run", metavar="SLUG", help="Print plan + manifest")

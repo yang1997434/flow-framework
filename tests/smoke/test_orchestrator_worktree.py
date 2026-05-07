@@ -22,11 +22,14 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from flow_orchestrator import (  # type: ignore
     WorktreeContext, TaskFacts, TaskManifest,
     DispatchOutcome, ManifestVerdict,
+    GateResult, BaselineRecord, Phase2Verdict, GateRunner,
     create_task_worktree, derive_task_facts, auto_dispatch_task,
     verify_manifest_against_facts,
 )
 from flow_state_writer import EVENT_AUTO_ENGAGED  # type: ignore
-from flow_contract import Contract, CONTRACT_SCHEMA_VERSION  # type: ignore
+from flow_contract import (  # type: ignore
+    Contract, CONTRACT_SCHEMA_VERSION, AcceptanceCriterion,
+)
 
 
 def _empty_manifest(id: str = "T0") -> TaskManifest:
@@ -790,6 +793,321 @@ class TestAutoDispatchManifestBlock(unittest.TestCase):
         self.assertFalse(
             (self.tmp / ".flow" / "tasks" / "demo" / "blocked.md").exists()
         )
+
+
+# ----------------------------------------------------------------------
+# T12 — GateRunner: gates 1, 3, 5, 6 + run_phase2 chain.
+# ----------------------------------------------------------------------
+
+
+def _make_gate_runner_ctx(tmp: Path) -> tuple[WorktreeContext, Contract, Path]:
+    """Shared fixture for GateRunner tests. Builds a real worktree (so
+    gate1/gate6 subprocess `cwd=...` is valid) + a minimal Contract +
+    a per-task task_dir.
+    """
+    _init_repo(tmp)
+    ctx = create_task_worktree(
+        repo_root=tmp, slug="t12demo", task_idx=0,
+        integration_target="master",
+    )
+    contract = Contract(
+        contract_schema_version=CONTRACT_SCHEMA_VERSION,
+        autonomy_mode="auto_default",
+        created_at="2026-05-06T00:00:00Z",
+        scope_allowed=["src/**"],
+        scope_forbidden=["secrets/**"],
+    )
+    task_dir = tmp / ".flow" / "tasks" / "t12demo"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    return ctx, contract, task_dir
+
+
+class TestGate1Baseline(unittest.TestCase):
+    """§1 row 7: baseline newly broken → block. Q3.1: runs INSIDE worktree."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="t12-gate1-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ctx, self.contract, self.task_dir = _make_gate_runner_ctx(
+            self.tmp,
+        )
+
+    def test_baseline_clean_passes(self) -> None:
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r1", task_id="T0",
+        )
+        r = gr.gate1_baseline(test_command="true")
+        self.assertEqual(r.status, "pass")
+        self.assertEqual(r.details["pre_existing_fails"], [])
+
+    def test_baseline_newly_fail_blocks_row7(self) -> None:
+        """No prior baseline AND current fails → block row 7 (F-class
+        fail-closed)."""
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r1", task_id="T0",
+            prior_baseline=BaselineRecord(failing=[]),
+        )
+        r = gr.gate1_baseline(test_command="false")
+        self.assertEqual(r.status, "fail")
+        self.assertEqual(r.details["block_row"], 7)
+        self.assertEqual(r.details["returncode"], 1)
+
+    def test_baseline_timeout_returns_inconclusive(self) -> None:
+        """D5 catch-all: subprocess timeout MUST NOT silently pass; routes
+        to operator review via inconclusive."""
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r1", task_id="T0",
+        )
+        r = gr.gate1_baseline(test_command="sleep 5", timeout_sec=1)
+        self.assertEqual(r.status, "inconclusive")
+        self.assertEqual(r.details["reason"], "timeout")
+
+
+class TestGate3Manifest(unittest.TestCase):
+    """Wires T11 verifier. Pass for clean facts; fail with block_row when
+    forbidden / out-of-scope facts are detected."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="t12-gate3-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ctx, self.contract, self.task_dir = _make_gate_runner_ctx(
+            self.tmp,
+        )
+        self.manifest = TaskManifest(
+            id="T0", writes_declared=["src/foo.py"],
+            allowed_writes=["src/foo.py"],
+            out_of_scope=[], forbidden_hits=[], shared_hits=[],
+        )
+
+    def test_gate3_returns_pass_for_clean_facts(self) -> None:
+        facts = TaskFacts(
+            changed_files=["src/foo.py"], newly_added_files=[],
+            diff_hash="x", target_commit_pre_merge="y",
+        )
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r1", task_id="T0",
+        )
+        r = gr.gate3_manifest(manifest=self.manifest, facts=facts)
+        self.assertEqual(r.status, "pass")
+        self.assertEqual(r.details["shared_artifacts_touched"], [])
+
+    def test_gate3_returns_fail_for_forbidden(self) -> None:
+        facts = TaskFacts(
+            changed_files=["secrets/key.pem"], newly_added_files=[],
+            diff_hash="x", target_commit_pre_merge="y",
+        )
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r1", task_id="T0",
+        )
+        r = gr.gate3_manifest(manifest=self.manifest, facts=facts)
+        self.assertEqual(r.status, "fail")
+        self.assertEqual(r.details["block_row"], 3)
+        self.assertIn("secrets/key.pem", r.details["violations"])
+
+
+class TestGate5Acceptance(unittest.TestCase):
+    """Iterates criteria; halts on first non-PASS via T7 run_one + T8
+    evaluate_criterion(phase=2). D6 status guard: every EvalDecision branch
+    has an explicit mapping."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="t12-gate5-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ctx, self.contract, self.task_dir = _make_gate_runner_ctx(
+            self.tmp,
+        )
+
+    def test_gate5_passes_when_all_criteria_pass(self) -> None:
+        # Use file_exists method so no subprocess is needed; VERSION was
+        # created by _init_repo and is committed in the worktree.
+        criteria = [
+            AcceptanceCriterion(
+                description="version present",
+                type="unit", method="file_exists",
+                path="VERSION", timeout_sec=30,
+            ),
+        ]
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r1", task_id="T0",
+        )
+        r = gr.gate5_acceptance(
+            criteria=criteria, attempt_id="a1", retry_idx=0,
+        )
+        self.assertEqual(r.status, "pass")
+        self.assertEqual(r.details["criteria_count"], 1)
+
+    def test_gate5_halts_on_first_local_fix_allowed(self) -> None:
+        """Phase 2 unit fail → LOCAL_FIX_ALLOWED. Halts at idx 0; the
+        second criterion must NOT execute."""
+        criteria = [
+            AcceptanceCriterion(
+                description="failing unit",
+                type="unit", method="cmd",
+                command="false", timeout_sec=10,
+            ),
+            AcceptanceCriterion(
+                description="would-pass unit",
+                type="unit", method="cmd",
+                command="true", timeout_sec=10,
+            ),
+        ]
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r1", task_id="T0",
+        )
+        r = gr.gate5_acceptance(
+            criteria=criteria, attempt_id="a1", retry_idx=0,
+        )
+        self.assertEqual(r.status, "fail")
+        self.assertEqual(r.details["halted_at_idx"], 0)
+        self.assertEqual(r.details["decision"], "local_fix_allowed")
+        self.assertEqual(r.details["block_row"], 5)
+        self.assertFalse(r.escalate)
+
+    def test_gate5_e2e_fail_propagates_escalate(self) -> None:
+        """e2e fail → BLOCKED_ESCALATE_ROW6 with escalate=True (Y1)."""
+        criteria = [
+            AcceptanceCriterion(
+                description="e2e flow",
+                type="e2e", method="cmd",
+                command="false", timeout_sec=10,
+            ),
+        ]
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r1", task_id="T0",
+        )
+        r = gr.gate5_acceptance(
+            criteria=criteria, attempt_id="a1", retry_idx=0,
+        )
+        self.assertEqual(r.status, "fail")
+        self.assertTrue(r.escalate)
+        self.assertEqual(r.details["block_row"], 6)
+        self.assertEqual(r.details["decision"], "blocked_escalate_row6")
+
+
+class TestGate6Regression(unittest.TestCase):
+    """Final regression smoke. Mirrors gate 1 in shape but later in chain."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="t12-gate6-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ctx, self.contract, self.task_dir = _make_gate_runner_ctx(
+            self.tmp,
+        )
+
+    def test_gate6_passes_when_smoke_returns_zero(self) -> None:
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r1", task_id="T0",
+        )
+        r = gr.gate6_regression(smoke_command="true")
+        self.assertEqual(r.status, "pass")
+
+    def test_gate6_fails_when_smoke_returns_nonzero(self) -> None:
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r1", task_id="T0",
+        )
+        r = gr.gate6_regression(smoke_command="false")
+        self.assertEqual(r.status, "fail")
+        self.assertEqual(r.details["block_row"], 5)
+        self.assertIn("returncode", r.details)
+
+
+class TestRunPhase2Chain(unittest.TestCase):
+    """End-to-end: gate1 → gate3 → gate5 → gate6 chain via run_phase2.
+    First non-pass halts; later gates do NOT execute."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="t12-phase2-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ctx, self.contract, self.task_dir = _make_gate_runner_ctx(
+            self.tmp,
+        )
+        self.manifest = TaskManifest(
+            id="T0", writes_declared=["src/foo.py"],
+            allowed_writes=["src/foo.py"],
+            out_of_scope=[], forbidden_hits=[], shared_hits=[],
+        )
+        self.clean_facts = TaskFacts(
+            changed_files=["src/foo.py"], newly_added_files=[],
+            diff_hash="x", target_commit_pre_merge="y",
+        )
+        self.criteria = [
+            AcceptanceCriterion(
+                description="version present",
+                type="unit", method="file_exists",
+                path="VERSION", timeout_sec=30,
+            ),
+        ]
+
+    def test_run_phase2_full_pass(self) -> None:
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r1", task_id="T0",
+        )
+        v = gr.run_phase2(
+            manifest=self.manifest, facts=self.clean_facts,
+            criteria=self.criteria,
+            attempt_id="a1", retry_idx=0,
+            baseline_command="true", smoke_command="true",
+        )
+        self.assertEqual(v.status, "pass")
+        self.assertIsNone(v.halted_at_gate)
+        self.assertIsNone(v.gate_result)
+
+    def test_run_phase2_halts_at_gate1_when_baseline_fails(self) -> None:
+        """Baseline failure → halt before gate3/5/6 fire. The forbidden
+        facts that would normally fail gate3 are passed but never reached
+        — the chain halts at gate1."""
+        forbidden_facts = TaskFacts(
+            changed_files=["secrets/key.pem"], newly_added_files=[],
+            diff_hash="x", target_commit_pre_merge="y",
+        )
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r1", task_id="T0",
+        )
+        v = gr.run_phase2(
+            manifest=self.manifest, facts=forbidden_facts,
+            criteria=self.criteria,
+            attempt_id="a1", retry_idx=0,
+            baseline_command="false",   # halts here
+            smoke_command="true",
+        )
+        self.assertEqual(v.status, "blocked")
+        self.assertEqual(v.halted_at_gate, "gate1_baseline")
+        self.assertIsNotNone(v.gate_result)
+        self.assertEqual(v.gate_result.status, "fail")
+        self.assertEqual(v.gate_result.details["block_row"], 7)
+
+    def test_run_phase2_halts_at_gate3_when_manifest_violates(self) -> None:
+        """Baseline passes; manifest verifier blocks → halt before gate5/6."""
+        forbidden_facts = TaskFacts(
+            changed_files=["secrets/key.pem"], newly_added_files=[],
+            diff_hash="x", target_commit_pre_merge="y",
+        )
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r1", task_id="T0",
+        )
+        v = gr.run_phase2(
+            manifest=self.manifest, facts=forbidden_facts,
+            criteria=self.criteria,
+            attempt_id="a1", retry_idx=0,
+            baseline_command="true",
+            smoke_command="true",
+        )
+        self.assertEqual(v.status, "blocked")
+        self.assertEqual(v.halted_at_gate, "gate3_manifest")
+        self.assertEqual(v.gate_result.details["block_row"], 3)
 
 
 if __name__ == "__main__":
