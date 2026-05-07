@@ -20,11 +20,28 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 from flow_orchestrator import (  # type: ignore
-    WorktreeContext, TaskFacts,
+    WorktreeContext, TaskFacts, TaskManifest,
+    DispatchOutcome, ManifestVerdict,
     create_task_worktree, derive_task_facts, auto_dispatch_task,
+    verify_manifest_against_facts,
 )
 from flow_state_writer import EVENT_AUTO_ENGAGED  # type: ignore
 from flow_contract import Contract, CONTRACT_SCHEMA_VERSION  # type: ignore
+
+
+def _empty_manifest(id: str = "T0") -> TaskManifest:
+    """Minimal TaskManifest fixture for `auto_dispatch_task` callers that
+    don't care about scope-vs-declared-writes interaction (T10-style
+    boundary tests). T11's verifier reads `contract.scope_*`, not
+    `manifest.*` — `manifest.id` is the only field consumed here."""
+    return TaskManifest(
+        id=id,
+        writes_declared=[],
+        allowed_writes=[],
+        out_of_scope=[],
+        forbidden_hits=[],
+        shared_hits=[],
+    )
 
 
 def _init_repo(path: Path) -> None:
@@ -182,6 +199,7 @@ class TestAutoDispatchTask(unittest.TestCase):
             slug="demo", task_idx=0, repo_root=self.tmp,
             dispatch_fn=fake_dispatch,
             contract=self.contract,
+            manifest=_empty_manifest(),
             run_id="run-abc",
             contract_path=self.tmp / "contract.json",
             contract_hash="cafebabe" * 8,
@@ -204,6 +222,7 @@ class TestAutoDispatchTask(unittest.TestCase):
                 slug="demo", task_idx=0, repo_root=self.tmp,
                 dispatch_fn=crashing_dispatch,
                 contract=self.contract,
+                manifest=_empty_manifest(),
                 run_id="run-abc",
                 contract_path=self.tmp / "contract.json",
                 contract_hash="cafebabe" * 8,
@@ -245,18 +264,22 @@ class TestAutoDispatchTask(unittest.TestCase):
             # Lying narrative — must be ignored by orchestrator.
             return {"changed_files": ["LIES.md"], "diff_hash": "0" * 64}
 
-        facts = auto_dispatch_task(
+        outcome = auto_dispatch_task(
             slug="demo", task_idx=0, repo_root=self.tmp,
             dispatch_fn=writing_dispatch,
             contract=self.contract,
+            manifest=_empty_manifest(),
             run_id="run-xyz",
             contract_path=self.tmp / "contract.json",
             contract_hash="deadbeef" * 8,
         )
-        self.assertIsInstance(facts, TaskFacts)
-        self.assertIn("evidence.py", facts.changed_files)
-        self.assertNotIn("LIES.md", facts.changed_files)
-        self.assertNotEqual(facts.diff_hash, "0" * 64)
+        # T11: return type is DispatchOutcome; facts is a nested attr.
+        self.assertIsInstance(outcome, DispatchOutcome)
+        self.assertEqual(outcome.status, "ok")
+        self.assertIsInstance(outcome.facts, TaskFacts)
+        self.assertIn("evidence.py", outcome.facts.changed_files)
+        self.assertNotIn("LIES.md", outcome.facts.changed_files)
+        self.assertNotEqual(outcome.facts.diff_hash, "0" * 64)
 
 
 class TestCreateTaskWorktreeValidation(unittest.TestCase):
@@ -349,6 +372,7 @@ class TestAutoDispatchTaskValidation(unittest.TestCase):
             slug="demo", task_idx=0, repo_root=self.tmp,
             dispatch_fn=lambda _ctx: None,
             contract=self.contract,
+            manifest=_empty_manifest(),
             run_id="run-abc",
             contract_path=self.tmp / "contract.json",
             contract_hash="deadbeef" * 8,
@@ -397,6 +421,258 @@ class TestAutoDispatchTaskValidation(unittest.TestCase):
     def test_wrong_type_contract_rejected(self) -> None:
         with self.assertRaises(ValueError):
             self._call(contract={"contract_schema_version": 1})  # type: ignore[arg-type]
+
+    def test_wrong_type_manifest_rejected(self) -> None:
+        """T11: `manifest` is required and must be a TaskManifest. Same
+        F-class fail-closed reasoning as `contract`: without this guard
+        a None manifest would create the worktree first and only blow
+        up later when reading `manifest.id` for the auto_engaged event.
+        """
+        with self.assertRaises(ValueError):
+            self._call(manifest=None)  # type: ignore[arg-type]
+
+
+class TestVerifyManifestAgainstFacts(unittest.TestCase):
+    """Plan §11.1 — pure-function verifier cases against a fixed contract.
+
+    contract.scope_allowed = ["src/**", "tests/**"]
+    contract.scope_forbidden = ["src/secrets/**"]
+
+    Order of precedence the verifier promises (C-blindspot):
+      forbidden glob > shared artifacts > out-of-scope.
+    """
+
+    def setUp(self) -> None:
+        self.contract = Contract(
+            contract_schema_version=CONTRACT_SCHEMA_VERSION,
+            autonomy_mode="auto",
+            created_at="2026-05-06T00:00:00Z",
+            scope_allowed=["src/**", "tests/**"],
+            scope_forbidden=["src/secrets/**"],
+        )
+        self.manifest = TaskManifest(
+            id="T1",
+            writes_declared=["src/foo.py"],
+            allowed_writes=["src/foo.py"],
+            out_of_scope=[],
+            forbidden_hits=[],
+            shared_hits=[],
+        )
+
+    def test_forbidden_path_in_facts_blocks(self) -> None:
+        facts = TaskFacts(
+            changed_files=["src/foo.py", "src/secrets/key.pem"],
+            newly_added_files=[],
+            diff_hash="x",
+            target_commit_pre_merge="y",
+        )
+        v = verify_manifest_against_facts(self.contract, self.manifest, facts)
+        self.assertEqual(v.decision, "block")
+        self.assertEqual(v.block_row, 3)
+        self.assertIn("src/secrets/key.pem", v.violations)
+
+    def test_out_of_scope_in_facts_blocks(self) -> None:
+        facts = TaskFacts(
+            changed_files=["src/foo.py", "infra/deploy.yml"],
+            newly_added_files=[],
+            diff_hash="x",
+            target_commit_pre_merge="y",
+        )
+        v = verify_manifest_against_facts(self.contract, self.manifest, facts)
+        self.assertEqual(v.decision, "block")
+        self.assertEqual(v.block_row, 3)
+        self.assertIn("infra/deploy.yml", v.violations)
+
+    def test_untracked_added_outside_scope_blocks_row4(self) -> None:
+        facts = TaskFacts(
+            changed_files=["src/foo.py", "scripts/rogue.sh"],
+            newly_added_files=["scripts/rogue.sh"],
+            diff_hash="x",
+            target_commit_pre_merge="y",
+        )
+        v = verify_manifest_against_facts(self.contract, self.manifest, facts)
+        self.assertEqual(v.decision, "block")
+        self.assertEqual(v.block_row, 4)
+        self.assertIn("scripts/rogue.sh", v.violations)
+
+    def test_shared_artifact_warns_not_blocks(self) -> None:
+        facts = TaskFacts(
+            changed_files=["src/foo.py", "VERSION"],
+            newly_added_files=[],
+            diff_hash="x",
+            target_commit_pre_merge="y",
+        )
+        v = verify_manifest_against_facts(self.contract, self.manifest, facts)
+        self.assertEqual(v.decision, "pass")
+        self.assertIn("VERSION", v.shared_artifacts_touched)
+        self.assertEqual(v.violations, [])
+
+    def test_clean_facts_pass(self) -> None:
+        facts = TaskFacts(
+            changed_files=["src/foo.py", "tests/test_foo.py"],
+            newly_added_files=["tests/test_foo.py"],
+            diff_hash="x",
+            target_commit_pre_merge="y",
+        )
+        v = verify_manifest_against_facts(self.contract, self.manifest, facts)
+        self.assertEqual(v.decision, "pass")
+        self.assertEqual(v.violations, [])
+        self.assertEqual(v.shared_artifacts_touched, [])
+
+    def test_forbidden_precedence_over_allowed(self) -> None:
+        """C-blindspot: a path that matches BOTH `scope_forbidden` and
+        `scope_allowed` must block (forbidden wins). With our fixture,
+        `src/secrets/key.pem` matches BOTH `src/secrets/**` (forbidden)
+        AND `src/**` (allowed). The verifier must classify it as a
+        forbidden hit, not let allowed-match short-circuit the check.
+        """
+        facts = TaskFacts(
+            changed_files=["src/secrets/key.pem"],
+            newly_added_files=[],
+            diff_hash="x",
+            target_commit_pre_merge="y",
+        )
+        v = verify_manifest_against_facts(self.contract, self.manifest, facts)
+        self.assertEqual(v.decision, "block")
+        self.assertEqual(v.block_row, 3)
+
+    def test_empty_scope_allowed_skips_out_of_scope_check(self) -> None:
+        """F-blindspot fail-open closure documented behavior: an empty
+        `scope_allowed` list means "no allowlist configured" — out-of-
+        scope check is skipped (matches v0.8.0 `build_plan()` advisory
+        semantics). Forbidden + shared steps still run."""
+        contract = Contract(
+            contract_schema_version=CONTRACT_SCHEMA_VERSION,
+            autonomy_mode="auto",
+            created_at="2026-05-06T00:00:00Z",
+            scope_allowed=[],
+            scope_forbidden=["src/secrets/**"],
+        )
+        # Forbidden hit still blocks even with empty allowlist.
+        facts = TaskFacts(
+            changed_files=["anywhere/file.py", "src/secrets/key.pem"],
+            newly_added_files=[],
+            diff_hash="x",
+            target_commit_pre_merge="y",
+        )
+        v = verify_manifest_against_facts(contract, self.manifest, facts)
+        self.assertEqual(v.decision, "block")
+        self.assertEqual(v.block_row, 3)
+        self.assertEqual(v.violations, ["src/secrets/key.pem"])
+
+    def test_real_world_glob_pattern(self) -> None:
+        """E-blindspot: validation rules vs real data. Matcher must
+        accept the patterns this project's own contracts will use:
+        `src/**` matches files at depth 1, 2, 3+. `scripts/**.py`
+        (would-be) etc. Test against actual repo-relative paths.
+        """
+        import fnmatch
+        # Sanity-check the underlying matcher does what the plan
+        # expects before the verifier relies on it.
+        self.assertTrue(fnmatch.fnmatch("src/foo.py", "src/**"))
+        self.assertTrue(fnmatch.fnmatch("src/a/b.py", "src/**"))
+        self.assertTrue(fnmatch.fnmatch("src/a/b/c.py", "src/**"))
+        self.assertFalse(fnmatch.fnmatch("infra/x.yml", "src/**"))
+        self.assertFalse(fnmatch.fnmatch("VERSION", "src/**"))
+
+
+class TestAutoDispatchManifestBlock(unittest.TestCase):
+    """Plan §11.3 — end-to-end: subagent edits forbidden file →
+    `auto_dispatch_task` writes blocked.md (block_type=manifest_violation)
+    and returns a blocked DispatchOutcome.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        _init_repo(self.tmp)
+        (self.tmp / ".flow" / "tasks" / "demo").mkdir(parents=True)
+        self.contract = Contract(
+            contract_schema_version=CONTRACT_SCHEMA_VERSION,
+            autonomy_mode="auto",
+            created_at="2026-05-06T00:00:00Z",
+            scope_allowed=["src/**"],
+            scope_forbidden=["secrets/**"],
+        )
+        self.manifest = TaskManifest(
+            id="T1",
+            writes_declared=["src/foo.py"],
+            allowed_writes=["src/foo.py"],
+            out_of_scope=[],
+            forbidden_hits=[],
+            shared_hits=[],
+        )
+
+    def test_dispatch_block_on_manifest_violation(self) -> None:
+        """Subagent writes a forbidden file inside the worktree;
+        orchestrator must detect it post-dispatch and block."""
+
+        def rogue_dispatch(ctx: WorktreeContext) -> None:
+            secrets_dir = ctx.worktree_path / "secrets"
+            secrets_dir.mkdir(parents=True)
+            (secrets_dir / "key.pem").write_text("PRIVATE\n")
+            subprocess.run(
+                ["git", "-C", str(ctx.worktree_path), "add", "."],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(ctx.worktree_path),
+                 "commit", "-q", "-m", "subagent rogue write"],
+                check=True,
+            )
+
+        outcome = auto_dispatch_task(
+            slug="demo", task_idx=0, repo_root=self.tmp,
+            dispatch_fn=rogue_dispatch,
+            contract=self.contract,
+            manifest=self.manifest,
+            run_id="run-blk",
+            contract_path=self.tmp / "contract.json",
+            contract_hash="deadbeef" * 8,
+        )
+        self.assertIsInstance(outcome, DispatchOutcome)
+        self.assertEqual(outcome.status, "blocked")
+        self.assertEqual(outcome.block_type, "manifest_violation")
+        self.assertEqual(outcome.block_row, 3)  # forbidden hit → row 3.
+        self.assertIsNotNone(outcome.blocked_md_path)
+        # blocked.md content surfaces the violation classification.
+        blocked = outcome.blocked_md_path.read_text()
+        self.assertIn("manifest_violation", blocked)
+        self.assertIn("secrets/key.pem", blocked)
+
+    def test_dispatch_ok_on_clean_diff(self) -> None:
+        """Same orchestration shell, but subagent writes only in-scope.
+        Outcome.status must be "ok" with no blocked.md side effect."""
+
+        def clean_dispatch(ctx: WorktreeContext) -> None:
+            (ctx.worktree_path / "src").mkdir(parents=True)
+            (ctx.worktree_path / "src" / "foo.py").write_text("# ok\n")
+            subprocess.run(
+                ["git", "-C", str(ctx.worktree_path), "add", "."],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(ctx.worktree_path),
+                 "commit", "-q", "-m", "in-scope edit"],
+                check=True,
+            )
+
+        outcome = auto_dispatch_task(
+            slug="demo", task_idx=0, repo_root=self.tmp,
+            dispatch_fn=clean_dispatch,
+            contract=self.contract,
+            manifest=self.manifest,
+            run_id="run-ok",
+            contract_path=self.tmp / "contract.json",
+            contract_hash="deadbeef" * 8,
+        )
+        self.assertEqual(outcome.status, "ok")
+        self.assertIsNone(outcome.block_type)
+        self.assertIsNone(outcome.block_row)
+        self.assertIsNone(outcome.blocked_md_path)
+        self.assertFalse(
+            (self.tmp / ".flow" / "tasks" / "demo" / "blocked.md").exists()
+        )
 
 
 if __name__ == "__main__":

@@ -35,6 +35,7 @@ from flow_contract import (  # type: ignore
 from progress_meta import read_progress_meta, ProgressMeta  # type: ignore
 from flow_state_writer import (  # type: ignore
     EVENT_AUTO_ENGAGED, append_autonomy_event, _new_event_id,
+    write_blocked,
 )
 
 
@@ -478,16 +479,132 @@ def derive_task_facts(ctx: WorktreeContext) -> TaskFacts:
     )
 
 
+# ----------------------------------------------------------------------
+# T11 — manifest violation enforcement (replaces v0.8.0 advisory dry-run).
+#
+# v0.8.0 `build_plan()` already computes `forbidden_hits / shared_hits /
+# out_of_scope` for the **declared** writes block in `progress.md`. T11
+# extends this from "advisory print at plan-time" to "enforce at runtime
+# against ACTUAL changed files derived from git".
+#
+# Per design §1 row 3 (file outside scope.allowed → block) + row 4
+# (untracked file outside scope → block) + the design-table separately
+# from row 14 (`shared` artifacts serialize via wave queue, NOT block —
+# T15 S1 territory; T11 surfaces them as advisory `shared_artifacts_touched`).
+#
+# Verifier identity: same primitives `_glob_match` + `SHARED_ARTIFACTS`
+# already used by `build_plan()` — so the enforcement view and the
+# advisory view share the same allowlist semantics. C2 frozenset-truth
+# audit: every `SHARED_ARTIFACTS` entry must be reachable. Our matcher
+# treats the path as a literal string equal-test (`path in
+# SHARED_ARTIFACTS`); paths from `git diff --name-only` are repo-relative
+# without `./` prefix, so `VERSION` matches `VERSION`. No normalization
+# is needed (and would silently break case-sensitive lookups on Linux).
+# ----------------------------------------------------------------------
+
+
+@dataclass
+class ManifestVerdict:
+    """T11 verdict from `verify_manifest_against_facts`. Caller branches
+    on `decision`; `block_row` (3 or 4) routes the blocked.md frontmatter.
+    `shared_artifacts_touched` is advisory (NOT a block per §1 row 14
+    semantics — wave-serialize logic lives in T15 S1).
+    """
+    decision: str                       # "pass" | "block"
+    block_row: Optional[int] = None     # §1 row 3 or 4
+    violations: list[str] = field(default_factory=list)
+    shared_artifacts_touched: list[str] = field(default_factory=list)
+
+
+def verify_manifest_against_facts(
+    contract: Contract,
+    manifest: TaskManifest,
+    facts: TaskFacts,
+) -> ManifestVerdict:
+    """Verify the on-disk diff (`facts`) against the contract scope.
+
+    Order of precedence (C-blindspot — forbidden wins over allowed even
+    when both glob lists match the same path):
+      1. ``contract.scope_forbidden`` glob hit → block row 3.
+      2. ``path in SHARED_ARTIFACTS`` → advisory, skip allowed-check.
+      3. ``contract.scope_allowed`` non-empty AND path does NOT match →
+         block row 4 if path was newly added (untracked-style, §1 row 4),
+         else row 3 (existing-file modification outside scope, §1 row 3).
+
+    Empty-list semantics (F-blindspot fail-open closure):
+      - ``contract.scope_allowed == []`` is treated as "no allowlist
+        configured" → no row-3/row-4 block fires from out-of-scope (the
+        forbidden + shared steps still run). This matches v0.8.0
+        ``build_plan()`` semantics (line 172: ``if contract.scope_allowed
+        and ...``) so the advisory and enforcement views agree. Real
+        contracts always populate the list; an empty list is a contract
+        author's explicit "scope unknown — allow anywhere" signal.
+      - ``contract.scope_forbidden == []`` means "nothing forbidden"
+        (vacuously, no glob can match). This is also v0.8.0 parity.
+
+    `manifest` is accepted for symmetry with §11.4's signature contract
+    (T15 will likely consume it; T11 only reads `contract` + `facts`).
+    """
+    verdict = ManifestVerdict(decision="pass")
+    newly_set = set(facts.newly_added_files)
+
+    for path in facts.changed_files:
+        # Step 1 — forbidden globs always win (C-blindspot precedence).
+        if _glob_match(contract.scope_forbidden, path):
+            verdict.violations.append(path)
+            verdict.decision = "block"
+            verdict.block_row = 3
+            continue
+        # Step 2 — shared artifacts: advisory only, NOT a block.
+        if path in SHARED_ARTIFACTS:
+            verdict.shared_artifacts_touched.append(path)
+            continue
+        # Step 3 — out-of-scope (only when an allowlist is configured).
+        if (
+            contract.scope_allowed
+            and not _glob_match(contract.scope_allowed, path)
+        ):
+            verdict.violations.append(path)
+            verdict.decision = "block"
+            row = 4 if path in newly_set else 3
+            # Keep the lowest (= most severe) row already set. row 3 is
+            # the catch-all "file outside scope"; row 4 is the narrower
+            # "untracked added outside scope". A prior row 3 from a
+            # forbidden hit must not be downgraded to row 4.
+            if verdict.block_row is None or row < verdict.block_row:
+                verdict.block_row = row
+    return verdict
+
+
+@dataclass
+class DispatchOutcome:
+    """T11 return type for `auto_dispatch_task`. Lets the orchestrator
+    dispatch loop branch on block vs. ok without re-reading
+    ``blocked.md`` from disk. ``ctx`` is always populated (worktree
+    created); ``facts`` is also always populated post-T10 (dispatch
+    return-path always reads the diff). ``blocked_md_path`` is set ONLY
+    when ``status == "blocked"``.
+    """
+    status: str                        # "ok" | "blocked"
+    ctx: WorktreeContext
+    facts: TaskFacts
+    block_type: Optional[str] = None
+    block_row: Optional[int] = None
+    blocked_md_path: Optional[Path] = None
+
+
 def auto_dispatch_task(
     *, slug: str, task_idx: int, repo_root: Path,
     dispatch_fn,
     contract: Contract,
+    manifest: TaskManifest,
     run_id: str,
     contract_path: Path,
     contract_hash: str,
     integration_target: str = "master",
-) -> TaskFacts:
-    """T10 orchestration shell — minimal scaffolding for one auto task.
+    notifier: Optional["Notifier"] = None,  # type: ignore[name-defined]
+) -> "DispatchOutcome":
+    """T10 orchestration shell + T11 manifest enforcement.
 
     1. Create worktree (S6 dual-base: original == current at creation).
     2. Emit `auto_engaged` event into `decisions.jsonl` BEFORE invoking
@@ -495,11 +612,13 @@ def auto_dispatch_task(
     3. Invoke `dispatch_fn(ctx)` — opaque subagent boundary; the returned
        value is IGNORED per PRD §1.2 (subagent narrative is advisory).
     4. Read authoritative facts from disk via `derive_task_facts`.
+    5. (T11) Verify `facts` against `manifest`/`contract` scope. Forbidden
+       hit OR out-of-scope hit → write `blocked.md` (block_type =
+       ``manifest_violation``, row 3 or 4) and return a blocked outcome.
+       SHARED_ARTIFACTS hits are advisory (not a block; T15 S1 wave-
+       serializes cross-task contention).
 
-    Steps 5+ (manifest verify / acceptance gate / merge / cleanup) are
-    T11–T15 territory. T10 deliberately keeps this shell minimal so the
-    boundary contract (event-before-dispatch, facts-from-disk) is testable
-    without dragging in the full pipeline.
+    Steps 6+ (acceptance gate / merge / cleanup) are T12–T15 territory.
 
     Required parameters for the `auto_engaged` event payload:
       - `contract`: parsed Contract — used for `contract_schema_version`.
@@ -550,6 +669,15 @@ def auto_dispatch_task(
             f"auto_dispatch_task: contract_path must be a non-empty "
             f"Path; got {contract_path!r}"
         )
+    # T11: `manifest` is required for the post-dispatch verifier. It
+    # supplies `manifest.id` for the auto_engaged event's `task_id`
+    # field (§8.4 14-field schema) AND is reserved for T15 wave logic
+    # (e.g., shared-artifact serialization keys off `manifest.id`).
+    if not isinstance(manifest, TaskManifest):
+        raise ValueError(
+            f"auto_dispatch_task: manifest must be a TaskManifest; "
+            f"got {type(manifest).__name__}"
+        )
     task_dir = repo_root / ".flow" / "tasks" / slug
     ctx = create_task_worktree(
         repo_root=repo_root,
@@ -568,7 +696,7 @@ def auto_dispatch_task(
             "ts": ctx.created_at,
             "slug": slug,
             "run_id": run_id,
-            "task_id": f"T{task_idx}",
+            "task_id": manifest.id,
             "worktree_id": ctx.worktree_id,
             "worktree_path": str(ctx.worktree_path),
             "original_base_commit": ctx.original_base_commit,
@@ -584,7 +712,56 @@ def auto_dispatch_task(
     # (PRD §1.2: subagent narrative is advisory, never structured data).
     dispatch_fn(ctx)
     # Authoritative facts come from disk, not the dispatch return value.
-    return derive_task_facts(ctx)
+    facts = derive_task_facts(ctx)
+
+    # T11 — manifest verification on actual diff (§1 row 3 / row 4).
+    verdict = verify_manifest_against_facts(contract, manifest, facts)
+    if verdict.decision == "block":
+        why = (
+            f"manifest_violation (row {verdict.block_row}): "
+            f"{verdict.violations}"
+        )
+        choices = [
+            "abort_task",
+            "switch_to_interactive",
+            "extend_scope_with_rationale",
+        ]
+        resume = f"flow orchestrator --resume {slug}"
+        if notifier is not None:
+            # T16 path — Notifier handles Tier 1 (blocked.md) + Tier 2
+            # (OSC 9 + BEL). Duck-typed: any object exposing
+            # `fire_block(...)` returning the blocked.md path works.
+            blocked_md_path = notifier.fire_block(
+                block_type="manifest_violation",
+                phase=2,
+                task_id=manifest.id,
+                issue_id="manifest_violation",
+                why_blocked=why,
+                required_choice=choices,
+                safe_resume_command=resume,
+                frontmatter_extra={"block_row": verdict.block_row},
+            )
+        else:
+            # Back-compat path for unit tests + callers that don't yet
+            # construct a Notifier (Step 19.11 always passes one in
+            # production). Tier 2 is skipped — only blocked.md lands.
+            blocked_md_path = write_blocked(
+                task_dir,
+                phase=2,
+                task=manifest.id,
+                why_blocked=why,
+                required_choice=choices,
+                safe_resume_command=resume,
+            )
+        return DispatchOutcome(
+            status="blocked",
+            ctx=ctx,
+            facts=facts,
+            block_type="manifest_violation",
+            block_row=verdict.block_row,
+            blocked_md_path=blocked_md_path,
+        )
+    return DispatchOutcome(status="ok", ctx=ctx, facts=facts)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
