@@ -208,7 +208,7 @@ class TestAutoDispatchTask(unittest.TestCase):
         captured_lines: list[str] = []
         decisions_path = self.tmp / ".flow" / "tasks" / "demo" / "decisions.jsonl"
 
-        def fake_dispatch(ctx: WorktreeContext) -> None:
+        def fake_dispatch(ctx: WorktreeContext, **kw) -> None:
             # Inside dispatch — auto_engaged must already be on disk.
             captured_lines.extend(decisions_path.read_text().splitlines())
 
@@ -231,7 +231,7 @@ class TestAutoDispatchTask(unittest.TestCase):
         """
         decisions_path = self.tmp / ".flow" / "tasks" / "demo" / "decisions.jsonl"
 
-        def crashing_dispatch(ctx: WorktreeContext) -> None:
+        def crashing_dispatch(ctx: WorktreeContext, **kw) -> None:
             raise RuntimeError("subagent died")
 
         with self.assertRaises(RuntimeError):
@@ -267,7 +267,7 @@ class TestAutoDispatchTask(unittest.TestCase):
         auto_dispatch_task returns come from `derive_task_facts(ctx)`,
         which reads git directly.
         """
-        def writing_dispatch(ctx: WorktreeContext):
+        def writing_dispatch(ctx: WorktreeContext, **kw):
             (ctx.worktree_path / "evidence.py").write_text("# hello\n")
             subprocess.run(
                 ["git", "-C", str(ctx.worktree_path), "add", "."],
@@ -387,7 +387,7 @@ class TestAutoDispatchTaskValidation(unittest.TestCase):
     def _call(self, **overrides):
         kwargs = dict(
             slug="demo", task_idx=0, repo_root=self.tmp,
-            dispatch_fn=lambda _ctx: None,
+            dispatch_fn=lambda _ctx, **_kw: None,
             contract=self.contract,
             manifest=_empty_manifest(),
             run_id="run-abc",
@@ -624,7 +624,7 @@ class TestAutoDispatchManifestBlock(unittest.TestCase):
         """Subagent writes a forbidden file inside the worktree;
         orchestrator must detect it post-dispatch and block."""
 
-        def rogue_dispatch(ctx: WorktreeContext) -> None:
+        def rogue_dispatch(ctx: WorktreeContext, **kw) -> None:
             secrets_dir = ctx.worktree_path / "secrets"
             secrets_dir.mkdir(parents=True)
             (secrets_dir / "key.pem").write_text("PRIVATE\n")
@@ -665,7 +665,7 @@ class TestAutoDispatchManifestBlock(unittest.TestCase):
         returned ``ok`` despite the row-3 violation (silent bypass).
         """
 
-        def stash_dispatch(ctx: WorktreeContext) -> None:
+        def stash_dispatch(ctx: WorktreeContext, **kw) -> None:
             secrets_dir = ctx.worktree_path / "secrets"
             secrets_dir.mkdir(parents=True)
             (secrets_dir / "key.pem").write_text("PRIVATE\n")
@@ -694,7 +694,7 @@ class TestAutoDispatchManifestBlock(unittest.TestCase):
         the file was invisible to verification.
         """
 
-        def untracked_dispatch(ctx: WorktreeContext) -> None:
+        def untracked_dispatch(ctx: WorktreeContext, **kw) -> None:
             (ctx.worktree_path / "infra").mkdir(parents=True)
             (ctx.worktree_path / "infra" / "deploy.yml").write_text(
                 "# rogue\n"
@@ -723,7 +723,7 @@ class TestAutoDispatchManifestBlock(unittest.TestCase):
         format unambiguous. This test pins that attack vector closed.
         """
 
-        def arrow_dispatch(ctx: WorktreeContext) -> None:
+        def arrow_dispatch(ctx: WorktreeContext, **kw) -> None:
             secrets_dir = ctx.worktree_path / "secrets"
             secrets_dir.mkdir(parents=True)
             # Filename literally contains ` -> ` — would be misparsed
@@ -752,7 +752,7 @@ class TestAutoDispatchManifestBlock(unittest.TestCase):
         Staged-only must also trip the manifest verifier.
         """
 
-        def staged_dispatch(ctx: WorktreeContext) -> None:
+        def staged_dispatch(ctx: WorktreeContext, **kw) -> None:
             secrets_dir = ctx.worktree_path / "secrets"
             secrets_dir.mkdir(parents=True)
             (secrets_dir / "key.pem").write_text("PRIVATE\n")
@@ -778,7 +778,7 @@ class TestAutoDispatchManifestBlock(unittest.TestCase):
         """Same orchestration shell, but subagent writes only in-scope.
         Outcome.status must be "ok" with no blocked.md side effect."""
 
-        def clean_dispatch(ctx: WorktreeContext) -> None:
+        def clean_dispatch(ctx: WorktreeContext, **kw) -> None:
             (ctx.worktree_path / "src").mkdir(parents=True)
             (ctx.worktree_path / "src" / "foo.py").write_text("# ok\n")
             subprocess.run(

@@ -55,6 +55,7 @@ from flow_state_writer import (  # type: ignore
     append_autonomy_event, _new_event_id,
     write_blocked, write_checkpoint,
     append_review_issue, ReviewIssueRecord,
+    append_decision, DecisionRecord,
 )
 from flow_notification import Notifier  # type: ignore
 
@@ -840,7 +841,15 @@ def auto_dispatch_task(
     )
     # Subagent boundary — opaque. Return value INTENTIONALLY discarded
     # (PRD §1.2: subagent narrative is advisory, never structured data).
-    dispatch_fn(ctx)
+    #
+    # T21 / S5: propagate FLOW_AUTONOMY_PARENT_PID=<own pid> so that any
+    # `flow orchestrator --auto-execute` invocation the subagent attempts
+    # mechanically aborts via `_guard_against_nested_autonomy`. We pass a
+    # fresh copy of the environment (not a reference to os.environ) so
+    # downstream mutations cannot reach back into the parent process.
+    subagent_env = os.environ.copy()
+    subagent_env[AUTONOMY_PARENT_PID_ENV] = str(os.getpid())
+    dispatch_fn(ctx, subagent_env=subagent_env)
     # Authoritative facts come from disk, not the dispatch return value.
     facts = derive_task_facts(ctx)
 
@@ -4839,6 +4848,83 @@ def _cmd_auto_execute(slug: str) -> int:
     return 0
 
 
+# ── T21: nested-autonomy mechanical guard (§7 S5) ──────────────────────
+# A subagent dispatched by `auto_dispatch_task` inherits the env var set
+# by the parent orchestrator. If that subagent in turn invokes `flow
+# orchestrator --auto-execute`, the env var is the mechanical signal that
+# we are in a nested autonomy attempt — which §1 row 16 forbids.
+#
+# The check is mechanical (env var presence) rather than parent-process
+# tree walking — robust against process-group changes, container
+# boundaries, sudo, etc. Plan §21 makes this the spec, NOT a degradation:
+# K-class trap defense. We do NOT decode the value as int, validate
+# format, or correlate against actual ancestor PIDs — any non-empty
+# string triggers abort. F-class fail-closed: even slug-not-found returns
+# exit 4 (security-positive default; no info leak about slug existence).
+#
+# S-class wire-up requirement: the guard MUST run inside `main()` BEFORE
+# routing to `_cmd_auto_execute`. Putting it inside `_cmd_auto_execute`
+# would let any future caller of `_cmd_auto_execute` (e.g. a programmatic
+# resume path) bypass the guard.
+AUTONOMY_PARENT_PID_ENV = "FLOW_AUTONOMY_PARENT_PID"
+
+
+def _guard_against_nested_autonomy(slug: str) -> Optional[int]:
+    """Return exit code 4 when the env var indicates a nested attempt;
+    return ``None`` to let the top-level orchestrator proceed.
+
+    Side effects on guard fire:
+      * Decision record `aborted_nested` appended to
+        ``decisions.jsonl`` (when the slug exists).
+      * stderr message names the env var so operators can diagnose.
+
+    The slug-not-found branch is intentionally treated as "still abort
+    with 4" rather than "report missing slug" — see plan 7670-7677.
+    Reporting "not found" would leak slug-existence to a sub-process
+    that may be probing.
+    """
+    parent_pid = os.environ.get(AUTONOMY_PARENT_PID_ENV)
+    if not parent_pid:
+        return None
+    try:
+        task_dir = _resolve_slug_dir(slug)
+    except SystemExit:
+        # Slug-not-found: still abort (no info leak). No task_dir to
+        # write a decision into; stderr remains the only signal.
+        print(
+            f"ERROR: nested autonomy attempt detected "
+            f"({AUTONOMY_PARENT_PID_ENV}={parent_pid}); "
+            f"slug {slug!r} not found. "
+            f"Aborted (aborted_nested, exit 4).",
+            file=sys.stderr,
+        )
+        return 4
+    # R-class: parent_pid is user-controlled; we journal it via the
+    # DecisionRecord helper, which goes through `append_jsonl_locked`
+    # (json.dumps, not raw concat) — newlines/control chars survive
+    # as escaped JSON, no frontmatter injection vector.
+    append_decision(task_dir, DecisionRecord(
+        id=f"aborted-nested-{_new_event_id()}",
+        ts=_now_iso(),
+        phase=2,
+        task=slug,
+        decision="aborted_nested",
+        reason=(
+            f"--auto-execute called with "
+            f"{AUTONOMY_PARENT_PID_ENV}={parent_pid}; "
+            f"nested autonomy is forbidden (§1 row 16)"
+        ),
+    ))
+    print(
+        f"ERROR: aborted_nested — orchestrator was invoked from a "
+        f"subagent context ({AUTONOMY_PARENT_PID_ENV}={parent_pid}). "
+        f"Nested autonomy is forbidden; see §1 row 16. "
+        f"Decision logged to {task_dir / 'decisions.jsonl'}.",
+        file=sys.stderr,
+    )
+    return 4
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="flow orchestrator")
     parser.add_argument("--dry-run", metavar="SLUG", help="Print plan + manifest")
@@ -4846,10 +4932,17 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="(disabled in v0.8.0) attempt autonomous run")
     args = parser.parse_args(argv)
 
+    if args.auto_execute:
+        # T21 / S5 — mechanical nested-autonomy guard runs BEFORE any
+        # other logic on the --auto-execute path. Putting this inside
+        # `_cmd_auto_execute` would risk a future caller bypassing it
+        # (S-class wire-up gap); main() is the single entry point.
+        guard = _guard_against_nested_autonomy(args.auto_execute)
+        if guard is not None:
+            return guard
+        return _cmd_auto_execute(args.auto_execute)
     if args.dry_run:
         return _cmd_dry_run(args.dry_run)
-    if args.auto_execute:
-        return _cmd_auto_execute(args.auto_execute)
     parser.print_help()
     return 1
 
