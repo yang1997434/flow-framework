@@ -698,6 +698,38 @@ class TestAutoDispatchManifestBlock(unittest.TestCase):
         blocked = outcome.blocked_md_path.read_text()
         self.assertIn("infra/deploy.yml", blocked)
 
+    def test_untracked_filename_with_arrow_separator_does_not_bypass(self) -> None:
+        """Codex T11 round-2 [P1]: a malicious subagent could create an
+        untracked file whose NAME literally contains ` -> ` — porcelain
+        v1 (without -z) renders it identically to a rename record,
+        letting the parser trim the forbidden prefix. ``-z`` makes the
+        format unambiguous. This test pins that attack vector closed.
+        """
+
+        def arrow_dispatch(ctx: WorktreeContext) -> None:
+            secrets_dir = ctx.worktree_path / "secrets"
+            secrets_dir.mkdir(parents=True)
+            # Filename literally contains ` -> ` — would be misparsed
+            # by the pre-fix code as "renamed-to" half "ok-decoy.py"
+            # (the in-scope safe-looking suffix), bypassing the
+            # forbidden ``secrets/...`` prefix entirely.
+            arrow_name = "key.pem -> ok-decoy.py"
+            (secrets_dir / arrow_name).write_text("PRIVATE\n")
+
+        outcome = auto_dispatch_task(
+            slug="demo", task_idx=0, repo_root=self.tmp,
+            dispatch_fn=arrow_dispatch,
+            contract=self.contract,
+            manifest=self.manifest,
+            run_id="run-arrow",
+            contract_path=self.tmp / "contract.json",
+            contract_hash="deadbeef" * 8,
+        )
+        self.assertEqual(outcome.status, "blocked")
+        # The forbidden path is recorded LITERALLY, including the ` -> `.
+        blocked = outcome.blocked_md_path.read_text()
+        self.assertIn("secrets/key.pem -> ok-decoy.py", blocked)
+
     def test_dispatch_block_on_staged_but_uncommitted_forbidden(self) -> None:
         """Subagent ``git add``s a forbidden file but never commits.
         Staged-only must also trip the manifest verifier.

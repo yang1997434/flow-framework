@@ -484,29 +484,50 @@ def derive_task_facts(ctx: WorktreeContext) -> TaskFacts:
     # ``secrets/key.pem`` would appear as the bare directory path,
     # leaking the actual filename out of `violations` and frustrating
     # forensics.
+    #
+    # Codex T11 round-2 [P1]: ``-z`` (NUL-terminated) is mandatory, NOT
+    # cosmetic. Without it, porcelain v1 represents renames as ``R  new
+    # -> old`` on a single line — which means a string-based ` -> `
+    # split is the only way to recover paths. But that string match is
+    # status-blind: a malicious subagent could create an UNTRACKED file
+    # whose own filename contains ` -> ` (e.g.
+    # ``secrets/key.pem -> src/foo.py``); the parser would record only
+    # the half after the arrow, hiding the real forbidden path. ``-z``
+    # disambiguates: renames produce TWO NUL-separated records (status+
+    # new-path, then bare old-path). Only the explicit ``R``/``C``
+    # status indicates rename — every other record's path is the entire
+    # post-status text, ` -> ` or no ` -> `.
     porcelain = _git(
         ctx.worktree_path, "-c", "core.quotePath=false",
-        "status", "--porcelain", "--untracked-files=all",
+        "status", "--porcelain", "-z", "--untracked-files=all",
     ).stdout
     working_changed: set[str] = set()
     working_added: set[str] = set()
-    for line in porcelain.splitlines():
-        if len(line) < 4:
+    records = porcelain.split("\x00")
+    i = 0
+    while i < len(records):
+        rec = records[i]
+        i += 1
+        if not rec or len(rec) < 4:
+            # Trailing empty string after the final NUL is expected; skip.
+            # Records shorter than ``XY space ...`` are malformed; skip.
             continue
-        # Porcelain v1 shape: ``XY <space> path[ -> oldpath]?``
-        x, y = line[0], line[1]
-        rest = line[3:]
-        # Renames encode as ``new -> old``; the NEW path is what matters
-        # for manifest verification (where the file ends up in the tree).
-        path = rest.split(" -> ", 1)[1] if " -> " in rest else rest
+        x = rec[0]
+        # Porcelain v1 -z: 'XY' + space + path  (no ` -> ` separators
+        # in-line; renames put oldpath in the NEXT record).
+        path = rec[3:]
         if not path:
             continue
         working_changed.add(path)
-        # Untracked (`??`), staged-add (`A_`), or rename-with-add (`R_`
-        # is conceptually delete-old+add-new — and we're already keeping
-        # only the NEW path) all produce a path that did not exist at
-        # the base commit.
-        if x == "A" or x == "R" or line[:2] == "??":
+        if x == "R" or x == "C":
+            # Rename / copy: the path here is NEW; the next record holds
+            # the OLD path. We treat the NEW path as a fresh write
+            # (effectively row-4 territory) and consume the old-path
+            # record so we don't mis-classify it as its own change.
+            working_added.add(path)
+            if i < len(records):
+                i += 1
+        elif x == "A" or rec[:2] == "??":
             working_added.add(path)
 
     # Merge committed + working-tree views; deduplicate while preserving
