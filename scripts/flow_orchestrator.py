@@ -890,6 +890,21 @@ def auto_dispatch_task(
 # contract author knows their suite is slower.
 _DEFAULT_GATE_TIMEOUT_SEC = 600
 
+# Gate 4 codex CLI timeout. A hung codex CLI must NOT hang Phase 2 — the
+# fix-pass for T13 added an explicit subprocess timeout; on expiry the
+# gate routes to ``inconclusive`` (operator review) like every other
+# subprocess D5-class catch-all in this module. Pinned at 600s to match
+# `_DEFAULT_GATE_TIMEOUT_SEC`'s "long-but-bounded" budget for
+# subprocess-driven gates.
+_GATE4_CODEX_TIMEOUT_SEC = 600
+
+# Codex verdict explicit allow-list. Anything else (missing field,
+# typo, unknown future verdict) routes to ``inconclusive`` so the chain
+# fails closed instead of fail-open silent pass on, e.g.,
+# ``"INCONCLUSIVE"`` or ``"BLUE"``. Defined at module level so callers
+# / reviewers can grep it without diving into the GateRunner class body.
+ALLOWED_VERDICTS = ("GREEN", "YELLOW", "RED")
+
 
 # ----------------------------------------------------------------------
 # T13 — canonical issue id (S7) for cross-round churn detection.
@@ -1373,6 +1388,7 @@ class GateRunner:
     def gate4_codex_review(
         self, *,
         codex_command: str = "codex review --diff-only --json",
+        codex_timeout_sec: Optional[int] = None,
     ) -> GateResult:
         """Run codex CLI, parse verdict, persist RED issues, detect churn.
 
@@ -1383,8 +1399,23 @@ class GateRunner:
                                     is NOT set here (caller routes via
                                     `escalate` flag — churn → escalate).
           - codex CLI rc != 0    → status=inconclusive (D5).
+          - codex CLI timeout    → status=inconclusive (D5; fix-pass P2-2).
           - non-JSON output      → status=inconclusive (F fail-closed).
+          - missing/unknown verdict → status=inconclusive (F fail-closed;
+                                    fix-pass P1-2 — explicit allow-list,
+                                    no fail-open silent pass on, e.g.,
+                                    ``"INCONCLUSIVE"`` or ``"BLUE"``).
           - issue missing fields → status=inconclusive (F fail-closed).
+
+        Fix-pass invariant (P1-1): on ANY validation failure during issue
+        parsing, NOTHING is appended to ``review-issues.jsonl``. We
+        first validate the entire batch + collect canonical ids, then
+        only on full-batch success do we append. A partial-write would
+        poison churn counts on subsequent rounds.
+
+        ``codex_timeout_sec`` defaults to ``_GATE4_CODEX_TIMEOUT_SEC``
+        when None; tests inject smaller values to exercise the timeout
+        path without sleeping for the full default.
         """
         # E-class trust boundary: codex_command is INTERNAL — never build
         # this string from external / codex-emitted / user-controlled data.
@@ -1394,15 +1425,40 @@ class GateRunner:
         # contract-author-supplied shell strings that can fork test
         # servers / watchers / & background jobs. ``codex_command`` is
         # different — it's a fixed CLI invocation owned by gate 4
-        # itself, with no expected child-process tree, and per plan
-        # T13 Step 13.4 the documented invocation is plain
-        # ``subprocess.run`` (timeouts are codex's own responsibility,
-        # not the harness'). Reusing pgkill here would add an unused
-        # process-group dance with no observed leak risk.
-        proc = subprocess.run(
-            codex_command, shell=True, cwd=str(self.ctx.worktree_path),
-            capture_output=True, text=True,
-        )
+        # itself, with no expected child-process tree. Fix-pass P2-2
+        # adds an explicit subprocess timeout (no process-group kill —
+        # codex CLI is a single binary, not a shell-orchestrated tree).
+        if codex_timeout_sec is None:
+            codex_timeout_sec = _GATE4_CODEX_TIMEOUT_SEC
+        try:
+            proc = subprocess.run(
+                codex_command, shell=True,
+                cwd=str(self.ctx.worktree_path),
+                capture_output=True, text=True,
+                timeout=codex_timeout_sec,
+            )
+        except subprocess.TimeoutExpired as e:
+            # D5 catch-all: a hung codex CLI must NOT hang Phase 2.
+            # ``e.stderr`` may be bytes (binary mode) or str (text mode);
+            # H-class — handle both shapes explicitly rather than
+            # assuming one.
+            stderr_payload = e.stderr or ""
+            if isinstance(stderr_payload, (bytes, bytearray)):
+                stderr_tail = stderr_payload.decode(
+                    "utf-8", errors="replace",
+                )[-1000:]
+            else:
+                stderr_tail = stderr_payload[-1000:]
+            return GateResult(
+                status="inconclusive",
+                details={
+                    "gate": "gate4_codex_review",
+                    "reason": "codex_timeout",
+                    "timeout_sec": codex_timeout_sec,
+                    "stderr_tail": stderr_tail,
+                },
+            )
+
         if proc.returncode != 0:
             return GateResult(
                 status="inconclusive",
@@ -1438,7 +1494,24 @@ class GateRunner:
                 },
             )
 
-        verdict = output.get("verdict", "INCONCLUSIVE")
+        # Fix-pass P1-2: explicit verdict allow-list. Missing field /
+        # typo / unknown future value MUST route to inconclusive — not
+        # fall-through to ``status="pass"`` (that's the exact fail-open
+        # pattern T9/T10 had P1s for). The check happens BEFORE issue
+        # parsing because an unknown verdict shouldn't even attempt to
+        # walk issues.
+        verdict = output.get("verdict")
+        if verdict not in ALLOWED_VERDICTS:
+            return GateResult(
+                status="inconclusive",
+                details={
+                    "gate": "gate4_codex_review",
+                    "reason": "unknown_verdict",
+                    "verdict": verdict,
+                    "stdout_tail": proc.stdout[-1000:],
+                },
+            )
+
         if verdict == "GREEN":
             return GateResult(
                 status="pass", details={"verdict": "GREEN"},
@@ -1457,7 +1530,18 @@ class GateRunner:
                 },
             )
 
+        # Fix-pass P1-1: TWO-PASS validate-then-append. Validate the
+        # ENTIRE batch first (collect canonical ids + persist payloads
+        # in memory). Only on full-batch success do we append rows to
+        # ``review-issues.jsonl``. A first-pass crash mid-batch would
+        # leave issues 0..k-1 on disk → next round's churn count is
+        # inflated by those orphans, producing false-positive escalates.
+        #
+        # Pass 1: validate every issue, collect (id, severity, message)
+        # tuples in a staging list. Any malformed issue → return
+        # inconclusive WITHOUT writing.
         issue_ids: list[str] = []
+        staged: list[tuple[str, str, str]] = []  # (issue_id, severity, msg)
         for issue in issues:
             if not isinstance(issue, dict):
                 return GateResult(
@@ -1494,21 +1578,32 @@ class GateRunner:
             severity = issue.get("severity", "med")
             if severity not in ("critical", "high", "med", "low", "info"):
                 severity = "med"
+            staged.append((issue_id, severity, issue["message"]))
+
+        # Pass 2: every issue validated → persist. We freeze the
+        # timestamp once for the whole batch so all rows from a single
+        # codex round share the same ts (audit-log clarity; no
+        # microsecond drift between adjacent rows). Any per-row
+        # I/O failure here legitimately leaves a partial write on disk
+        # — that's a disk-state failure (G-class), not a parse-time
+        # poisoning, and is surfaced through the normal exception path.
+        ts = datetime.datetime.now(datetime.UTC).strftime(
+            "%Y-%m-%dT%H:%M:%SZ",
+        )
+        for issue_id, severity, message in staged:
             append_review_issue(self.task_dir, ReviewIssueRecord(
                 id=issue_id,
-                ts=datetime.datetime.now(datetime.UTC).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ",
-                ),
+                ts=ts,
                 task=self.task_id,
                 severity=severity,
                 reviewer="codex",
-                description=issue["message"],
+                description=message,
                 disposition="open",
             ))
 
         # Churn detection — issue ids that have appeared
         # CHURN_THRESHOLD+ times across this task's review history.
-        # Counts include the row we JUST appended, so the threshold is
+        # Counts include the rows we JUST appended, so the threshold is
         # the inclusive Nth round (matches the §3 line 141 spec
         # "after 3 rounds, escalate").
         churn_ids = [
@@ -1719,12 +1814,21 @@ class GateRunner:
         """Chain the five Phase 2 gates in declared order:
         ``1 → 3 → 4 → 5 → 6``.
 
-        First non-pass result halts and returns a `Phase2Verdict` with
+        Halt condition: first non-pass result OR any ``escalate=True``
+        from a passing gate. Returns a `Phase2Verdict` with
         `halted_at_gate` naming the gate. Caller branches on
         `gate_result.escalate` for blocked.md routing.
 
         ``inconclusive`` from any gate also halts (it's "could not
         produce a verdict" — operator review owns the resolution).
+
+        Fix-pass P2-1: ``escalate`` is honored even when ``status ==
+        "pass"``. Gate 4 may return ``status=pass + escalate=True`` on
+        YELLOW + churn (design §3 line 141: "churn → escalate
+        regardless of verdict; do NOT consume more retry budget"). The
+        escalate signal is generic — applied uniformly to all gates so
+        a future gate that reuses the pattern doesn't need a custom
+        halt branch.
 
         Codex round-1 [P2]: re-derive facts AFTER gate 1 baseline. The
         baseline command runs INSIDE the worktree (Q3.1) and may write
@@ -1744,7 +1848,7 @@ class GateRunner:
             test_command=baseline_command,
             timeout_sec=baseline_timeout_sec,
         )
-        if r.status != "pass":
+        if r.status != "pass" or r.escalate:
             return Phase2Verdict(
                 status="blocked",
                 halted_at_gate="gate1_baseline",
@@ -1805,7 +1909,7 @@ class GateRunner:
             )
 
         r = self.gate3_manifest(manifest=manifest, facts=post_baseline_facts)
-        if r.status != "pass":
+        if r.status != "pass" or r.escalate:
             return Phase2Verdict(
                 status="blocked",
                 halted_at_gate="gate3_manifest",
@@ -1813,7 +1917,7 @@ class GateRunner:
             )
 
         r = self.gate4_codex_review(codex_command=codex_command)
-        if r.status != "pass":
+        if r.status != "pass" or r.escalate:
             return Phase2Verdict(
                 status="blocked",
                 halted_at_gate="gate4_codex_review",
@@ -1825,7 +1929,7 @@ class GateRunner:
             attempt_id=attempt_id,
             retry_idx=retry_idx,
         )
-        if r.status != "pass":
+        if r.status != "pass" or r.escalate:
             return Phase2Verdict(
                 status="blocked",
                 halted_at_gate="gate5_acceptance",
@@ -1836,7 +1940,7 @@ class GateRunner:
             smoke_command=smoke_command,
             timeout_sec=smoke_timeout_sec,
         )
-        if r.status != "pass":
+        if r.status != "pass" or r.escalate:
             return Phase2Verdict(
                 status="blocked",
                 halted_at_gate="gate6_regression",

@@ -27,7 +27,11 @@ from flow_orchestrator import (  # type: ignore
     verify_manifest_against_facts,
     canonical_issue_id,
 )
-from flow_state_writer import EVENT_AUTO_ENGAGED  # type: ignore
+from flow_state_writer import (  # type: ignore
+    EVENT_AUTO_ENGAGED,
+    ReviewIssueRecord,
+    append_review_issue,
+)
 from flow_contract import (  # type: ignore
     Contract, CONTRACT_SCHEMA_VERSION, AcceptanceCriterion,
 )
@@ -1344,6 +1348,84 @@ class TestGate4CodexReview(unittest.TestCase):
         self.assertEqual(r.status, "inconclusive")
         self.assertIn("stdout_tail", r.details)
 
+    # ------------------------------------------------------------------
+    # Fix-pass tests (P1-1, P1-2, P2-2 — codex review YELLOW post-T13).
+    # ------------------------------------------------------------------
+
+    def test_gate4_malformed_batch_writes_nothing(self) -> None:
+        """Fix-pass P1-1: one malformed issue in a RED batch must NOT
+        leave the prefix issues on disk. Pre-fix, validation happened
+        per-issue during write — issues 0..k-1 leaked into
+        review-issues.jsonl before issue k failed validation, inflating
+        next-round churn counts on any matching id.
+        """
+        gr = self._make_runner()
+        stub = json.dumps({
+            "verdict": "RED",
+            "issues": [
+                {"file": "a.py", "line_range": "L1",
+                 "class": "c", "message": "msg1",
+                 "severity": "high"},
+                {"file": "b.py"},  # missing line_range / class / message
+            ],
+        })
+        r = gr.gate4_codex_review(codex_command=f"echo '{stub}'")
+        self.assertEqual(r.status, "inconclusive")
+        self.assertEqual(r.details["reason"], "issue_missing_required_field")
+        issues_path = gr.task_dir / "review-issues.jsonl"
+        # NO rows must be written when batch validation fails — even
+        # the well-formed first issue is rolled back.
+        self.assertFalse(
+            issues_path.is_file(),
+            "no rows should be written when batch validation fails",
+        )
+
+    def test_gate4_unknown_verdict_inconclusive(self) -> None:
+        """Fix-pass P1-2: explicit verdict allow-list. Anything outside
+        ``ALLOWED_VERDICTS`` (typo, future tag, ``"INCONCLUSIVE"``)
+        MUST route to inconclusive — not silently fall through to
+        ``status="pass"`` (the same fail-open pattern T9/T10 had P1s
+        for).
+        """
+        gr = self._make_runner()
+        for stub_verdict in ("BLUE", "INCONCLUSIVE", ""):
+            stub = json.dumps({"verdict": stub_verdict, "issues": []})
+            r = gr.gate4_codex_review(codex_command=f"echo '{stub}'")
+            self.assertEqual(
+                r.status, "inconclusive",
+                f"verdict={stub_verdict!r} must route to inconclusive",
+            )
+            self.assertEqual(r.details["reason"], "unknown_verdict")
+            self.assertEqual(r.details["verdict"], stub_verdict)
+
+    def test_gate4_missing_verdict_inconclusive(self) -> None:
+        """Fix-pass P1-2: a JSON object with no ``verdict`` key at all
+        must also route to inconclusive (the pre-fix
+        ``output.get("verdict", "INCONCLUSIVE")`` fallback then
+        treated everything-but-RED as pass)."""
+        gr = self._make_runner()
+        stub = json.dumps({"issues": []})  # no verdict field at all
+        r = gr.gate4_codex_review(codex_command=f"echo '{stub}'")
+        self.assertEqual(r.status, "inconclusive")
+        self.assertEqual(r.details["reason"], "unknown_verdict")
+        # ``verdict`` key in details captures the actual seen value
+        # (None for missing) so audit logs show the malformed payload.
+        self.assertIsNone(r.details["verdict"])
+
+    def test_gate4_timeout_routes_to_inconclusive(self) -> None:
+        """Fix-pass P2-2: a hung codex CLI must NOT hang Phase 2.
+        Override the default 600s timeout to 1s and run ``sleep 5``
+        (which exceeds the override) — the gate must surface the
+        timeout as ``inconclusive`` with ``reason=codex_timeout``."""
+        gr = self._make_runner()
+        r = gr.gate4_codex_review(
+            codex_command="sleep 5",
+            codex_timeout_sec=1,
+        )
+        self.assertEqual(r.status, "inconclusive")
+        self.assertEqual(r.details["reason"], "codex_timeout")
+        self.assertEqual(r.details["timeout_sec"], 1)
+
 
 class TestRunPhase2InsertsGate4(unittest.TestCase):
     """T13 chain extension: full Phase 2 sequence is 1 → 3 → 4 → 5 → 6.
@@ -1433,6 +1515,82 @@ class TestRunPhase2InsertsGate4(unittest.TestCase):
         )
         self.assertEqual(v.status, "blocked")
         self.assertEqual(v.halted_at_gate, "gate4_codex_review")
+        self.assertEqual(calls, ["1", "3", "4"])
+
+    def test_gate4_yellow_churn_escalates_phase2(self) -> None:
+        """Fix-pass P2-1: gate 4 can return ``status=pass +
+        escalate=True`` on YELLOW + churn. Pre-fix, ``run_phase2``'s
+        halt condition was ``if r.status != "pass":`` — escalate was
+        silently dropped and the chain advanced to gate 5/6.
+
+        Design §3 line 141: churn → escalate regardless of verdict; do
+        NOT consume more retry budget. ``run_phase2`` must halt at
+        gate 4 even when the verdict itself is "pass" (YELLOW).
+        """
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r", task_id="T0",
+        )
+        # Pre-seed review-issues.jsonl with 2 prior occurrences of the
+        # canonical id we're about to emit. The third (this round) hits
+        # CHURN_THRESHOLD=3 → escalate fires.
+        target_id = canonical_issue_id("x.py", "L1", "c", "m")
+        for _ in range(2):
+            append_review_issue(gr.task_dir, ReviewIssueRecord(
+                id=target_id,
+                ts="2026-05-07T00:00:00Z",
+                task=gr.task_id,
+                severity="high",
+                reviewer="codex",
+                description="m",
+                disposition="open",
+            ))
+        # Stub out gates 1, 3, 5, 6 (cheap pass) and let gate 4 execute
+        # against the real codex stub so we exercise the actual
+        # status=pass + escalate=True return path that triggered the
+        # P2-1 bug.
+        calls: list = []
+        gr.gate1_baseline = (
+            lambda **_: (calls.append("1") or GateResult(status="pass"))
+        )
+        gr.gate3_manifest = (
+            lambda **_: (calls.append("3") or GateResult(status="pass"))
+        )
+        # Wrap real gate4 so we can record the call AND get the genuine
+        # YELLOW + churn outcome.
+        real_gate4 = gr.gate4_codex_review
+        gr.gate4_codex_review = (
+            lambda **kw: (
+                calls.append("4") or real_gate4(**kw)
+            )
+        )
+        gr.gate5_acceptance = (
+            lambda **_: (calls.append("5") or GateResult(status="pass"))
+        )
+        gr.gate6_regression = (
+            lambda **_: (calls.append("6") or GateResult(status="pass"))
+        )
+        stub = json.dumps({
+            "verdict": "YELLOW",
+            "issues": [{
+                "file": "x.py", "line_range": "L1",
+                "class": "c", "message": "m",
+                "severity": "high",
+            }],
+        })
+        v = gr.run_phase2(
+            manifest=self.manifest, facts=self.facts,
+            criteria=[], attempt_id="a", retry_idx=0,
+            baseline_command="true",
+            codex_command=f"echo '{stub}'",
+            smoke_command="true",
+        )
+        # Halts at gate 4 even though gate 4 returned status="pass".
+        self.assertEqual(v.status, "blocked")
+        self.assertEqual(v.halted_at_gate, "gate4_codex_review")
+        self.assertEqual(v.gate_result.status, "pass")
+        self.assertTrue(v.gate_result.escalate)
+        # Gates 5 + 6 must NOT have executed.
         self.assertEqual(calls, ["1", "3", "4"])
 
 
