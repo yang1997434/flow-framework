@@ -564,14 +564,30 @@ def check_staleness() -> int:
         except (OSError, json.JSONDecodeError) as e:
             warn(f"{slug}: contract.json unreadable — {type(e).__name__}: {e}")
             continue
-        integration_target = (
-            contract_data.get("integration_target") or "master"
-        )
-        baseline_command = (
-            contract_data.get("baseline_command")
-            or contract_data.get("baseline", {}).get("command")
-            or ""
-        )
+
+        # L-class guard (code-review [85]): defend every `.get()` chain
+        # below with isinstance checks. A corrupt contract — top-level
+        # array/string/number, or `"baseline"` field that is itself a
+        # non-dict — would otherwise raise AttributeError mid-doctor and
+        # crash the run before `check_contract_integrity()` + summary.
+        # Same defensive pattern flow_staleness.py uses internally;
+        # this extends it to the doctor wire-up that reads the contract.
+        if not isinstance(contract_data, dict):
+            warn(f"{slug}: contract.json top-level is not a dict; skipping")
+            continue
+
+        integration_target = contract_data.get("integration_target")
+        if not isinstance(integration_target, str) or not integration_target:
+            integration_target = "master"
+
+        baseline_command = contract_data.get("baseline_command")
+        if not isinstance(baseline_command, str):
+            legacy = contract_data.get("baseline")
+            baseline_command = (
+                legacy.get("command") if isinstance(legacy, dict) else ""
+            )
+            if not isinstance(baseline_command, str):
+                baseline_command = ""
 
         # Resolve original_base_commit: prefer the value stored in the
         # task dir (T10 records it via auto_engaged event); fall back
