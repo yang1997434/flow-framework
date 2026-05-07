@@ -79,6 +79,7 @@ class _RunnerFixtureBase(unittest.TestCase):
         status: str | None = None,
         completed_at: str | None = None,
         duration_ms: int | None = None,
+        criterion_hash: str | None = None,
     ) -> AcceptanceProgressEvent:
         return AcceptanceProgressEvent(
             event_id=f"e{criterion_idx}_{event}",
@@ -91,7 +92,7 @@ class _RunnerFixtureBase(unittest.TestCase):
             retry_idx=0,
             criterion_id=f"c{criterion_idx}",
             criterion_idx=criterion_idx,
-            criterion_hash="0" * 64,
+            criterion_hash=criterion_hash or ("0" * 64),
             type=type_,
             method=method,
             idempotent="false" if method == "cmd" else "true",
@@ -146,6 +147,7 @@ class _RunnerFixtureBase(unittest.TestCase):
         attempt_id: str,
         type_: str = "unit",
         method: str = "cmd",
+        criterion_hash: str | None = None,
     ) -> None:
         append_acceptance_progress(
             self.tmp,
@@ -155,6 +157,7 @@ class _RunnerFixtureBase(unittest.TestCase):
                 event="started",
                 type_=type_,
                 method=method,
+                criterion_hash=criterion_hash,
             ),
         )
 
@@ -451,23 +454,21 @@ class TestResumeAttempt(_RunnerFixtureBase):
     def test_resume_with_in_flight_safe_method_continues(self) -> None:
         """file_exists in-flight → resume continues."""
         (self.tmp / "VERSION").write_text("0.8.1\n")
+        in_flight_crit = self._crit(
+            method="file_exists",
+            path="VERSION",
+            type="smoke",
+            command=None,
+        )
         self._write_completed_pair(0, attempt_id="a1")
         self._write_started_only(
             1,
             attempt_id="a1",
             type_="smoke",
             method="file_exists",
+            criterion_hash=self.runner._criterion_hash(in_flight_crit),
         )
-        criteria = [
-            self._crit(),
-            self._crit(
-                method="file_exists",
-                path="VERSION",
-                type="smoke",
-                command=None,
-            ),
-            self._crit(),
-        ]
+        criteria = [self._crit(), in_flight_crit, self._crit()]
         verdict, rp = self.runner.resume_attempt(
             self.tmp,
             attempt_id="a1",
@@ -478,13 +479,15 @@ class TestResumeAttempt(_RunnerFixtureBase):
         self.assertEqual(rp.in_flight_criterion_idx, 1)
 
     def test_resume_with_in_flight_unsafe_cmd_blocks(self) -> None:
+        in_flight_crit = self._crit(command="rm -rf build")
         self._write_started_only(
             0,
             attempt_id="a1",
             type_="unit",
             method="cmd",
+            criterion_hash=self.runner._criterion_hash(in_flight_crit),
         )
-        criteria = [self._crit(command="rm -rf build")]
+        criteria = [in_flight_crit]
         verdict, _ = self.runner.resume_attempt(
             self.tmp,
             attempt_id="a1",
@@ -494,6 +497,112 @@ class TestResumeAttempt(_RunnerFixtureBase):
             contract=self._contract(idempotent_cmd_allowlist=[]),
         )
         self.assertEqual(verdict.decision, "block_in_flight")
+        # Reason must point at R8 default block, NOT identity mismatch
+        # (otherwise this test wouldn't actually exercise R8).
+        self.assertIn("non-idempotent by default", verdict.reason.lower())
+
+    def test_resume_blocks_when_criterion_identity_changed(self) -> None:
+        """Codex round-1 [P1]: contract edited mid-attempt — current
+        criterion at recorded idx no longer matches the in-flight event's
+        recorded ``criterion_hash``. Must block, not auto_rerun, even if
+        the new criterion's method would otherwise route to auto_rerun.
+        """
+        # Started event recorded against an OLD criterion (a cmd).
+        old_crit = self._crit(command="rm -rf build", method="cmd")
+        self._write_started_only(
+            0,
+            attempt_id="a1",
+            type_="unit",
+            method="cmd",
+            criterion_hash=self.runner._criterion_hash(old_crit),
+        )
+        # Contract was edited — at idx 0 there is now a DIFFERENT criterion
+        # (file_exists, which would normally auto_rerun cleanly).
+        (self.tmp / "VERSION").write_text("0.8.1\n")
+        new_crit = self._crit(
+            method="file_exists",
+            path="VERSION",
+            type="smoke",
+            command=None,
+        )
+        verdict, _ = self.runner.resume_attempt(
+            self.tmp,
+            attempt_id="a1",
+            criteria=[new_crit],
+            contract=self._contract(),
+        )
+        self.assertEqual(verdict.decision, "block_in_flight")
+        self.assertIn("identity changed", verdict.reason.lower())
+
+    def test_cmd_compound_command_blocks_despite_allowlist_match(
+        self,
+    ) -> None:
+        """Codex round-1 [P1]: ``pytest tests; ./deploy.sh`` matches the
+        ``pytest`` allowlist prefix but contains ``;``. _run_cmd uses
+        shell=True, so re-running would re-fire ``./deploy.sh``. Must
+        block; operator opts in via per-criterion override only.
+        """
+        in_flight_crit = self._crit(command="pytest tests; ./deploy.sh")
+        self._write_started_only(
+            0,
+            attempt_id="a1",
+            method="cmd",
+            criterion_hash=self.runner._criterion_hash(in_flight_crit),
+        )
+        verdict, _ = self.runner.resume_attempt(
+            self.tmp,
+            attempt_id="a1",
+            criteria=[in_flight_crit],
+            contract=self._contract(idempotent_cmd_allowlist=["pytest"]),
+        )
+        self.assertEqual(verdict.decision, "block_in_flight")
+        self.assertIn("shell control characters", verdict.reason.lower())
+
+    def test_cmd_pipe_command_blocks_despite_allowlist_match(self) -> None:
+        """Same family as compound — pipe is also a shell control char."""
+        in_flight_crit = self._crit(command="pytest tests | tee log.txt")
+        self._write_started_only(
+            0,
+            attempt_id="a1",
+            method="cmd",
+            criterion_hash=self.runner._criterion_hash(in_flight_crit),
+        )
+        verdict, _ = self.runner.resume_attempt(
+            self.tmp,
+            attempt_id="a1",
+            criteria=[in_flight_crit],
+            contract=self._contract(idempotent_cmd_allowlist=["pytest"]),
+        )
+        self.assertEqual(verdict.decision, "block_in_flight")
+        self.assertIn("shell control characters", verdict.reason.lower())
+
+    def test_cmd_compound_with_explicit_override_unblocks(self) -> None:
+        """Operator opts in: per-criterion override with rationale wins
+        over the shell-metachar guard. The override path (4a) bypasses
+        the allowlist path (4b) entirely — operator takes responsibility.
+        """
+        in_flight_crit = self._crit(
+            command="pytest tests && echo done",
+            idempotent={
+                "value": True,
+                "rationale": "compound is read-only — verified by author",
+                "side_effect_class": "read_only",
+            },
+        )
+        self._write_started_only(
+            0,
+            attempt_id="a1",
+            method="cmd",
+            criterion_hash=self.runner._criterion_hash(in_flight_crit),
+        )
+        verdict, _ = self.runner.resume_attempt(
+            self.tmp,
+            attempt_id="a1",
+            criteria=[in_flight_crit],
+            contract=self._contract(idempotent_cmd_allowlist=["pytest"]),
+        )
+        self.assertEqual(verdict.decision, "auto_rerun")
+        self.assertIn("per-criterion override", verdict.reason.lower())
 
 
 if __name__ == "__main__":

@@ -1706,6 +1706,22 @@ class AcceptanceRunner:
             allowlist = (
                 getattr(contract, "idempotent_cmd_allowlist", None) or ()
             )
+            # SAFETY (codex round-1 [P1]): _run_cmd executes via shell=True,
+            # so a prefix match on ``pytest`` would also clear
+            # ``pytest tests; ./deploy.sh`` and re-fire the trailing
+            # non-idempotent command after a crash. Reject any allowlist
+            # match for commands containing shell control characters; the
+            # operator MUST opt in via the per-criterion override (path 4a)
+            # with an explicit rationale for compound commands.
+            #
+            # Coverage scope: shell control + chaining + redirection +
+            # subshells + whitespace forms. Globs (``* ? [ { ~``) are
+            # intentionally NOT blocked — they're behavior-at-re-run-time
+            # concerns (different files match the second time), not the
+            # safety-bug shape codex flagged. If glob non-determinism
+            # becomes a problem, layer that on as a separate guard.
+            _SHELL_METACHARS = ";&|<>()`$\\\n\t\r\v\f"
+            command_has_metachar = any(c in _SHELL_METACHARS for c in command)
             for allowed in allowlist:
                 if not isinstance(allowed, str) or not allowed.strip():
                     continue
@@ -1714,6 +1730,18 @@ class AcceptanceRunner:
                     command == normalized
                     or command.startswith(normalized + " ")
                 ):
+                    if command_has_metachar:
+                        return IdempotencyVerdict(
+                            decision="block_in_flight",
+                            reason=(
+                                f"cmd matches allowlist entry "
+                                f"{normalized!r} but contains shell "
+                                f"control characters; allowlist applies "
+                                f"only to simple-command shape — supply "
+                                f"per-criterion idempotent override with "
+                                f"rationale to opt in"
+                            ),
+                        )
                     return IdempotencyVerdict(
                         decision="auto_rerun",
                         reason=(
@@ -1797,6 +1825,33 @@ class AcceptanceRunner:
                 rp,
             )
         criterion = criteria[rp.in_flight_criterion_idx]
+
+        # Identity check (codex round-1 [P1]): the in-flight event recorded
+        # the criterion's hash at started-time (T4+Y7). If the contract was
+        # edited between crash and resume, the criterion at the recorded
+        # idx may now be a DIFFERENT criterion (different method/type/cmd)
+        # than the one that was running — applying R8 against the new shape
+        # would mis-classify the in-flight cell. Compare hashes and fail
+        # closed on mismatch; the operator can resolve via interactive
+        # block (revert contract, switch_to_interactive, abort).
+        recorded_hash = (rp.in_flight_event or {}).get("criterion_hash")
+        if recorded_hash:
+            current_hash = self._criterion_hash(criterion)
+            if recorded_hash != current_hash:
+                return (
+                    IdempotencyVerdict(
+                        decision="block_in_flight",
+                        reason=(
+                            f"criterion identity changed mid-attempt "
+                            f"(idx={rp.in_flight_criterion_idx}): recorded "
+                            f"hash {recorded_hash[:12]!r}, current hash "
+                            f"{current_hash[:12]!r}; contract was edited "
+                            f"between started event and resume"
+                        ),
+                    ),
+                    rp,
+                )
+
         verdict = self.resolve_in_flight_idempotency(
             criterion,
             contract=contract,
