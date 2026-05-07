@@ -66,6 +66,37 @@ from flow_state_writer import write_blocked  # noqa: E402  (T5/T6 helper)
 OSC9_TERM_ALLOWLIST: tuple[str, ...] = ("kitty", "ghostty", "iTerm.app")
 THROTTLE_FILENAME = ".notification_throttle.json"
 
+# OSC 9 sanitize budget. Long OSC strings can be silently dropped by
+# terminal parsers (xterm caps internal OSC buffer at ~1k; conservative
+# cap at 200 keeps us well under any plausible limit and bounds blast
+# radius if a caller passes a megabyte of text).
+OSC9_BODY_MAXLEN = 200
+
+
+def _sanitize_osc_text(body: str, max_len: int = OSC9_BODY_MAXLEN) -> str:
+    """Strip control chars + truncate. Prevents OSC sequence injection.
+
+    Threat model: ``body`` reaches us as ``why_blocked`` from the
+    orchestrator. v0.8.1's source is contract-derived violations
+    (file paths / manifest keys — internal), but v0.8.x evolves toward
+    operator-supplied issue strings, and OSC injection is on the
+    pitfall list (`.flow/pitfalls/claude-review-blindspots.md`). A
+    crafted body containing ``\\x07\\x1b]0;HACKED\\x07`` would close
+    our OSC 9, open a fresh OSC 0 (window-title set), and hijack the
+    operator's terminal.
+
+    Allowlist: printable ASCII (0x20–0x7E) plus ``\\t``. Explicitly
+    excludes ``\\x07`` (BEL — closes the OSC), ``\\x1b`` (ESC — opens
+    a new sequence), and all other C0/C1 control chars. Non-ASCII is
+    dropped too — terminal handling of non-ASCII inside OSC is
+    implementation-defined; safer to coerce to ASCII for this surface.
+
+    Truncation runs AFTER stripping so the budget reflects characters
+    actually emitted, not raw input length.
+    """
+    safe = "".join(ch for ch in body if 0x20 <= ord(ch) < 0x7F or ch == "\t")
+    return safe[:max_len]
+
 
 def _utcnow() -> datetime.datetime:
     """Single source of truth for "now" in this module — easier to mock."""
@@ -327,8 +358,11 @@ class Notifier:
         """
         if with_osc9:
             # OSC 9 carries the message text; trailing BEL closes the
-            # sequence AND serves as audible floor.
-            text = f"\x1b]9;flow blocked: {body}\x07"
+            # sequence AND serves as audible floor. Sanitize body to
+            # prevent control-char injection (e.g. embedded BEL closing
+            # our OSC 9 + nested OSC 0 setting the window title).
+            safe_body = _sanitize_osc_text(body)
+            text = f"\x1b]9;flow blocked: {safe_body}\x07"
         else:
             # BEL-only floor — operator hears a ping even if no desktop
             # notification API is available.
@@ -378,7 +412,12 @@ class Notifier:
         # Build closure for the locked RMW. The closure decides:
         #   - allowed = True / False (returned to caller via outer var)
         #   - new_state for write (only when allowed)
-        decision = {"allowed": False}
+        # Initialize to True (fail-open): per module docstring, throttle is
+        # ergonomic, NOT a safety boundary. Lock timeout / corruption /
+        # missing-prior all degrade to "operator gets one extra ping",
+        # never to "operator misses an emission". The transform only flips
+        # to False when it has explicitly observed an in-window prior entry.
+        decision = {"allowed": True}
 
         def _transform(state: dict) -> tuple[dict, bool]:
             last_iso = state.get(key)
@@ -398,21 +437,20 @@ class Notifier:
                     # safety boundary.
                     pass
             # Either no prior entry, prior entry expired, or prior entry
-            # corrupt → emit + record this firing.
-            decision["allowed"] = True
+            # corrupt → emit + record this firing. (decision["allowed"]
+            # already True from the fail-open default.)
             new_state = dict(state)
             new_state[key] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
             return new_state, True
 
-        wrote = _locked_throttle_rmw(path, _transform)
         # Two outcomes return False from _locked_throttle_rmw:
-        #   1. Lock timeout (≥2s contended) — fail-open, allow emission.
-        #      This is consistent with throttle being ergonomic.
-        #   2. transform decided "no write" (within window) — decision
-        #      already set to False above.
-        if not wrote and decision["allowed"]:
-            # Lock timeout while we wanted to write. Allow emission
-            # (fail-open) but couldn't persist — operator just gets
-            # extra pings on the next call too. Acceptable.
-            return True
+        #   1. Lock timeout (≥2s contended) — transform never ran, so
+        #      decision["allowed"] stays at its fail-open default (True).
+        #      Operator gets the emission but throttle state isn't updated;
+        #      next call may re-fire too. Acceptable: throttle is
+        #      ergonomic, not a safety boundary.
+        #   2. transform decided "no write" (within window) — decision was
+        #      explicitly flipped to False inside the closure.
+        # Either way the answer is decision["allowed"].
+        _locked_throttle_rmw(path, _transform)
         return decision["allowed"]
