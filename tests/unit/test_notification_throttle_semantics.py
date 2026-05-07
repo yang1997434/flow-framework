@@ -667,13 +667,18 @@ class TestCodexRound1NaiveTimestamp(unittest.TestCase):
         self.assertEqual(n._stderr.getvalue().count("\x1b]9;"), 1)
 
 
-class TestCodexRound1FrontmatterExtra(unittest.TestCase):
-    """T16 codex round-1 P2.2: fire_block must not silently drop
-    frontmatter_extra. Production caller (flow_orchestrator.py:824)
-    passes ``{"block_row": verdict.block_row}`` directly to write_blocked
-    today; if a future migration routes through Notifier, block_row would
-    vanish from blocked.md without this guard. NotImplementedError forces
-    T19 wire-up to handle pass-through."""
+class TestCodexRound2FrontmatterExtraPassThrough(unittest.TestCase):
+    """T16 codex round-2 [P2] regression fix (method B):
+    ``Notifier.fire_block`` MUST pass ``frontmatter_extra`` through to
+    ``write_blocked`` rather than raising. Round-1 introduced a loud
+    ``NotImplementedError`` that broke the live orchestrator path —
+    ``flow_orchestrator.auto_dispatch_task`` calls
+    ``notifier.fire_block(..., frontmatter_extra={"block_row": ...})``
+    on every manifest violation, so the guard aborted Tier 1
+    (``write_blocked``) before the safety surface landed. Pass-through
+    restores the boundary; ``write_blocked`` owns the input-shape
+    validation (key/value rules + injection guard).
+    """
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -698,23 +703,33 @@ class TestCodexRound1FrontmatterExtra(unittest.TestCase):
         n._stderr = io.StringIO()
         return n
 
-    def test_frontmatter_extra_raises_not_implemented(self):
+    def test_frontmatter_extra_passes_through_to_blocked_md(self):
+        """Production caller in flow_orchestrator.py:824 passes
+        ``frontmatter_extra={"block_row": verdict.block_row}``; Notifier
+        must thread that to write_blocked, not raise."""
         n = self._notifier()
-        with self.assertRaises(NotImplementedError) as ctx:
-            n.fire_block(
-                block_type="x", phase=2, task_id="T1", issue_id="i1",
-                why_blocked="x", required_choice=["abort"],
-                safe_resume_command="flow resume d",
-                frontmatter_extra={"block_row": 5},
-            )
-        # Error message names the future-wire path so implementer of T19
-        # finds the right context fast.
-        self.assertIn("T19", str(ctx.exception))
-        self.assertIn("write_blocked", str(ctx.exception))
+        path = n.fire_block(
+            block_type="manifest_violation", phase=2,
+            task_id="T1", issue_id="manifest_violation",
+            why_blocked="row 4 violation",
+            required_choice=["abort_task"],
+            safe_resume_command="flow resume d",
+            frontmatter_extra={"block_row": 4},
+        )
+        self.assertTrue(path.exists())
+        body = path.read_text()
+        # Operator-grep contract: `block_row: 4` shows up as plain
+        # frontmatter — no JSON quoting on int scalars.
+        self.assertIn("block_row: 4", body)
+        # Reserved frontmatter still emitted in the canonical spot.
+        self.assertIn("block_type: manifest_violation", body)
+        self.assertIn("ts: ", body)
 
-    def test_frontmatter_extra_none_is_allowed(self):
-        """Default None / empty dict must NOT trigger NotImplementedError
-        — only non-empty dicts (which would be silently dropped) raise."""
+    def test_frontmatter_extra_none_preserves_back_compat(self):
+        """Default None / empty dict → no extra frontmatter emitted; the
+        body must be byte-equivalent to the pre-fix path apart from the
+        timestamp. (Empty-dict short-circuit guarantees byte-for-byte
+        back-compat with v0.8.0 callers + existing test fixtures.)"""
         n = self._notifier()
         # No frontmatter_extra at all (default None).
         path = n.fire_block(
@@ -723,6 +738,10 @@ class TestCodexRound1FrontmatterExtra(unittest.TestCase):
             safe_resume_command="flow resume d",
         )
         self.assertTrue(path.exists())
+        body = path.read_text()
+        # No `block_row:` line — no extras.
+        self.assertNotIn("block_row:", body)
+
         # Empty dict: equivalent to None.
         n2 = self._notifier()
         path2 = n2.fire_block(
@@ -732,6 +751,137 @@ class TestCodexRound1FrontmatterExtra(unittest.TestCase):
             frontmatter_extra={},
         )
         self.assertTrue(path2.exists())
+        self.assertNotIn("block_row:", path2.read_text())
+
+    def test_frontmatter_extra_emits_str_scalar_with_quote_escape(self):
+        """String values MUST be JSON-encoded so embedded quotes /
+        backslashes round-trip safely (frontmatter parsers treat
+        unquoted-string scalars with quotes inside as malformed)."""
+        n = self._notifier()
+        path = n.fire_block(
+            block_type="x", phase=2, task_id="T1", issue_id="i1",
+            why_blocked="x", required_choice=["abort"],
+            safe_resume_command="flow resume d",
+            frontmatter_extra={"note": 'has "quote" and \\backslash'},
+        )
+        body = path.read_text()
+        # Quoted via json.dumps → `"has \"quote\" and \\backslash"`.
+        self.assertIn(
+            'note: "has \\"quote\\" and \\\\backslash"', body,
+        )
+
+    def test_frontmatter_extra_emits_bool_lowercase(self):
+        """`bool` is a subclass of `int` in Python — branch order in
+        ``_format_frontmatter_extra`` must put bool BEFORE int or True/False
+        would emit as 1/0. This test pins the YAML-literal contract."""
+        n = self._notifier()
+        path = n.fire_block(
+            block_type="x", phase=2, task_id="T1", issue_id="i1",
+            why_blocked="x", required_choice=["abort"],
+            safe_resume_command="flow resume d",
+            frontmatter_extra={"flag_on": True, "flag_off": False},
+        )
+        body = path.read_text()
+        self.assertIn("flag_on: true", body)
+        self.assertIn("flag_off: false", body)
+        # Negative: must NOT emit `flag_on: 1` (the bool→int trap).
+        self.assertNotIn("flag_on: 1", body)
+        self.assertNotIn("flag_off: 0", body)
+
+    def test_frontmatter_extra_rejects_invalid_key_shape(self):
+        """Keys with hyphens / dots / spaces aren't unquoted-YAML safe;
+        forcing operators to grep for arbitrary shapes would erode the
+        operator-grep contract write_blocked is documented to honor."""
+        n = self._notifier()
+        with self.assertRaises(ValueError) as ctx:
+            n.fire_block(
+                block_type="x", phase=2, task_id="T1", issue_id="i1",
+                why_blocked="x", required_choice=["abort"],
+                safe_resume_command="flow resume d",
+                frontmatter_extra={"bad-key": 1},
+            )
+        self.assertIn("bad-key", str(ctx.exception))
+        # Fail-closed: blocked.md must NOT exist (validation runs BEFORE
+        # any disk write).
+        self.assertFalse((Path(self.tmp) / "blocked.md").exists())
+
+    def test_frontmatter_extra_rejects_reserved_key_collision(self):
+        """A caller bug that passes ``{"ts": "..."}`` would silently
+        overwrite the canonical timestamp; reject loudly."""
+        n = self._notifier()
+        for reserved in ("block_type", "phase", "task", "ts",
+                         "why_blocked", "required_choice",
+                         "safe_resume_command"):
+            with self.subTest(key=reserved):
+                with self.assertRaises(ValueError) as ctx:
+                    n.fire_block(
+                        block_type="x", phase=2, task_id="T1",
+                        issue_id="i1", why_blocked="x",
+                        required_choice=["abort"],
+                        safe_resume_command="flow resume d",
+                        frontmatter_extra={reserved: "x"},
+                    )
+                msg = str(ctx.exception)
+                self.assertIn(reserved, msg)
+                self.assertIn("reserved", msg)
+
+    def test_frontmatter_extra_rejects_non_scalar_value(self):
+        """List / dict / None values are forbidden — silent
+        stringification would conflate `[1, 2]` with `"[1, 2]"`."""
+        n = self._notifier()
+        for bad in ([1, 2], {"a": "b"}, None):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError) as ctx:
+                    n.fire_block(
+                        block_type="x", phase=2, task_id="T1",
+                        issue_id="i1", why_blocked="x",
+                        required_choice=["abort"],
+                        safe_resume_command="flow resume d",
+                        frontmatter_extra={"k": bad},
+                    )
+                msg = str(ctx.exception)
+                # Either "scalar" (for list/dict) or "scalar" again for
+                # None — the validator should consistently surface the
+                # scalar-only contract.
+                self.assertIn("scalar", msg)
+
+    def test_frontmatter_extra_rejects_newline_in_str_value(self):
+        """Frontmatter injection guard: a newline in a str value would
+        break out of the `key: value` line into adjacent rows."""
+        n = self._notifier()
+        for bad in ("a\nb", "a\rb", "leading\n", "\r\n"):
+            with self.subTest(value=bad):
+                with self.assertRaises(ValueError) as ctx:
+                    n.fire_block(
+                        block_type="x", phase=2, task_id="T1",
+                        issue_id="i1", why_blocked="x",
+                        required_choice=["abort"],
+                        safe_resume_command="flow resume d",
+                        frontmatter_extra={"k": bad},
+                    )
+                msg = str(ctx.exception)
+                self.assertIn("newline", msg)
+                # Fail-closed — no partial blocked.md.
+                self.assertFalse(
+                    (Path(self.tmp) / "blocked.md").exists(),
+                    f"blocked.md leaked for value {bad!r}",
+                )
+
+    def test_frontmatter_extra_block_type_preserved_through_notifier(self):
+        """Regression guard: pass-through must NOT drop ``block_type`` —
+        write_blocked emits both `block_type:` and any extras."""
+        n = self._notifier()
+        path = n.fire_block(
+            block_type="post_merge_verify_failed", phase=3,
+            task_id="T1", issue_id="post_merge",
+            why_blocked="acceptance failed",
+            required_choice=["retry"],
+            safe_resume_command="flow resume d",
+            frontmatter_extra={"verifier_attempt": 2},
+        )
+        body = path.read_text()
+        self.assertIn("block_type: post_merge_verify_failed", body)
+        self.assertIn("verifier_attempt: 2", body)
 
 
 class TestCodexRound1KeyDelimiterReject(unittest.TestCase):

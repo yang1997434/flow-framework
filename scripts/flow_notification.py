@@ -235,16 +235,18 @@ class Notifier:
         Errors from write_blocked (e.g., I/O failures) propagate — Tier 1
         is a safety surface, fail-closed.
 
-        ``frontmatter_extra`` is a reserved parameter for future T19
-        wire-up: callers like flow_orchestrator.py pass extras such as
-        ``{"block_row": verdict.block_row}`` directly to ``write_blocked``
-        today. Once Notifier owns the dispatch path, this field will pass
-        through to ``write_blocked``. Until then, **passing a non-empty
-        dict raises NotImplementedError** rather than silently dropping
-        operator-critical fields (e.g. ``block_row`` would vanish from
-        blocked.md if dropped). Loud failure forces T19 implementer to
-        wire it through. Empty dict / None is allowed (no extras → no
-        ambiguity).
+        ``frontmatter_extra`` is passed through to ``write_blocked`` so
+        operator-critical metadata (e.g. ``{"block_row": 4}``) lands in
+        blocked.md frontmatter. Codex round-2 [P2] regression fix: the
+        previous round's ``NotImplementedError`` guard broke the live
+        T15/T16 orchestrator path — ``flow_orchestrator.auto_dispatch_task``
+        passes a truthy ``frontmatter_extra`` for every manifest violation,
+        so the loud-fail aborted Tier 1 (``write_blocked``) before the
+        safety surface landed. Pass-through restores the safety boundary;
+        ``write_blocked`` validates the extras dict (key shape, reserved-
+        key collision, scalar-only values, no newlines) and raises
+        ``ValueError`` BEFORE any disk write on bad input — that's the
+        proper layer for input shape validation, not Notifier.
         """
         # L-class: enforce string identity BEFORE composing throttle key.
         # `isinstance` is the gate; non-string raises rather than silently
@@ -258,20 +260,11 @@ class Notifier:
                 f"issue_id must be str, got {type(issue_id).__name__}"
             )
 
-        # P2.2 (codex round-1): loud footgun — accepting frontmatter_extra
-        # but not threading it to write_blocked silently drops fields like
-        # block_row that production callers pass today via direct
-        # write_blocked invocation. Force T19 wire-up to handle this.
-        if frontmatter_extra:
-            raise NotImplementedError(
-                "Notifier.fire_block: frontmatter_extra is reserved for "
-                "future wiring through write_blocked; pass-through not yet "
-                "implemented (see T19 follow-up). Caller must use "
-                "write_blocked directly until then if extra frontmatter "
-                "is required."
-            )
-
         # Tier 1: ALWAYS write blocked.md. Errors propagate.
+        # Codex round-2 [P2] fix: pass `frontmatter_extra` through —
+        # production caller flow_orchestrator.py:824 already supplies
+        # `{"block_row": verdict.block_row}`. write_blocked owns the
+        # validation contract for the extras shape.
         path = write_blocked(
             self.task_dir,
             phase=phase,
@@ -280,6 +273,7 @@ class Notifier:
             required_choice=required_choice,
             safe_resume_command=safe_resume_command,
             block_type=block_type,
+            frontmatter_extra=frontmatter_extra,
         )
 
         # Tier 2: throttled.

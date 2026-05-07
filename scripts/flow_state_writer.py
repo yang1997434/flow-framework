@@ -18,6 +18,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import socket
 import sys
 import uuid
@@ -164,6 +165,91 @@ def write_checkpoint(
     return path
 
 
+# Reserved frontmatter keys that `_format_frontmatter_extra` MUST refuse to
+# overwrite — see codex round-2 [P2] fix-pass (method B). Operator-supplied
+# extras like `block_row: 4` are fine, but a caller bug that passes
+# `{"ts": "..."}` would silently clobber the canonical timestamp; reject up
+# front so the failure is loud (D5 over fallback bypass).
+_FRONTMATTER_RESERVED: frozenset[str] = frozenset({
+    "block_type", "phase", "task", "why_blocked",
+    "required_choice", "safe_resume_command", "ts",
+})
+
+# YAML scalar identifier — same shape Python uses for plain identifiers, so
+# parsers across the ecosystem (PyYAML, ruamel, hand-grep) all agree on the
+# unquoted-key form. Refusing anything else (including hyphens / dots /
+# spaces / unicode) is intentional: those would force quoting and complicate
+# the grep-friendly emission contract write_blocked is documented to honor.
+_FRONTMATTER_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _format_frontmatter_extra(extra: Optional[dict]) -> str:
+    """Validate + emit zero-or-more frontmatter ``key: value`` lines.
+
+    Returns ``""`` when ``extra`` is None or empty (back-compat byte-for-byte
+    short-circuit — older callers / older blocked.md fixtures see no diff).
+
+    Validation (J-class injection defense from
+    ``.flow/pitfalls/claude-review-blindspots.md``):
+
+    1. Each key MUST be ``str`` matching ``[A-Za-z_][A-Za-z0-9_]*`` —
+       reject anything that would force YAML quoting or look like a
+       structured selector.
+    2. Each key MUST NOT collide with the canonical reserved keys
+       written by ``write_blocked`` itself; otherwise a caller bug
+       could overwrite the timestamp / block_type silently.
+    3. Each value MUST be a scalar of type ``str``/``int``/``bool``/
+       ``float``. Lists / dicts / None are rejected — these are exactly
+       the shapes that would tempt a "just stringify it" silent bypass.
+    4. ``str`` values MUST NOT contain ``\\n`` or ``\\r`` — otherwise an
+       attacker-controlled value could break out of the `key: value`
+       line into adjacent frontmatter rows (the same defense already
+       applied to ``block_type`` above).
+
+    Emission order: caller's dict insertion order (Python 3.7+ guarantees
+    insertion-preserving iteration). String values are JSON-encoded so
+    embedded quotes / backslashes round-trip safely; bool emits the YAML
+    literal (`true`/`false`); int/float emit verbatim.
+    """
+    if not extra:
+        return ""
+    lines: list[str] = []
+    for k, v in extra.items():
+        if not isinstance(k, str) or not _FRONTMATTER_KEY_RE.match(k):
+            raise ValueError(
+                f"frontmatter_extra key {k!r} must be a YAML scalar "
+                f"identifier matching {_FRONTMATTER_KEY_RE.pattern}"
+            )
+        if k in _FRONTMATTER_RESERVED:
+            raise ValueError(
+                f"frontmatter_extra key {k!r} collides with reserved "
+                f"frontmatter field; reserved set: "
+                f"{sorted(_FRONTMATTER_RESERVED)}"
+            )
+        # `bool` is a subclass of `int` — its branch MUST come first or
+        # `True`/`False` would emit as `1`/`0` (silently wrong YAML/JSON
+        # round-trip). isinstance(True, int) == True is the trap.
+        if isinstance(v, bool):
+            lines.append(f"{k}: {'true' if v else 'false'}")
+        elif isinstance(v, str):
+            if "\n" in v or "\r" in v:
+                raise ValueError(
+                    f"frontmatter_extra value for {k!r} must not contain "
+                    f"newline/carriage-return (frontmatter injection guard)"
+                )
+            # JSON-encode to safely escape quotes / backslashes; the
+            # surrounding double-quotes are valid YAML for scalar strings.
+            lines.append(f"{k}: {json.dumps(v, ensure_ascii=False)}")
+        elif isinstance(v, (int, float)):
+            lines.append(f"{k}: {v}")
+        else:
+            raise ValueError(
+                f"frontmatter_extra value for {k!r} must be a scalar "
+                f"(str/int/bool/float); got {type(v).__name__}"
+            )
+    return "\n".join(lines) + "\n"
+
+
 def write_blocked(
     task_dir: Path,
     phase: int,
@@ -172,6 +258,7 @@ def write_blocked(
     required_choice: list[str],
     safe_resume_command: str,
     block_type: Optional[str] = None,
+    frontmatter_extra: Optional[dict] = None,
 ) -> Path:
     """Write transient blocked.md. Resume protocol clears it on success.
 
@@ -185,6 +272,16 @@ def write_blocked(
     here we only guard against frontmatter injection by rejecting
     values that contain a newline (which would break out of the
     `block_type:` line into adjacent frontmatter rows).
+
+    ``frontmatter_extra`` (codex round-2 [P2] regression fix) accepts
+    operator-critical extra metadata that must land in blocked.md
+    frontmatter — production caller ``flow_orchestrator.auto_dispatch_task``
+    passes ``{"block_row": verdict.block_row}`` so operators can grep the
+    manifest row that tripped the violation. ``None`` (default) preserves
+    byte-for-byte back-compat with v0.8.0 callers; an empty dict is
+    equivalent to None. Validation runs in ``_format_frontmatter_extra``
+    BEFORE any disk write so an invalid extras dict raises ``ValueError``
+    without leaving a partial blocked.md.
     """
     bt_line = ""
     if block_type is not None:
@@ -193,6 +290,10 @@ def write_blocked(
                 f"block_type must be a single-line str; got {block_type!r}"
             )
         bt_line = f"block_type: {block_type}\n"
+    # Validate + format BEFORE any disk write — invalid extras must not
+    # leave a partial blocked.md (D5: explicit ValueError propagates;
+    # no try/except around atomic_write_text).
+    extra_lines = _format_frontmatter_extra(frontmatter_extra)
     body = (
         f"---\n"
         f"{bt_line}"
@@ -202,6 +303,7 @@ def write_blocked(
         f"required_choice: {json.dumps(required_choice)}\n"
         f"safe_resume_command: {safe_resume_command}\n"
         f"ts: {datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%dT%H:%M:%SZ')}\n"
+        f"{extra_lines}"
         f"---\n\n"
         f"# Blocked: {why_blocked}\n\n"
         f"Choices: {', '.join(required_choice)}\n\n"
