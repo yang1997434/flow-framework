@@ -2064,6 +2064,16 @@ class GateRunner:
 _GIT_HEAD_QUERY_TIMEOUT_SEC = 30
 _GIT_MERGE_TIMEOUT_SEC = 60
 
+# Code-review round-1 [P1-3]: argv allowlist guard. ``merge_strategy`` is
+# spliced directly into the ``git merge <strategy> <branch>`` argv. Only
+# ``--ff-only`` is in scope for v0.8.1; ``--no-ff`` is reserved for
+# v0.8.2. Any other value (e.g. ``--squash``, ``--strategy=ours``) MUST
+# fail loud at the merge_task entry point — BEFORE any disk side-effect
+# (event append / checkpoint write / progress.md status) — so a future
+# caller passing a user-derived string gets an immediate rejection
+# instead of a silent strategy substitution.
+_ALLOWED_MERGE_STRATEGIES: tuple[str, ...] = ("--ff-only", "--no-ff")
+
 
 def _run_argv_with_pgkill(
     argv: list[str],
@@ -2196,6 +2206,16 @@ class MergeRunner:
         self, *, facts: TaskFacts, merge_strategy: str,
     ) -> MergeResult:
         """Execute steps 2-7 of the R3 transactional sequence."""
+        # Code-review round-1 [P1-3]: allowlist guard. Run BEFORE any
+        # disk side-effect so an unsupported strategy never produces
+        # half-written events / checkpoints. v0.8.1 only ``--ff-only``
+        # is exercised; allowlist documents the contract and fails
+        # loud on accidental expansion.
+        if merge_strategy not in _ALLOWED_MERGE_STRATEGIES:
+            raise ValueError(
+                f"unsupported merge_strategy: {merge_strategy!r}; "
+                f"allowed: {_ALLOWED_MERGE_STRATEGIES}"
+            )
         # Step 2 — task_ready_to_merge.
         append_autonomy_event(
             self.task_dir, EVENT_TASK_READY_TO_MERGE,
@@ -2248,24 +2268,18 @@ class MergeRunner:
         """Steps 5-7. Split out so step 4's status update is the gap-
         boundary commit point — a crash between step 4 and step 5 is
         observable by readers as ``task_ready_to_merge`` without a
-        following ``merge_started`` (Y5)."""
-        # Step 5 — merge_started.
-        append_autonomy_event(
-            self.task_dir, EVENT_MERGE_STARTED,
-            {
-                "event_id": _new_event_id(),
-                "ts": _now_iso(),
-                "slug": self.ctx.slug,
-                "run_id": self.run_id,
-                "task_id": self.task_id,
-                "worktree_id": self.ctx.worktree_id,
-                "worktree_path": str(self.ctx.worktree_path),
-                "integration_target": self.ctx.integration_target,
-                "target_commit_pre_merge": facts.target_commit_pre_merge,
-            },
-        )
+        following ``merge_started`` (Y5).
 
-        # Step 6 — git merge. Guarded by R9 HEAD safety check.
+        Code-review round-1 [P1-1]: the R9 HEAD safety pre-check runs
+        BEFORE the ``merge_started`` event is emitted. Reason: R9 block
+        + emitted ``merge_started`` would leave a phantom gap signature
+        (``merge_started`` without ``merge_applied``) that
+        :func:`detect_mid_merge_crash` reports as ``mid_merge_crash`` —
+        but no git ran, so the recommended ``replay_merge_from_diff_hash``
+        is misleading. Emit ``merge_started`` only after the HEAD
+        invariant is proven.
+        """
+        # R9 HEAD pre-check (BEFORE merge_started event — see docstring).
         repo_root = self._derive_repo_root()
 
         # R9 HEAD assertion: refuse to merge unless repo_root HEAD is
@@ -2319,6 +2333,26 @@ class MergeRunner:
                 ),
             )
 
+        # Step 5 — merge_started. Emitted ONLY after R9 HEAD pre-check
+        # passes; otherwise we'd write a phantom gap that
+        # ``detect_mid_merge_crash`` would mistake for a real
+        # mid_merge_crash (see code-review P1-1 fix).
+        append_autonomy_event(
+            self.task_dir, EVENT_MERGE_STARTED,
+            {
+                "event_id": _new_event_id(),
+                "ts": _now_iso(),
+                "slug": self.ctx.slug,
+                "run_id": self.run_id,
+                "task_id": self.task_id,
+                "worktree_id": self.ctx.worktree_id,
+                "worktree_path": str(self.ctx.worktree_path),
+                "integration_target": self.ctx.integration_target,
+                "target_commit_pre_merge": facts.target_commit_pre_merge,
+            },
+        )
+
+        # Step 6 — git merge. R9 HEAD invariant already proven above.
         merge_run = _run_argv_with_pgkill(
             ["git", "-C", str(repo_root),
              "merge", merge_strategy, self.ctx.branch],
@@ -2508,6 +2542,38 @@ def detect_mid_merge_crash(
         "post_merge_verify_in_progress_crash", "choices": [...]}`` —
         ``merge_applied`` without a paired terminal verify event.
       - ``{"state": "none"}`` — no merge events for this (run, task).
+
+    ``mid_merge_crash`` semantic note (code-review round-1 [P1-2]):
+    after the P1-1 reorder (R9 HEAD pre-check before
+    ``merge_started``), several distinct ``MergeRunner._continue_merge``
+    failure paths can still produce the gap signature
+    (``merge_started`` without ``merge_applied``):
+
+      * **timeout during git merge** — pgkill fired; on-disk repo state
+        is undefined. Genuine mid-merge crash.
+      * **spawn_error invoking git merge** — Popen failed; no git ran
+        at all. Phantom gap; ``replay_merge_from_diff_hash`` is a no-op.
+      * **rc != 0 from git merge** — conflict, hook reject, etc. Replay
+        will recur the same error. Conservative-correct (operator must
+        unblock manually before retry).
+      * **post-merge ``rev-parse HEAD`` failure** — merge HAS APPLIED
+        but we couldn't read the new HEAD. Reported here as
+        ``mid_merge_crash`` (a slight misclassification — semantically
+        ``mid_gate8_crash`` would be closer). Acceptable because
+        ``replay_merge_from_diff_hash`` is idempotent: the second
+        attempt's ``git merge --abort`` + re-merge resolves to a no-op
+        when source == target after the first merge.
+
+    All four paths funnel to the same R3 reconcile choices:
+    ``{replay_merge_from_diff_hash, abort_and_revert_partial,
+    switch_to_interactive}``. Replay is idempotent in every path
+    above, so a false-positive ``mid_merge_crash`` cannot corrupt repo
+    state — at worst it surfaces a redundant prompt to the user.
+
+    v0.8.2 may emit a separate ``merge_aborted_pre_apply`` event from
+    the spawn_error / post-rev-parse-fail paths to allow finer-grained
+    reporting; for v0.8.1 the conservative classification + idempotent
+    replay is sufficient.
 
     Pitfalls covered:
       - **L** (presence vs type): every JSON access uses ``.get(...)``

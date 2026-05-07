@@ -2014,10 +2014,18 @@ class TestMergeRefusesWrongHead(unittest.TestCase):
             check=True, capture_output=True, text=True,
         ).stdout.strip()
         self.assertEqual(head_before, head_after)
-        # No merge_applied event written (pre-merge events ran first).
+        # Code-review round-1 [P1-1]: ``merge_started`` MUST NOT be
+        # written when R9 HEAD pre-check blocks. Otherwise
+        # ``detect_mid_merge_crash`` reports a phantom
+        # ``mid_merge_crash`` (gap signature ``merge_started`` without
+        # ``merge_applied``) and the user is told to
+        # ``replay_merge_from_diff_hash`` even though no git ran. The
+        # pre-merge events that DO get written are the steps 2-3
+        # bookkeeping (``task_ready_to_merge``); ``merge_started`` is
+        # gated on the R9 invariant being proven.
         events = _decisions_jsonl_events(self.task_dir)
         self.assertIn("task_ready_to_merge", events)
-        self.assertIn("merge_started", events)
+        self.assertNotIn("merge_started", events)
         self.assertNotIn("merge_applied", events)
 
     def test_proceeds_when_head_matches_integration_target(self) -> None:
@@ -2037,6 +2045,48 @@ class TestMergeRefusesWrongHead(unittest.TestCase):
             check=True, capture_output=True, text=True,
         ).stdout.strip()
         self.assertEqual(head_after, self.head_sha)
+
+
+class TestMergeStrategyAllowlist(unittest.TestCase):
+    """Code-review round-1 [P1-3]: ``merge_strategy`` is a free-form
+    str spliced into argv. Allowlist guard at ``merge_task`` entry MUST
+    reject unsupported strategies BEFORE any disk side-effect (events /
+    checkpoints / progress.md). v0.8.1 ships only ``--ff-only``;
+    accidental ``--squash`` etc. must fail loud.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="t14-merge-allowlist-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ctx, self.contract, self.task_dir = _make_merge_runner_ctx(
+            self.tmp,
+        )
+        self.head_sha = _commit_in_worktree(
+            self.ctx, "src/foo.py", "print('hi')\n",
+        )
+        self.facts = TaskFacts(
+            changed_files=["src/foo.py"], newly_added_files=["src/foo.py"],
+            diff_hash="x" * 64, target_commit_pre_merge=self.head_sha,
+        )
+
+    def test_merge_task_rejects_unsupported_strategy(self) -> None:
+        """``--squash`` (out of scope for v0.8.1) → ValueError, no
+        side effects on disk.
+        """
+        merger = MergeRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r", task_id="T0",
+        )
+        with self.assertRaises(ValueError) as cm:
+            merger.merge_task(facts=self.facts, merge_strategy="--squash")
+        self.assertIn("unsupported merge_strategy", str(cm.exception))
+        self.assertIn("--squash", str(cm.exception))
+        # Verify NO events written — guard runs BEFORE step 2.
+        events_path = self.task_dir / "decisions.jsonl"
+        if events_path.is_file():
+            text = events_path.read_text(encoding="utf-8")
+            self.assertNotIn("task_ready_to_merge", text)
+            self.assertNotIn("merge_started", text)
 
 
 class TestMidMergeCrashDetection(unittest.TestCase):
