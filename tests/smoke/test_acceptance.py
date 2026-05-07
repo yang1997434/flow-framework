@@ -41,6 +41,7 @@ from flow_acceptance import (   # type: ignore  # noqa: E402
     E2E_TYPE_TIMEOUT,
     MAX_JSON_QUERY_FILE_BYTES,
     MAX_HTTP_REDIRECTS,
+    EvalDecision,
 )
 from flow_contract import AcceptanceCriterion  # type: ignore  # noqa: E402
 
@@ -1784,6 +1785,104 @@ class TestEmbeddedNulRunOneSafetyNet(unittest.TestCase):
             retry_idx=0, task_dir=self.task_dir,
         )
         self._assert_paired_events(result)
+
+
+# ---------------------------------------------------------------------------
+# T8 — evaluate_criterion routing (Phase 2 + Phase 3)
+# ---------------------------------------------------------------------------
+
+
+class TestEvaluateCriterionPhase2(unittest.TestCase):
+    """T8 §3 line 130–137 + Y1: Phase 2 routing — happy path + R1
+    local-fix whitelist + e2e/regression escalate-or-block."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp))
+
+    def _runner(self) -> AcceptanceRunner:
+        return _make_runner(self.tmp)
+
+    def _crit(self, type_: str, method: str) -> AcceptanceCriterion:
+        kwargs = {"description": "x", "type": type_, "method": method,
+                  "timeout_sec": 30}
+        if method == "cmd":
+            kwargs["command"] = "x"
+        return AcceptanceCriterion(**kwargs)
+
+    def test_phase2_unit_pass(self):
+        runner = self._runner()
+        crit = self._crit(type_="unit", method="cmd")
+        result = RunResult(status="pass", exit_code=0, duration_ms=5)
+        d = runner.evaluate_criterion(crit, phase=2, runner_result=result)
+        self.assertEqual(d, EvalDecision.PASS)
+
+    def test_phase2_unit_fail_allows_local_fix(self):
+        crit = self._crit(type_="unit", method="cmd")
+        result = RunResult(status="fail", exit_code=1, duration_ms=5)
+        d = self._runner().evaluate_criterion(crit, phase=2, runner_result=result)
+        self.assertEqual(d, EvalDecision.LOCAL_FIX_ALLOWED)
+
+    def test_phase2_unit_timeout_blocks_row5(self):
+        crit = self._crit(type_="unit", method="cmd")
+        result = RunResult(status="timed_out", duration_ms=1000)
+        d = self._runner().evaluate_criterion(crit, phase=2, runner_result=result)
+        self.assertEqual(d, EvalDecision.BLOCK_ROW5)
+
+    def test_phase2_e2e_fail_escalates_row6(self):
+        crit = self._crit(type_="e2e", method="cmd")
+        result = RunResult(status="fail", exit_code=1,
+                           duration_ms=5, escalate=True)
+        d = self._runner().evaluate_criterion(crit, phase=2, runner_result=result)
+        self.assertEqual(d, EvalDecision.BLOCKED_ESCALATE_ROW6)
+
+    def test_phase2_regression_fail_blocks_row5(self):
+        """§3 line 134: regression type never local."""
+        crit = self._crit(type_="regression", method="cmd")
+        result = RunResult(status="fail", exit_code=1, duration_ms=5)
+        d = self._runner().evaluate_criterion(crit, phase=2, runner_result=result)
+        self.assertEqual(d, EvalDecision.BLOCK_ROW5)
+
+
+class TestEvaluateCriterionPhase3(unittest.TestCase):
+    """T8 R2: Phase 3 (post-merge verify) — behavior/e2e never local;
+    unit/integration fail blocks but does NOT enter retry whitelist."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp))
+
+    def _runner(self) -> AcceptanceRunner:
+        return _make_runner(self.tmp)
+
+    def _crit(self, type_: str, method: str) -> AcceptanceCriterion:
+        kwargs = {"description": "x", "type": type_, "method": method,
+                  "timeout_sec": 30}
+        if method == "cmd":
+            kwargs["command"] = "x"
+        return AcceptanceCriterion(**kwargs)
+
+    def test_phase3_behavior_fail_escalates_row6(self):
+        """R2: behavior in Phase 3 NEVER local — must escalate."""
+        crit = self._crit(type_="behavior", method="cmd")
+        result = RunResult(status="fail", exit_code=1, duration_ms=5)
+        d = self._runner().evaluate_criterion(crit, phase=3, runner_result=result)
+        self.assertEqual(d, EvalDecision.BLOCKED_ESCALATE_ROW6)
+
+    def test_phase3_e2e_fail_escalates_row6(self):
+        crit = self._crit(type_="e2e", method="cmd")
+        result = RunResult(status="fail", exit_code=1,
+                           duration_ms=5, escalate=True)
+        d = self._runner().evaluate_criterion(crit, phase=3, runner_result=result)
+        self.assertEqual(d, EvalDecision.BLOCKED_ESCALATE_ROW6)
+
+    def test_phase3_unit_fail_blocks_row5_no_retry(self):
+        """Post-merge verify: unit fail blocks but does NOT enter retry whitelist."""
+        crit = self._crit(type_="unit", method="cmd")
+        result = RunResult(status="fail", exit_code=1, duration_ms=5)
+        d = self._runner().evaluate_criterion(crit, phase=3, runner_result=result)
+        self.assertEqual(d, EvalDecision.BLOCK_ROW5)
+        self.assertNotEqual(d, EvalDecision.LOCAL_FIX_ALLOWED)
 
 
 if __name__ == "__main__":

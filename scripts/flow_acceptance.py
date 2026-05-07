@@ -150,6 +150,7 @@ the criterion author's URL choice — same trust boundary as ``cmd``.
 from __future__ import annotations
 
 import datetime
+import enum
 import hashlib
 import http.client
 import json
@@ -283,6 +284,45 @@ class _SchemeValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
         )
 
 
+# ---------------------------------------------------------------------------
+# T8 — evaluate_criterion routing constants + enum
+# ---------------------------------------------------------------------------
+
+
+class EvalDecision(str, enum.Enum):
+    """Routing verdict for ``AcceptanceRunner.evaluate_criterion`` (T8).
+
+    Consumed by orchestrator dispatch (T13 codex review whitelist + T15 gate
+    harness loop): the runner produces the verdict, the orchestrator decides
+    what to do with it (re-run, block, escalate to user).
+
+    - ``PASS``: criterion satisfied, continue.
+    - ``LOCAL_FIX_ALLOWED``: Phase 2 retry whitelist applies (R1).
+    - ``BLOCK_ROW5``: §1 row 5 — regular block (no escalate-choice menu).
+    - ``BLOCKED_ESCALATE_ROW6``: §1 row 6 — escalate menu
+      ``{abort, interactive, split}``.
+    - ``INCONCLUSIVE``: T9 resume / contract bug; deferred verdict.
+    """
+
+    PASS = "pass"
+    LOCAL_FIX_ALLOWED = "local_fix_allowed"
+    BLOCK_ROW5 = "block_row5"
+    BLOCKED_ESCALATE_ROW6 = "blocked_escalate_row6"
+    INCONCLUSIVE = "inconclusive"
+
+
+# Per design §3 line 130–131 + plan §8.2: types that allow Phase 2 local fix.
+# NOTE (B-blindspot — design vs plan): design §3 line 139–140 defines the
+# whitelist as "gates 4 + 5-unit/integration/behavior" only. The plan
+# (most recent codex-approved artifact) extends to ``smoke`` as well — this
+# T8 implementation follows the plan; the discrepancy is flagged for review.
+PHASE2_LOCAL_FIX_TYPES = frozenset({"unit", "integration", "behavior", "smoke"})
+# Phase 3 types that NEVER local-fix (R2 — PRD §1.3): behavior + e2e + regression.
+PHASE3_NEVER_LOCAL_TYPES = frozenset({"behavior", "e2e", "regression"})
+# E2E always escalates regardless of phase (PRD §1.3 + Y1).
+ALWAYS_ESCALATE_TYPES = frozenset({"e2e"})
+
+
 @dataclass
 class RunResult:
     """Per-criterion executor return shape.
@@ -407,6 +447,123 @@ class AcceptanceRunner:
         if criterion.method == "http":
             return "true"
         return "unknown"
+
+    # ------------------------------------------------------------------
+    # T8 — Phase 2 / Phase 3 retry-routing decision
+    # ------------------------------------------------------------------
+
+    def evaluate_criterion(
+        self,
+        criterion: AcceptanceCriterion,
+        *,
+        phase: int,
+        runner_result: RunResult,
+    ) -> EvalDecision:
+        """Decide the next routing step for a finished criterion run.
+
+        Inputs:
+          - ``criterion``: the AcceptanceCriterion (gives us ``type``).
+          - ``phase``: 2 = task execution in worktree (gates 5 + 6);
+            3 = post-merge verification (gate 8).
+          - ``runner_result``: the :class:`RunResult` produced by ``run_one``
+            (or, in tests, hand-built). ``status`` ∈ ``{pass, fail,
+            timed_out, inconclusive, interrupted}``; ``escalate`` is the Y1
+            flag set by ``run_one`` for ``type=e2e`` failures.
+
+        Output: :class:`EvalDecision` per the design §3 line 130–137 + Y1
+        decision matrix:
+
+        =============  ===========================  ===========================
+        type           Phase 2                      Phase 3
+        =============  ===========================  ===========================
+        unit           pass→PASS / fail→LOCAL /     pass→PASS / fail→BLOCK_ROW5
+                       timeout→BLOCK_ROW5           / timeout→BLOCK_ROW5
+        integration    as unit                      as unit
+        behavior       as unit (R1)                 fail/timeout→ESCALATE (R2)
+        smoke          as unit (R1, plan extends)   as unit
+        e2e            ESCALATE (Y1, always)        ESCALATE (always)
+        regression     fail/timeout→BLOCK_ROW5      same
+        =============  ===========================  ===========================
+
+        Routing-order rationale (C-blindspot — order matters):
+          1. ``status == "pass"`` short-circuits regardless of phase/type.
+          2. ``inconclusive`` short-circuits to ``INCONCLUSIVE`` (T9 will
+             distinguish "tool broke" from "criterion bug").
+          3. ``type == "e2e"`` OR ``runner_result.escalate=True`` route to
+             escalate BEFORE regression / phase-2-whitelist branches —
+             otherwise an e2e criterion authored as ``type=regression``
+             would route wrong, and a future executor that sets
+             ``escalate=True`` for non-e2e types would be ignored.
+          4. ``regression`` → BLOCK_ROW5 (§3 line 134; never local).
+          5. Phase 3 ∈ {behavior, e2e, regression} → escalate (R2).
+          6. Phase 2 fail in whitelist → LOCAL_FIX_ALLOWED.
+          7. Catch-all → BLOCK_ROW5 (D5 defense-in-depth: timeout for any
+             non-e2e type / non-whitelisted Phase 2 fail / Phase 3 unit fail).
+
+        D5 catch-all: the final ``return EvalDecision.BLOCK_ROW5`` is the
+        safety net for any combination not explicitly handled above. It is
+        load-bearing — do not promote to a raise (an unrouted verdict
+        would crash the orchestrator gate-loop) and do not remove (silent
+        fall-through would be a null verdict). All paths through the
+        function return a member of :class:`EvalDecision`.
+        """
+        # D5: ``phase`` is the contract boundary — a misuse from the
+        # orchestrator must surface immediately, not be silently routed.
+        if phase not in (2, 3):
+            raise ValueError(f"phase must be 2 or 3, got {phase!r}")
+
+        status = runner_result.status
+
+        # 1. Pass propagates regardless of type/phase.
+        if status == "pass":
+            return EvalDecision.PASS
+
+        # 2. inconclusive: deferred to T9 (resume / contract bug discrimination).
+        if status == "inconclusive":
+            return EvalDecision.INCONCLUSIVE
+
+        # 3. Y1 + always-escalate: e2e (or any executor-flagged escalate)
+        # always routes to row 6 regardless of phase. MUST run before the
+        # regression / whitelist branches — if the contract author put e2e
+        # under type=regression by mistake we still honor the escalate flag.
+        if (
+            criterion.type in ALWAYS_ESCALATE_TYPES
+            or runner_result.escalate
+        ):
+            return EvalDecision.BLOCKED_ESCALATE_ROW6
+
+        # 4. regression: never local — same verdict in both phases.
+        if criterion.type == "regression":
+            return EvalDecision.BLOCK_ROW5
+
+        # 5. Phase 3 R2: behavior in Phase 3 escalates (e2e already handled
+        # above; regression too). The set membership keeps the rule next to
+        # its definition for future additions.
+        if phase == 3 and criterion.type in PHASE3_NEVER_LOCAL_TYPES:
+            return EvalDecision.BLOCKED_ESCALATE_ROW6
+
+        # 6. Phase 2 R1 retry whitelist: fail (NOT timeout) for whitelisted
+        # types → orchestrator may attempt local fix + retry. Timeout falls
+        # through to the catch-all (BLOCK_ROW5) per design line 279 (timeout
+        # is treated as criterion fail; retry budget shouldn't burn on what
+        # may be an environmental issue — extend_timeout_and_retry is the
+        # operator-driven path).
+        #
+        # A-blindspot: ``criterion.type`` is a typed dataclass attribute, so
+        # we use ``in PHASE2_LOCAL_FIX_TYPES`` (set membership) — NOT
+        # ``criterion.type or "unit"``. Implicit defaults here would silently
+        # accept malformed contracts; T1's parser already rejects empty types.
+        if (
+            phase == 2
+            and status == "fail"
+            and criterion.type in PHASE2_LOCAL_FIX_TYPES
+        ):
+            return EvalDecision.LOCAL_FIX_ALLOWED
+
+        # 7. D5 catch-all: timeout (any type) / non-whitelisted Phase 2 fail /
+        # Phase 3 unit-or-integration fail / interrupted. Block on §1 row 5
+        # so the orchestrator surfaces a regular block (no escalate menu).
+        return EvalDecision.BLOCK_ROW5
 
     def _resolve_within_worktree(
         self, rel_path: str, field_name: str,
