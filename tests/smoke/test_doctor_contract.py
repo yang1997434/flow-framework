@@ -240,6 +240,147 @@ class TestDoctorEmptySnapshotNoFalsePositive(unittest.TestCase):
         self.assertIn("no task-start snapshot", out)
 
 
+class TestDoctorReasonRender(unittest.TestCase):
+    """[Codex round-3 P3] Visibility — round-2 fix-pass made check_all
+    propagate `reason` details (e.g. baseline timed out / spawn failed
+    / "no baseline_command configured" / "could not import _run_shell_
+    with_pgkill helper") on the not-stale path. But doctor's render
+    loop only consumed `skipped`; `reason` was silently dropped, making
+    round-2's aggregator propagation dead code. Round-3 fix adds an
+    `elif "reason"` branch on both the stale and clean rendering
+    paths, surfacing "<trig>: not stale — <reason>" so operators see
+    why a trigger declined to fire vs simply passing.
+
+    These tests exercise the renderer in-process: we patch
+    `flow_staleness.StalenessChecker.check_all` to return a verdict
+    with reason details, run `flow_doctor.check_staleness()`, capture
+    stdout, and assert the new "not stale — <reason>" line surfaces.
+    Without round-3 fix the same input produced silent output, hence
+    the reason text is the load-bearing assertion.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp))
+        # Real worktree dir + .flow scaffold so check_staleness reaches
+        # the per-task body (the check_all patch only intercepts the
+        # leaf-level staleness scan, not the candidate discovery loop).
+        self.task_dir = _init_repo_with_worktree(self.tmp, "demo")
+        self.contract_path = self.task_dir / "contract.json"
+        self.contract_path.write_text(json.dumps({
+            "integration_target": "master",
+            # Force include_baseline=True so trigger 5 surfaces.
+            "baseline_command": "true",
+        }))
+        # Prepend scripts/ so we can import flow_doctor / flow_staleness.
+        scripts = str(REPO_ROOT / "scripts")
+        if scripts not in sys.path:
+            sys.path.insert(0, scripts)
+
+    def _run_check_staleness_with_patched_verdict(
+        self, verdict_details: dict
+    ) -> str:
+        """Run flow_doctor.check_staleness() in-process with cwd=self.tmp
+        and `StalenessChecker.check_all` patched to return a verdict with
+        `verdict_details` as `details`. Captures stdout and returns it."""
+        import io
+        import contextlib
+        from unittest import mock
+
+        # Late imports so each test gets a fresh module reference.
+        import flow_doctor
+        import flow_staleness
+
+        fake_verdict = flow_staleness.StalenessVerdict(stale=False)
+        fake_verdict.details = dict(verdict_details)
+
+        old_cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            with mock.patch.object(
+                flow_staleness.StalenessChecker,
+                "check_all",
+                return_value=fake_verdict,
+            ):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    flow_doctor.check_staleness()
+                return buf.getvalue()
+        finally:
+            os.chdir(old_cwd)
+
+    def test_doctor_renders_reason_on_clean_path(self) -> None:
+        """Trigger 5 declined to fire because baseline timed out
+        (inconclusive). With round-3 fix the operator sees
+        'baseline_fail: not stale — baseline timed out (inconclusive)'
+        on the clean (not-stale) branch. Pre-fix: invisible."""
+        out = self._run_check_staleness_with_patched_verdict({
+            "baseline_fail": {
+                "reason": "baseline timed out (inconclusive)",
+                "timeout_sec": 300,
+            },
+        })
+        self.assertIn("not stale", out)
+        self.assertIn("baseline timed out (inconclusive)", out)
+
+    def test_doctor_renders_reason_for_no_baseline_command(self) -> None:
+        """The 'no baseline_command configured' reason is the most
+        actionable to the operator (they need to fill in their
+        baseline command in contract.json). Round-3 fix surfaces it."""
+        out = self._run_check_staleness_with_patched_verdict({
+            "baseline_fail": {"reason": "no baseline_command configured"},
+        })
+        self.assertIn("not stale", out)
+        self.assertIn("no baseline_command configured", out)
+
+    def test_doctor_reason_does_not_misrender_as_exit_code(self) -> None:
+        """Pre-fix regression: when one trigger fired stale and trigger
+        5 returned `{"reason": ...}` (not stale), the stale branch's
+        `elif trig == "baseline_fail"` would mis-render the reason
+        detail as 'baseline_fail: exit_code=?' (because reason dicts
+        don't contain `exit_code`). Round-3 fix adds an `elif "reason"`
+        guard before the typed renderer, suppressing the misrender."""
+        # Construct a verdict where trigger 1 (base_branch) fires stale
+        # but trigger 5 declined with a reason. Stale branch must render
+        # the reason, NOT 'exit_code=?'.
+        import flow_staleness
+        fake_verdict = flow_staleness.StalenessVerdict(stale=True)
+        fake_verdict.triggered = ["base_branch"]
+        fake_verdict.details = {
+            "base_branch": {
+                "from_commit": "aaaaaaa1234567",
+                "to_commit": "bbbbbbb1234567",
+                "integration_target": "master",
+            },
+            "baseline_fail": {"reason": "baseline spawn failed"},
+        }
+        import io
+        import contextlib
+        from unittest import mock
+        import flow_doctor
+
+        old_cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            with mock.patch.object(
+                flow_staleness.StalenessChecker,
+                "check_all",
+                return_value=fake_verdict,
+            ):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    flow_doctor.check_staleness()
+                out = buf.getvalue()
+        finally:
+            os.chdir(old_cwd)
+
+        # Reason renders correctly:
+        self.assertIn("not stale", out)
+        self.assertIn("baseline spawn failed", out)
+        # And the misrender does NOT occur:
+        self.assertNotIn("exit_code=?", out)
+
+
 class TestDoctorRClassEscape(unittest.TestCase):
     """[Codex round-1 P2 R-class] Disk-derived strings (slug,
     worktree dir name, integration_target) printed in the staleness

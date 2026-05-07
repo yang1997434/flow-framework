@@ -703,6 +703,21 @@ def check_staleness() -> int:
                         f"{_safe_print_str(det.get('skipped', ''))}"
                     )
                     continue
+                # [P3 codex round-3]: when one trigger fires stale but
+                # another non-stale trigger returned `{"reason": ...}`
+                # (e.g. baseline timed out / spawn failed / no command
+                # configured), surface the reason instead of falling
+                # through to the typed renderer below — without this,
+                # `baseline_fail` w/ reason would mis-render as
+                # "exit_code=?". Round-2 fix-pass made the aggregator
+                # propagate `reason` on the not-stale path, but doctor
+                # only consumed `skipped`; this finishes the chain.
+                if "reason" in det:
+                    print(
+                        f"      {trig}: not stale — "
+                        f"{_safe_print_str(det.get('reason', ''))}"
+                    )
+                    continue
                 if trig == "base_branch":
                     target_safe = _safe_print_str(
                         det.get("integration_target", "?")
@@ -733,11 +748,29 @@ def check_staleness() -> int:
             # branch so the operator can tell whether triggers 2/3/4
             # actually ran or skipped due to the v0.8.1 empty-snapshot
             # mode (codex round-1 P2 visibility).
+            #
+            # [P3 codex round-3]: also surface `reason` details. The
+            # round-2 fix-pass made check_all propagate both `skipped`
+            # and `reason` keys through the aggregator, but doctor's
+            # render loop only consumed `skipped`, so reasons like
+            # "baseline timed out (inconclusive)", "baseline spawn
+            # failed", "no baseline_command configured", and
+            # "could not import _run_shell_with_pgkill helper" stayed
+            # invisible — the aggregator propagation was dead code.
+            # Both keys go through `_safe_print_str` because the
+            # `reason` string may carry subprocess output (R-class).
             for trig, det in verdict.details.items():
-                if isinstance(det, dict) and "skipped" in det:
+                if not isinstance(det, dict):
+                    continue
+                if "skipped" in det:
                     print(
                         f"      {trig}: skipped — "
                         f"{_safe_print_str(det.get('skipped', ''))}"
+                    )
+                elif "reason" in det:
+                    print(
+                        f"      {trig}: not stale — "
+                        f"{_safe_print_str(det.get('reason', ''))}"
                     )
 
     if active_count == 0:
