@@ -622,6 +622,14 @@ class StalenessChecker:
             verdict.stale = True
             verdict.triggered.append("lockfile")
             verdict.details["lockfile"] = d2
+        elif isinstance(d2, dict) and ("skipped" in d2 or "reason" in d2):
+            # [P3 codex round-2]: surface skip / reason details even when
+            # not stale so doctor can print "skipped — no snapshot" to
+            # operator. Without this, check_all silently drops the
+            # context returned by leaf checks (round-1 fix-pass added
+            # `{"skipped": ...}` for v0.8.1 empty-snapshot mode but
+            # aggregator was overwriting that with nothing).
+            verdict.details["lockfile"] = d2
 
         # Trigger 3 — prd.md edited.
         prd = self.task_dir / "prd.md"
@@ -635,6 +643,11 @@ class StalenessChecker:
             verdict.stale = True
             verdict.triggered.append("prd_mtime")
             verdict.details["prd_mtime"] = d3
+        elif isinstance(d3, dict) and ("skipped" in d3 or "reason" in d3):
+            # [P3 codex round-2]: same as trigger 2 — surface skip /
+            # reason (e.g. "prd.md missing", "no snapshot") so operator
+            # understands why prd_mtime didn't fire.
+            verdict.details["prd_mtime"] = d3
 
         # Trigger 4 — dep-file version changed.
         snap_dep = self.baseline_snapshot.get("dep_versions", {}) or {}
@@ -644,6 +657,9 @@ class StalenessChecker:
         if r4:
             verdict.stale = True
             verdict.triggered.append("dep_version")
+            verdict.details["dep_version"] = d4
+        elif isinstance(d4, dict) and ("skipped" in d4 or "reason" in d4):
+            # [P3 codex round-2]: same skip-context propagation.
             verdict.details["dep_version"] = d4
 
         # Trigger 5 — baseline now fails (opt-in only).
@@ -666,6 +682,15 @@ class StalenessChecker:
                 if r5:
                     verdict.stale = True
                     verdict.triggered.append("baseline_fail")
+                    verdict.details["baseline_fail"] = d5
+                elif isinstance(d5, dict) and (
+                    "skipped" in d5 or "reason" in d5
+                ):
+                    # [P3 codex round-2]: baseline can decline to fire
+                    # for operator-actionable reasons (no command
+                    # configured, baseline was already failing, spawn
+                    # error, timeout). Surface those instead of
+                    # silently dropping the context.
                     verdict.details["baseline_fail"] = d5
 
         return verdict

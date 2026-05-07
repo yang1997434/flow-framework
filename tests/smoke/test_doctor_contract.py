@@ -216,6 +216,29 @@ class TestDoctorEmptySnapshotNoFalsePositive(unittest.TestCase):
         # Confirm staleness section actually ran for this slug.
         self.assertIn("demo", out)
 
+    def test_doctor_surfaces_skipped_message_to_operator(self) -> None:
+        """[Codex round-2 P3] Visibility: round-1 fix-pass made triggers
+        2/3/4 skip when snapshot is empty (v0.8.1 doctor-only mode), but
+        the aggregator silently dropped the skip detail → operator saw
+        only "clean" with no indication that triggers 2/3/4 were not
+        actually checking. Round-2 fix propagates skip details through
+        check_all so doctor's existing "skipped — ..." render path
+        actually receives them. Operator must now see the skipped
+        message so they understand v0.8.1 limitation."""
+        self.contract_path.write_text(json.dumps({
+            "integration_target": "master",
+            "baseline_command": "",
+        }))
+        (self.task_dir / "prd.md").write_text("# spec\n")
+        (self.tmp / "package-lock.json").write_text('{"v": 1}')
+
+        result = self._run_doctor()
+        out = result.stdout + result.stderr
+        self.assertIn("Contract integrity", out)
+        # Skipped message reaches operator output.
+        self.assertIn("skipped", out)
+        self.assertIn("no task-start snapshot", out)
+
 
 class TestDoctorRClassEscape(unittest.TestCase):
     """[Codex round-1 P2 R-class] Disk-derived strings (slug,

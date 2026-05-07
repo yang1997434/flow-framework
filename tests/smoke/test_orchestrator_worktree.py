@@ -2964,6 +2964,103 @@ class TestStalenessCheckAllAggregator(unittest.TestCase):
         self.assertTrue(verdict.stale)
         self.assertIn("baseline_fail", verdict.triggered)
 
+    def test_aggregator_preserves_skip_details_on_empty_snapshot(self) -> None:
+        """[Codex round-2 P3] Round-1 fix-pass made leaf checks 2/3/4
+        return `(False, {"skipped": ...})` on empty snapshot, but
+        check_all() previously dropped that detail (only stored details
+        on the trigger-fire branch). Doctor's render path looks for
+        verdict.details[*]["skipped"] — so without aggregator
+        propagation, operator never sees "skipped — no snapshot" and
+        cannot tell triggers 2/3/4 are inactive in v0.8.1 doctor-only
+        mode. Aggregator must surface skip context."""
+        # Add a lockfile + dep-file + prd.md so leaf checks have
+        # something to potentially skip vs. fire on.
+        (self.tmp / "package-lock.json").write_text('{"v": 1}')
+        (self.tmp / "package.json").write_text('{"name": "x"}')
+        (self.task_dir / "prd.md").write_text("# spec\n")
+        checker = StalenessChecker(
+            repo_root=self.tmp, ctx=self.ctx, task_dir=self.task_dir,
+            baseline_snapshot={
+                "lockfiles": {},
+                "prd_mtime": 0.0,
+                "dep_versions": {},
+            },
+        )
+        verdict = checker.check_all(include_baseline=False)
+        self.assertFalse(verdict.stale)
+        self.assertEqual(verdict.triggered, [])
+        # All three skip details preserved on the not-stale branch.
+        self.assertIn("lockfile", verdict.details)
+        self.assertIsInstance(verdict.details["lockfile"], dict)
+        self.assertIn("skipped", verdict.details["lockfile"])
+        self.assertIn("dep_version", verdict.details)
+        self.assertIn("skipped", verdict.details["dep_version"])
+        # prd_mtime: snapshot_mtime=0.0 → leaf check returns skipped.
+        self.assertIn("prd_mtime", verdict.details)
+        self.assertIn("skipped", verdict.details["prd_mtime"])
+
+    def test_aggregator_does_not_pollute_details_on_clean_run(self) -> None:
+        """[Codex round-2 P3] Anti-noise: when a leaf check returns
+        empty detail dict ({} = trigger didn't fire AND no skip / no
+        reason), aggregator must NOT add a key to verdict.details for
+        that trigger. Otherwise genuinely-clean runs would have noisy
+        empty-dict entries in details."""
+        # Create real lockfile + dep-file so snapshot is non-empty
+        # (avoids leaf checks taking the "empty snapshot" skip path).
+        (self.tmp / "package-lock.json").write_text('{"v": 1}')
+        (self.tmp / "package.json").write_text('{"name": "x"}')
+        prd = self.task_dir / "prd.md"
+        prd.write_text("# spec\n")
+        # Snapshot the current state; nothing changes after → leaf
+        # checks return (False, {}).
+        lock_snap = StalenessChecker.snapshot_lockfiles(self.tmp)
+        dep_snap = StalenessChecker.snapshot_dep_versions(self.tmp)
+        # prd_mtime > current → trigger 3 returns (False, {}).
+        prd_mtime = prd.stat().st_mtime + 100.0
+        self.assertTrue(lock_snap)
+        self.assertTrue(dep_snap)
+        checker = StalenessChecker(
+            repo_root=self.tmp, ctx=self.ctx, task_dir=self.task_dir,
+            baseline_snapshot={
+                "lockfiles": lock_snap,
+                "prd_mtime": prd_mtime,
+                "dep_versions": dep_snap,
+            },
+        )
+        verdict = checker.check_all(include_baseline=False)
+        self.assertFalse(verdict.stale)
+        # No trigger fired AND no skip/reason → details for those keys
+        # must be absent (avoid polluting the verdict).
+        self.assertNotIn("lockfile", verdict.details)
+        self.assertNotIn("dep_version", verdict.details)
+        self.assertNotIn("prd_mtime", verdict.details)
+
+    def test_aggregator_preserves_baseline_skip_reason(self) -> None:
+        """[Codex round-2 P3] Trigger 5 (baseline_fail) leaf check
+        returns operator-actionable reasons (e.g. 'baseline was failing
+        at task start', 'no baseline_command configured'). Aggregator
+        must surface those when the trigger doesn't fire, so doctor can
+        explain to the operator why baseline didn't actually run."""
+        checker = StalenessChecker(
+            repo_root=self.tmp, ctx=self.ctx, task_dir=self.task_dir,
+            baseline_snapshot={
+                "lockfiles": {},
+                "prd_mtime": 0.0,
+                "dep_versions": {},
+            },
+        )
+        verdict = checker.check_all(
+            include_baseline=True,
+            baseline_command="false",
+            baseline_was_passing=False,  # → leaf returns reason
+        )
+        self.assertFalse(verdict.stale)
+        self.assertNotIn("baseline_fail", verdict.triggered)
+        # Reason preserved so operator knows baseline was already failing.
+        self.assertIn("baseline_fail", verdict.details)
+        self.assertIsInstance(verdict.details["baseline_fail"], dict)
+        self.assertIn("reason", verdict.details["baseline_fail"])
+
 
 if __name__ == "__main__":
     unittest.main()
