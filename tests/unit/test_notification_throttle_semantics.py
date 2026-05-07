@@ -910,7 +910,7 @@ class TestCodexRound2FrontmatterExtraPassThrough(unittest.TestCase):
                 issue_id="i1", why_blocked="x",
                 required_choice=["abort"],
                 safe_resume_command="flow resume d",
-                frontmatter_extra={"note": "a b"},
+                frontmatter_extra={"note": "a\u2028b"},
             )
         self.assertIn("line-separator", str(ctx.exception).lower())
         self.assertFalse((Path(self.tmp) / "blocked.md").exists())
@@ -928,7 +928,7 @@ class TestCodexRound2FrontmatterExtraPassThrough(unittest.TestCase):
                 issue_id="i1", why_blocked="x",
                 required_choice=["abort"],
                 safe_resume_command="flow resume d",
-                frontmatter_extra={"note": "a b"},
+                frontmatter_extra={"note": "a\u2029b"},
             )
         self.assertIn("line-separator", str(ctx.exception).lower())
         self.assertFalse((Path(self.tmp) / "blocked.md").exists())
@@ -945,6 +945,79 @@ class TestCodexRound2FrontmatterExtraPassThrough(unittest.TestCase):
                 required_choice=["abort"],
                 safe_resume_command="flow resume d",
                 frontmatter_extra={"note": "a\x85b"},
+            )
+        self.assertIn("line-separator", str(ctx.exception).lower())
+        self.assertFalse((Path(self.tmp) / "blocked.md").exists())
+
+    def test_frontmatter_extra_rejects_vertical_tab(self):
+        """Codex round-4 [P2]: ``\\x0b`` (VT) is in Python's
+        ``str.splitlines()`` boundary set. Round-3 missed it; an
+        operator script that splitlines-parses the frontmatter would
+        see a forged row from ``"a\\x0bb"``. Pin explicitly."""
+        n = self._notifier()
+        with self.assertRaises(ValueError) as ctx:
+            n.fire_block(
+                block_type="x", phase=2, task_id="T1",
+                issue_id="i1", why_blocked="x",
+                required_choice=["abort"],
+                safe_resume_command="flow resume d",
+                frontmatter_extra={"note": "a\x0bb"},
+            )
+        self.assertIn("line-separator", str(ctx.exception).lower())
+        self.assertFalse((Path(self.tmp) / "blocked.md").exists())
+
+    def test_frontmatter_extra_rejects_form_feed(self):
+        """Codex round-4 [P2]: ``\\x0c`` (FF) -- splitlines() boundary."""
+        n = self._notifier()
+        with self.assertRaises(ValueError) as ctx:
+            n.fire_block(
+                block_type="x", phase=2, task_id="T1",
+                issue_id="i1", why_blocked="x",
+                required_choice=["abort"],
+                safe_resume_command="flow resume d",
+                frontmatter_extra={"note": "a\x0cb"},
+            )
+        self.assertIn("line-separator", str(ctx.exception).lower())
+        self.assertFalse((Path(self.tmp) / "blocked.md").exists())
+
+    def test_frontmatter_extra_rejects_file_separator(self):
+        """Codex round-4 [P2]: ``\\x1c`` (FS) -- splitlines() boundary."""
+        n = self._notifier()
+        with self.assertRaises(ValueError) as ctx:
+            n.fire_block(
+                block_type="x", phase=2, task_id="T1",
+                issue_id="i1", why_blocked="x",
+                required_choice=["abort"],
+                safe_resume_command="flow resume d",
+                frontmatter_extra={"note": "a\x1cb"},
+            )
+        self.assertIn("line-separator", str(ctx.exception).lower())
+        self.assertFalse((Path(self.tmp) / "blocked.md").exists())
+
+    def test_frontmatter_extra_rejects_group_separator(self):
+        """Codex round-4 [P2]: ``\\x1d`` (GS) -- splitlines() boundary."""
+        n = self._notifier()
+        with self.assertRaises(ValueError) as ctx:
+            n.fire_block(
+                block_type="x", phase=2, task_id="T1",
+                issue_id="i1", why_blocked="x",
+                required_choice=["abort"],
+                safe_resume_command="flow resume d",
+                frontmatter_extra={"note": "a\x1db"},
+            )
+        self.assertIn("line-separator", str(ctx.exception).lower())
+        self.assertFalse((Path(self.tmp) / "blocked.md").exists())
+
+    def test_frontmatter_extra_rejects_record_separator(self):
+        """Codex round-4 [P2]: ``\\x1e`` (RS) -- splitlines() boundary."""
+        n = self._notifier()
+        with self.assertRaises(ValueError) as ctx:
+            n.fire_block(
+                block_type="x", phase=2, task_id="T1",
+                issue_id="i1", why_blocked="x",
+                required_choice=["abort"],
+                safe_resume_command="flow resume d",
+                frontmatter_extra={"note": "a\x1eb"},
             )
         self.assertIn("line-separator", str(ctx.exception).lower())
         self.assertFalse((Path(self.tmp) / "blocked.md").exists())

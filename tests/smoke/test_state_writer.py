@@ -131,7 +131,23 @@ class TestStateWriter(unittest.TestCase):
                 self.task_dir,
                 phase=2, task="t1", why_blocked="x",
                 required_choice=["a"], safe_resume_command="r",
-                block_type="manifest_violation ts: forged",
+                block_type="manifest_violation\u2028ts: forged",
+            )
+        self.assertFalse((self.task_dir / "blocked.md").exists())
+
+    def test_blocked_md_block_type_rejects_vertical_tab(self):
+        """Codex round-4 [P2]: ``\\x0b`` (VT) is in Python's
+        ``str.splitlines()`` boundary set. Round-3 missed it; an
+        attacker passing ``block_type="x\\x0bts: forged"`` would
+        get a forged frontmatter row visible to operator scripts
+        that splitlines-parse the file. Pin explicitly here.
+        """
+        with self.assertRaises(ValueError):
+            write_blocked(
+                self.task_dir,
+                phase=2, task="t1", why_blocked="x",
+                required_choice=["a"], safe_resume_command="r",
+                block_type="manifest_violation\x0bts: forged",
             )
         self.assertFalse((self.task_dir / "blocked.md").exists())
 

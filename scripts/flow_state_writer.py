@@ -183,26 +183,40 @@ _FRONTMATTER_RESERVED: frozenset[str] = frozenset({
 _FRONTMATTER_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-# Frontmatter line-separator class (codex round-3 [P2]+[P3] — extends original
-# `\n`-only / `\n|\r`-only checks across both `block_type` and
-# `frontmatter_extra` validators). Members:
-#   \n / \r          ASCII LF/CR — long-known frontmatter row separators.
-#   \x00             NUL — some YAML 1.1 parsers terminate the document
-#                    stream here; downstream tools that read `blocked.md`
-#                    via `open(..., 'r')` may also see a truncated buffer.
-#   \x85             NEL (Unicode Next-Line). YAML 1.2 §5.4 explicitly lists
-#                    NEL as a line break; PyYAML in default mode honors it.
-#     /    Unicode LINE / PARAGRAPH SEPARATOR. Python's
-#                    `str.splitlines()` treats both as line breaks (and
-#                    several YAML parsers follow Python's lead), so an
-#                    operator script that splits frontmatter line-by-line
-#                    with the stdlib helper would see forged rows even
-#                    when PyYAML itself is strict.
+# Frontmatter line-separator class (codex round-3 [P2]+[P3] / round-4 [P2]+[P3]
+# -- extends the original `\n`-only / `\n|\r`-only checks across both
+# `block_type` and `frontmatter_extra` validators).  Source is kept ASCII-clean:
+# every Unicode separator is written as a Python escape (`"\\u2028"` etc.) so
+# this file can be opened safely by editors that treat U+2028/U+2029 as line
+# terminators.  Members:
+#   \n / \r              ASCII LF/CR -- long-known frontmatter row separators.
+#   \x00                 NUL -- some YAML 1.1 parsers terminate the document
+#                        stream here; downstream tools that read `blocked.md`
+#                        via `open(..., 'r')` may also see a truncated buffer.
+#   \x0b / \x0c          VT / FF -- listed in `str.splitlines()` boundary
+#                        set; an operator script using splitlines would
+#                        see forged frontmatter rows otherwise.
+#   \x1c / \x1d / \x1e   FS / GS / RS -- same splitlines() boundary set;
+#                        the round-3 fix advertised "splitlines() defense"
+#                        but omitted these five chars.  Round-4 closes the gap.
+#   \x85                 NEL (Unicode Next-Line). YAML 1.2 section 5.4
+#                        lists NEL as a line break; PyYAML default honors it.
+#   \u2028 / \u2029      Unicode LINE / PARAGRAPH SEPARATOR. Python's
+#                        `str.splitlines()` treats both as line breaks
+#                        (and several YAML parsers follow Python's lead),
+#                        so an operator script that splits frontmatter
+#                        line-by-line with the stdlib helper would see
+#                        forged rows even when PyYAML itself is strict.
 # tuple form (not regex) keeps the rule readable and avoids regex
 # meta-character escape footguns; `in` membership across a tuple of
-# fixed-length strings is O(n) over a 6-element list — fine here.
+# fixed-length strings is O(n) over an 11-element list -- fine here.
 _FRONTMATTER_LINE_SEPARATORS: tuple[str, ...] = (
-    "\n", "\r", "\x00", "\x85", " ", " ",
+    "\n", "\r",
+    "\x00",                                        # NUL -- YAML stream terminator
+    "\x0b", "\x0c",                                # VT, FF -- splitlines() boundary
+    "\x1c", "\x1d", "\x1e",                        # FS, GS, RS -- splitlines() boundary
+    "\x85",                                        # NEL -- YAML 1.2 line-break
+    "\u2028", "\u2029",                            # LSEP, PSEP -- splitlines() boundary
 )
 
 
@@ -211,17 +225,22 @@ def _reject_frontmatter_line_separators(value: str, *, field_name: str) -> None:
 
     Shared by ``block_type`` validation (in ``write_blocked``) and the
     ``frontmatter_extra`` str-value branch (in
-    ``_format_frontmatter_extra``). Codex round-3 fix-pass:
+    ``_format_frontmatter_extra``). History:
 
-    - [P2] block_type previously rejected only ``\\n``; ``\\r`` slipped
-      through and forged frontmatter rows in YAML parsers that respect
-      CR (every spec-conformant 1.2 parser does).
-    - [P3] frontmatter_extra str values previously rejected only
+    - Round-3 [P2]: block_type previously rejected only ``\\n``; ``\\r``
+      slipped through and forged frontmatter rows in YAML parsers that
+      respect CR (every spec-conformant 1.2 parser does).
+    - Round-3 [P3]: frontmatter_extra str values previously rejected only
       ``\\n`` / ``\\r``; ``\\x00`` / ``\\x85`` / ``\\u2028`` / ``\\u2029``
       passed through to disk and could still be treated as line breaks
       by Python's ``str.splitlines`` and several YAML parsers.
+    - Round-4 [P2]: the round-3 set still left out ``\\x0b`` (VT) /
+      ``\\x0c`` (FF) / ``\\x1c`` / ``\\x1d`` / ``\\x1e`` (FS / GS / RS),
+      which Python ``str.splitlines()`` ALSO treats as line boundaries.
+      Operator scripts that splitlines-parse the frontmatter would have
+      seen forged rows from a ``block_type="x\\x0bts: forged"`` bypass.
 
-    Two callers, one rule — extracting the helper de-duplicates the
+    Two callers, one rule -- extracting the helper de-duplicates the
     check and prevents drift if a future round adds another separator.
     """
     for sep in _FRONTMATTER_LINE_SEPARATORS:
@@ -252,14 +271,15 @@ def _format_frontmatter_extra(extra: Optional[dict]) -> str:
        ``float``. Lists / dicts / None are rejected — these are exactly
        the shapes that would tempt a "just stringify it" silent bypass.
     4. ``str`` values MUST NOT contain any line-break-class char
-       (``\\n`` ``\\r`` ``\\x00`` ``\\x85`` ``\\u2028`` ``\\u2029``).
-       The full class is enforced via ``_reject_frontmatter_line_separators``
-       which is shared with ``block_type`` validation. Codex round-3
-       [P3] extension: the original ``\\n``/``\\r`` reject left
-       Python-``splitlines``-recognized separators (NEL / LSEP / PSEP)
-       and the YAML-stream-terminator NUL on the path to disk; the full
-       class rejection is the J-class injection defense for both
-       parser families.
+       (``\\n`` ``\\r`` ``\\x00`` ``\\x0b`` ``\\x0c`` ``\\x1c`` ``\\x1d``
+       ``\\x1e`` ``\\x85`` ``\\u2028`` ``\\u2029``). The full class is
+       enforced via ``_reject_frontmatter_line_separators`` which is
+       shared with ``block_type`` validation. Round-4 [P2] extension:
+       the round-3 set covered ``\\n``/``\\r``/``\\x00``/``\\x85``/
+       ``\\u2028``/``\\u2029`` but missed VT/FF/FS/GS/RS, which Python
+       ``str.splitlines()`` ALSO treats as line boundaries. The full
+       class rejection is the J-class injection defense for both the
+       splitlines-based and the YAML-parser-based reader families.
 
     Emission order: caller's dict insertion order (Python 3.7+ guarantees
     insertion-preserving iteration). String values are JSON-encoded so
