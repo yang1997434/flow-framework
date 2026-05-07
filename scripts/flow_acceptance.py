@@ -324,6 +324,57 @@ ALWAYS_ESCALATE_TYPES = frozenset({"e2e"})
 
 
 @dataclass
+class ResumePoint:
+    """T9 resume state from tail-scanning ``acceptance-progress.jsonl``.
+
+    Returned by :meth:`AcceptanceRunner.find_resume_point`. The
+    orchestrator uses it to decide where to restart the criteria loop
+    after an auto-mode crash (per design §6 Q6.1 + Y8).
+
+    Attributes:
+      ``next_idx``: criterion_idx to start fresh execution at —
+        ``max(criterion_idx with completed/timeout) + 1`` within the
+        attempt, or ``0`` if no criteria completed.
+      ``in_flight_criterion_idx``: idx of a criterion whose ``started``
+        event has no matching ``completed`` / ``timeout`` (the
+        orchestrator crashed mid-run). ``None`` means every started
+        was paired — no in-flight recovery needed.
+      ``in_flight_event``: the raw started-event dict (so callers can
+        inspect timing / hash / log paths for the blocked.md body).
+        ``None`` iff ``in_flight_criterion_idx`` is ``None``.
+    """
+    next_idx: int
+    in_flight_criterion_idx: Optional[int]
+    in_flight_event: Optional[dict]
+
+
+@dataclass
+class IdempotencyVerdict:
+    """T9 R8 hardened decision: auto-rerun vs block on an in-flight
+    interrupted criterion.
+
+    Returned by :meth:`AcceptanceRunner.resolve_in_flight_idempotency`.
+    Orchestrator dispatch (T19 wires this into the resume path):
+
+      - ``decision == "auto_rerun"``: the criterion is safe to re-run
+        (read-only method / GET http / cmd in allowlist / cmd with a
+        per-criterion ``idempotent.{value=True, rationale=...}``
+        override). Orchestrator re-runs ``in_flight_criterion_idx``,
+        then proceeds.
+      - ``decision == "block_in_flight"``: re-running may double a
+        side effect. Orchestrator writes ``blocked.md`` per §1 row 5
+        with ``reason`` in the body and surfaces the in-flight
+        criterion to the operator.
+
+    ``reason`` is a single human-readable line — render it as-is into
+    the blocked.md body. Format kept stable so downstream tooling
+    (issue templates, dashboards) can pattern-match.
+    """
+    decision: str   # "auto_rerun" | "block_in_flight"
+    reason: str
+
+
+@dataclass
 class RunResult:
     """Per-criterion executor return shape.
 
@@ -1412,6 +1463,346 @@ class AcceptanceRunner:
             command_hash=result.command_hash,
         ))
         return result
+
+    # ------------------------------------------------------------------
+    # T9 — In-flight resume + R8 idempotency override resolution
+    # ------------------------------------------------------------------
+
+    def find_resume_point(
+        self,
+        task_dir: Path,
+        *,
+        attempt_id: str,
+    ) -> "ResumePoint":
+        """Tail-scan ``acceptance-progress.jsonl`` for the given attempt_id.
+
+        Returns where to resume + whether a criterion was in-flight when
+        the orchestrator crashed. Per design §6 Q6.1:
+
+          - ``next_idx`` = ``max(criterion_idx with completed/timeout) + 1``
+            within ``attempt_id``; ``0`` if no completed criteria exist.
+          - ``in_flight_criterion_idx`` = the criterion_idx of a ``started``
+            event with no matching ``completed`` / ``timeout`` (within
+            ``attempt_id``). ``None`` if every started has been paired.
+          - ``in_flight_event`` = the raw started event dict (so
+            ``resolve_in_flight_idempotency`` can read fields off it for
+            the blocked.md reason).
+
+        Anti-patterns avoided:
+          - **A (.get falsy)**: ``rec.get("attempt_id") != attempt_id``
+            with ``attempt_id="0"`` would silently match every attempt.
+            We filter via membership (``"attempt_id" in rec``) FIRST,
+            then equality, so a missing field doesn't accidentally
+            match the empty-string sentinel.
+          - **D5 (catch-all)**: a malformed JSON line MUST NOT crash
+            the runner — we ``json.JSONDecodeError`` → skip line, log
+            via ``error_msg`` accumulator. The orchestrator's outer
+            ``run_one`` catch-all in T7 already wraps any escaped
+            exception, but we never want this method to be the source
+            of one.
+          - **Stale started**: if a started event sits at
+            ``criterion_idx <= max(completed)``, it's a leftover from a
+            prior retry within the same attempt; treat as no in-flight.
+        """
+        path = task_dir / "acceptance-progress.jsonl"
+        if not path.is_file():
+            return ResumePoint(
+                next_idx=0,
+                in_flight_criterion_idx=None,
+                in_flight_event=None,
+            )
+
+        # Per-criterion last-seen event within this attempt. We keep the
+        # latest event per criterion_idx so a (started → completed) pair
+        # collapses to the completed entry; a dangling started (no
+        # following completed) remains as the latest entry.
+        last_event_per_idx: dict[int, dict] = {}
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            # If the progress file can't even be read, conservative
+            # default: resume from the top with no in-flight. The
+            # orchestrator's outer catch-all logs separately.
+            return ResumePoint(
+                next_idx=0,
+                in_flight_criterion_idx=None,
+                in_flight_event=None,
+            )
+
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                # D5 catch-all: malformed event. Skip and continue;
+                # never crash the resume scan.
+                continue
+            if not isinstance(rec, dict):
+                # Rare: top-level JSON is a number/list. Skip.
+                continue
+            # A-aware: explicit membership test BEFORE equality so a
+            # missing attempt_id field doesn't sneak through with a
+            # falsy match.
+            if "attempt_id" not in rec or rec["attempt_id"] != attempt_id:
+                continue
+            idx = rec.get("criterion_idx")
+            # bool is an int subclass — exclude explicitly so a stray
+            # ``True`` doesn't masquerade as criterion_idx=1.
+            if isinstance(idx, bool) or not isinstance(idx, int):
+                continue
+            # Newer event for the same idx supersedes older.
+            last_event_per_idx[idx] = rec
+
+        in_flight_idx: Optional[int] = None
+        in_flight_event: Optional[dict] = None
+        completed_indices: set[int] = set()
+        for idx, ev in last_event_per_idx.items():
+            event_kind = ev.get("event")
+            if event_kind == "started":
+                # If multiple criteria are dangling-started (would only
+                # happen with concurrent runs, which T9 doesn't claim
+                # to handle), keep the highest idx — that's the most
+                # recent-by-position in the criteria list.
+                if in_flight_idx is None or idx > in_flight_idx:
+                    in_flight_idx = idx
+                    in_flight_event = ev
+            elif event_kind in ("completed", "timeout"):
+                completed_indices.add(idx)
+            # Any other event_kind (or missing) → ignore. The schema
+            # validator already rejects unknown event kinds at write
+            # time, but we stay defensive for direct-fixture lines.
+
+        next_idx = (max(completed_indices) + 1) if completed_indices else 0
+        # Stale started: a started event at idx <= a completed idx
+        # came from a prior retry within the same attempt. Discard.
+        if in_flight_idx is not None and in_flight_idx < next_idx:
+            in_flight_idx = None
+            in_flight_event = None
+
+        return ResumePoint(
+            next_idx=next_idx,
+            in_flight_criterion_idx=in_flight_idx,
+            in_flight_event=in_flight_event,
+        )
+
+    def resolve_in_flight_idempotency(
+        self,
+        criterion: AcceptanceCriterion,
+        *,
+        contract,  # forward-ref (Contract); typed via duck-shape
+        in_flight_event: dict,
+    ) -> "IdempotencyVerdict":
+        """R8 hardened in-flight idempotency decision (design line 268-275).
+
+        Returns ``IdempotencyVerdict(decision, reason)`` where
+        ``decision ∈ {"auto_rerun", "block_in_flight"}`` and ``reason``
+        is human-readable for the §1 row 5 ``blocked.md`` body.
+
+        Decision table (design line 268-275):
+          - ``type == "e2e"`` → **always block**. PRD §1.3 + design
+            line 275 explicit: NO override accepted. Type wins over
+            method (an e2e+file_exists criterion still blocks).
+          - ``method`` ∈ {file_exists, json_query} → auto_rerun
+            (read-only — no side effects to undo on rerun).
+          - ``method == "http"`` → auto_rerun (GET is RFC 7231
+            idempotent; v0.8.1 is GET-only — non-GET awaits the
+            v0.8.2 ``http_method`` field).
+          - ``method == "cmd"`` → block UNLESS unblocked via either:
+              (a) per-criterion ``idempotent`` override with
+                  ``value=True`` AND non-empty ``rationale`` AND the
+                  override is a dict (T1 schema enforces
+                  ``timeout_sec`` + ``side_effect_class`` at parse
+                  time; we still verify the decision-critical fields
+                  here as defense-in-depth);
+              (b) command starts with an entry in
+                  ``contract.idempotent_cmd_allowlist`` (binary OR
+                  multi-word prefix like ``flow doctor``).
+
+        Anti-patterns avoided:
+          - **B (cross-ref)**: e2e bypass FIRST so an e2e criterion
+            authored as ``method=cmd`` with rationale=true still blocks
+            (matches design line 275 verbatim — type wins).
+          - **A (.get falsy)**: rationale check uses
+            ``isinstance(rationale, str) and rationale.strip()`` rather
+            than ``idem.get("rationale")`` truthiness — both ``None``
+            and ``""`` are correctly treated as "missing".
+          - **C2 (frozenset 撒谎)**: there is no `*_TYPES` set here;
+            every method/type cell is exercised by a corresponding
+            unit test in tests/unit/test_idempotent_in_flight_resume.py.
+        """
+        # 1. e2e bypass — design line 275: NO override accepted.
+        if criterion.type == "e2e":
+            return IdempotencyVerdict(
+                decision="block_in_flight",
+                reason=(
+                    "type=e2e is always non-idempotent (PRD §1.3, "
+                    "design line 275); no override accepted on "
+                    "in-flight interrupt"
+                ),
+            )
+
+        # 2. Read-only methods — always safe to rerun.
+        if criterion.method in ("file_exists", "json_query"):
+            return IdempotencyVerdict(
+                decision="auto_rerun",
+                reason=(
+                    f"method={criterion.method} is read-only; "
+                    f"safe to rerun"
+                ),
+            )
+
+        # 3. http — GET-only in v0.8.1 (design line 274). Non-GET is a
+        # v0.8.2 follow-up via the ``http_method`` field; all current
+        # http criteria are RFC 7231 idempotent.
+        if criterion.method == "http":
+            return IdempotencyVerdict(
+                decision="auto_rerun",
+                reason=(
+                    "http GET is idempotent per RFC 7231 (v0.8.1 "
+                    "ships GET-only); non-GET awaits v0.8.2 "
+                    "http_method field"
+                ),
+            )
+
+        # 4. cmd — default block; unblock via override OR allowlist.
+        if criterion.method == "cmd":
+            # 4a. Per-criterion override (R8 path b). The dataclass
+            # field is typed Optional[dict]; T1's parser validates
+            # ``timeout_sec`` + ``side_effect_class`` at parse time.
+            # We check the decision-critical pair (value + rationale)
+            # here so direct-construction tests (no parser) can't
+            # silently slip a half-formed override through.
+            idem = criterion.idempotent
+            if isinstance(idem, dict):
+                value = idem.get("value")
+                rationale = idem.get("rationale")
+                # value MUST be exactly the bool ``True`` — not a
+                # truthy non-bool like 1 / "true" / [1]. The schema
+                # enforces this; the explicit ``is True`` check
+                # blocks A-blindspot truthiness leaks for
+                # direct-construction.
+                value_ok = value is True
+                rationale_ok = (
+                    isinstance(rationale, str) and bool(rationale.strip())
+                )
+                if value_ok and rationale_ok:
+                    return IdempotencyVerdict(
+                        decision="auto_rerun",
+                        reason=(
+                            f"per-criterion override: rationale="
+                            f"{rationale.strip()!r} "
+                            f"(side_effect_class="
+                            f"{idem.get('side_effect_class')!r})"
+                        ),
+                    )
+
+            # 4b. Allowlist (R8 path a). Each entry can be a single
+            # binary (``pytest``) OR a multi-word prefix (``flow
+            # doctor``). We match by prefix-followed-by-space OR
+            # exact-equality (the criterion is just the binary).
+            command = (criterion.command or "").strip()
+            allowlist = (
+                getattr(contract, "idempotent_cmd_allowlist", None) or ()
+            )
+            for allowed in allowlist:
+                if not isinstance(allowed, str) or not allowed.strip():
+                    continue
+                normalized = allowed.strip()
+                if (
+                    command == normalized
+                    or command.startswith(normalized + " ")
+                ):
+                    return IdempotencyVerdict(
+                        decision="auto_rerun",
+                        reason=(
+                            f"command matches allowlist entry "
+                            f"{normalized!r}"
+                        ),
+                    )
+
+            # No override, no allowlist match → R8 default block.
+            binary = command.split(" ", 1)[0] if command else ""
+            return IdempotencyVerdict(
+                decision="block_in_flight",
+                reason=(
+                    f"cmd is non-idempotent by default (R8 hardened); "
+                    f"no allowlist match for {binary!r} and no "
+                    f"per-criterion idempotent override"
+                ),
+            )
+
+        # 5. Unknown method (T1's parser already rejects these;
+        # defense-in-depth so an unknown method block-fails-closed
+        # rather than slipping into an auto-rerun).
+        return IdempotencyVerdict(
+            decision="block_in_flight",
+            reason=(
+                f"unknown method {criterion.method!r}; conservative "
+                f"block per fail-closed policy"
+            ),
+        )
+
+    def resume_attempt(
+        self,
+        task_dir: Path,
+        *,
+        attempt_id: str,
+        criteria: list,
+        contract,
+    ) -> Tuple["IdempotencyVerdict", "ResumePoint"]:
+        """Convenience wrapper combining ``find_resume_point`` +
+        ``resolve_in_flight_idempotency``.
+
+        Orchestrator call site (design §6 Y8): after T5's
+        ``detect_auto_prepare_state`` reports a startable lock state
+        AND the contract has ``acceptance_criteria``, the orchestrator
+        calls this to learn:
+
+          - The IdempotencyVerdict — auto_rerun (caller proceeds from
+            ``ResumePoint.next_idx`` OR re-runs
+            ``in_flight_criterion_idx``) OR block_in_flight (caller
+            writes blocked.md per §6 R8 with ``verdict.reason`` in
+            the body).
+          - The ResumePoint — where to start in the criteria list.
+
+        No in-flight criterion → ``IdempotencyVerdict("auto_rerun",
+        "no in-flight criterion")``. The caller resumes at
+        ``rp.next_idx`` without re-running anything.
+        """
+        rp = self.find_resume_point(task_dir, attempt_id=attempt_id)
+        if rp.in_flight_criterion_idx is None:
+            return (
+                IdempotencyVerdict(
+                    decision="auto_rerun",
+                    reason="no in-flight criterion to classify",
+                ),
+                rp,
+            )
+        # Defensive index — if the criteria list is shorter than the
+        # in-flight idx (truncated contract / replay across schema
+        # changes), block rather than crash.
+        if rp.in_flight_criterion_idx >= len(criteria):
+            return (
+                IdempotencyVerdict(
+                    decision="block_in_flight",
+                    reason=(
+                        f"in-flight criterion_idx="
+                        f"{rp.in_flight_criterion_idx} exceeds "
+                        f"contract length {len(criteria)}; contract "
+                        f"changed since attempt started"
+                    ),
+                ),
+                rp,
+            )
+        criterion = criteria[rp.in_flight_criterion_idx]
+        verdict = self.resolve_in_flight_idempotency(
+            criterion,
+            contract=contract,
+            in_flight_event=rp.in_flight_event or {},
+        )
+        return (verdict, rp)
 
     # ------------------------------------------------------------------
     # Identity helpers
