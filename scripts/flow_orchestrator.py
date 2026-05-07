@@ -37,8 +37,14 @@ from flow_contract import (  # type: ignore
 )
 from progress_meta import read_progress_meta, ProgressMeta  # type: ignore
 from flow_state_writer import (  # type: ignore
-    EVENT_AUTO_ENGAGED, append_autonomy_event, _new_event_id,
-    write_blocked,
+    EVENT_AUTO_ENGAGED,
+    EVENT_TASK_READY_TO_MERGE,
+    EVENT_MERGE_STARTED,
+    EVENT_MERGE_APPLIED,
+    EVENT_TASK_COMPLETED,
+    EVENT_POST_MERGE_VERIFY_FAILED,
+    append_autonomy_event, _new_event_id,
+    write_blocked, write_checkpoint,
     append_review_issue, ReviewIssueRecord,
 )
 
@@ -2031,6 +2037,554 @@ class GateRunner:
             )
 
         return Phase2Verdict(status="pass")
+
+
+# ----------------------------------------------------------------------
+# T14 — R3 9-step transactional sequence steps 1-7 (Gate 7 local merge).
+#
+# Per design §6 line 242 transition table + Y5 gap-by-gap crash semantics.
+# T14 owns steps 1-7 + mid-merge crash detection. T15 owns steps 8 + 9a/9b
+# (gate 8 + completion paths). T19 (Group G) owns dispatch-side recovery
+# routing — `detect_mid_merge_crash` is the contract it consumes.
+#
+# Subprocess discipline (T13 K-class lesson): the 3 git subprocess calls
+# below run in list-form (no shell=True) so E-class injection is not a
+# concern. They do still need timeout protection — `git merge` can hang
+# on lock contention, GPG prompts, or pre-commit hooks; `git rev-parse`
+# can hang on a corrupt repo. A small list-form sibling helper
+# `_run_argv_with_pgkill` mirrors `_run_shell_with_pgkill`'s timeout +
+# process-group-kill semantics for argv invocations. Reuse over reinvent
+# (I-class).
+# ----------------------------------------------------------------------
+
+
+# Module-level timeouts — kept as named constants so reviewers can grep
+# them. Both are conservative defaults; tests inject smaller values via
+# the `_GIT_*_TIMEOUT_SEC` patches if needed.
+_GIT_HEAD_QUERY_TIMEOUT_SEC = 30
+_GIT_MERGE_TIMEOUT_SEC = 60
+
+
+def _run_argv_with_pgkill(
+    argv: list[str],
+    *,
+    cwd: Path,
+    timeout_sec: int,
+) -> _ShellRunResult:
+    """List-form sibling of :func:`_run_shell_with_pgkill`. Same
+    timeout + process-group-kill semantics; argv goes through ``Popen``
+    without ``shell=True`` so shell metachars are NOT a concern (E-class
+    safe by construction).
+
+    The pgkill mechanics still matter: ``git`` subprocesses can spawn
+    children (hooks, GPG agent prompts, alternate-object readers); on
+    timeout we must SIGTERM/SIGKILL the entire group, not just the
+    direct child, otherwise children orphan to PID 1 (T7/T12/T13
+    pgkill recurrence).
+    """
+    try:
+        proc = subprocess.Popen(
+            argv,
+            shell=False,
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except OSError as e:
+        return _ShellRunResult(
+            returncode=None, stdout="", stderr="",
+            spawn_error=f"{type(e).__name__}: {e}",
+        )
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_sec)
+        return _ShellRunResult(
+            returncode=proc.returncode,
+            stdout=stdout or "",
+            stderr=stderr or "",
+        )
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        deadline = time.monotonic() + _PROCESS_GROUP_KILL_GRACE_SEC
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(proc.pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = proc.communicate(
+                timeout=_PROCESS_GROUP_KILL_GRACE_SEC,
+            )
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+        return _ShellRunResult(
+            returncode=None,
+            stdout=stdout or "",
+            stderr=stderr or "",
+            timed_out=True,
+        )
+
+
+def _now_iso() -> str:
+    """ISO 8601 UTC timestamp with `Z` suffix. Stable across the module."""
+    return datetime.datetime.now(datetime.UTC).strftime(
+        "%Y-%m-%dT%H:%M:%SZ",
+    )
+
+
+@dataclass
+class MergeResult:
+    """Return type for :meth:`MergeRunner.merge_task`.
+
+    `status`:
+      - "merged": git merge applied + `merge_applied` event emitted.
+      - "blocked": merge refused or failed; `block_reason` populated.
+        Caller writes blocked.md per §1 routing (T15 + T19 own blocked.md
+        emission for mid-merge gaps; T14 only returns the verdict).
+    """
+    status: str
+    target_commit_pre_merge: Optional[str] = None
+    target_commit_post_merge: Optional[str] = None
+    block_reason: Optional[str] = None
+
+
+class MergeRunner:
+    """R3 9-step transactional sequence — steps 1-7.
+
+    Step 1 (gates 1-6 pass) is the caller's contract: ``merge_task`` MUST
+    only be invoked after :meth:`GateRunner.run_phase2` returned
+    ``status == "pass"``. T14 does NOT re-verify; that is the wave-runner /
+    dispatcher's responsibility.
+
+    Steps 2-7 are this method's atomic-write sequence:
+      2. ``decisions.jsonl`` append ``task_ready_to_merge``
+      3. ``checkpoints/<ts>.md`` write (``phase=pre_merge``)
+      4. ``progress.md`` task status → ``merging``
+      5. ``decisions.jsonl`` append ``merge_started``
+      6. ``git merge`` into ``integration_target`` (R9 HEAD safety check
+         BEFORE the merge call: refuse if repo HEAD is not on
+         ``integration_target``).
+      7. ``decisions.jsonl`` append ``merge_applied``
+    """
+
+    def __init__(
+        self, *,
+        ctx: WorktreeContext, contract: Contract, task_dir: Path,
+        run_id: str, task_id: str,
+    ):
+        self.ctx = ctx
+        self.contract = contract
+        self.task_dir = task_dir
+        self.run_id = run_id
+        self.task_id = task_id
+
+    # ------------------------------------------------------------------
+    # Public surface.
+    # ------------------------------------------------------------------
+
+    def merge_task(
+        self, *, facts: TaskFacts, merge_strategy: str,
+    ) -> MergeResult:
+        """Execute steps 2-7 of the R3 transactional sequence."""
+        # Step 2 — task_ready_to_merge.
+        append_autonomy_event(
+            self.task_dir, EVENT_TASK_READY_TO_MERGE,
+            {
+                "event_id": _new_event_id(),
+                "ts": _now_iso(),
+                "slug": self.ctx.slug,
+                "run_id": self.run_id,
+                "task_id": self.task_id,
+                "worktree_id": self.ctx.worktree_id,
+                "worktree_path": str(self.ctx.worktree_path),
+                "original_base_commit": self.ctx.original_base_commit,
+                "current_base_commit": self.ctx.current_base_commit,
+                "lifecycle_state": "merging",
+                "diff_hash": facts.diff_hash,
+                "target_commit_pre_merge": facts.target_commit_pre_merge,
+            },
+        )
+        # Step 3 — pre_merge checkpoint.
+        ts = _now_iso()
+        write_checkpoint(
+            self.task_dir, ts=ts,
+            body=(
+                f"phase: pre_merge\n"
+                f"worktree_id: {self.ctx.worktree_id}\n"
+                f"worktree_path: {self.ctx.worktree_path}\n"
+                f"original_base_commit: {self.ctx.original_base_commit}\n"
+                f"current_base_commit: {self.ctx.current_base_commit}\n"
+                f"lifecycle_state: merging\n"
+                f"diff_hash: {facts.diff_hash}\n"
+                f"target_commit_pre_merge: {facts.target_commit_pre_merge}\n"
+            ),
+            git_hash=facts.target_commit_pre_merge,
+        )
+        # Step 4 — progress.md status → merging. Naïve writer; T20 owns
+        # the lint + schema enforcement.
+        self._update_task_status("merging")
+        # Steps 5-7.
+        return self._continue_merge(
+            facts=facts, merge_strategy=merge_strategy,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal — steps 5-7 + helpers.
+    # ------------------------------------------------------------------
+
+    def _continue_merge(
+        self, *, facts: TaskFacts, merge_strategy: str,
+    ) -> MergeResult:
+        """Steps 5-7. Split out so step 4's status update is the gap-
+        boundary commit point — a crash between step 4 and step 5 is
+        observable by readers as ``task_ready_to_merge`` without a
+        following ``merge_started`` (Y5)."""
+        # Step 5 — merge_started.
+        append_autonomy_event(
+            self.task_dir, EVENT_MERGE_STARTED,
+            {
+                "event_id": _new_event_id(),
+                "ts": _now_iso(),
+                "slug": self.ctx.slug,
+                "run_id": self.run_id,
+                "task_id": self.task_id,
+                "worktree_id": self.ctx.worktree_id,
+                "worktree_path": str(self.ctx.worktree_path),
+                "integration_target": self.ctx.integration_target,
+                "target_commit_pre_merge": facts.target_commit_pre_merge,
+            },
+        )
+
+        # Step 6 — git merge. Guarded by R9 HEAD safety check.
+        repo_root = self._derive_repo_root()
+
+        # R9 HEAD assertion: refuse to merge unless repo_root HEAD is
+        # already on integration_target. `git merge` would otherwise
+        # silently merge into whatever the user last checked out — a
+        # destructive footgun (their feature branch absorbs our task
+        # branch). NO auto-checkout: that mutates user state without
+        # consent. Block reason names the wrong HEAD + expected target
+        # so the user can recover manually.
+        head_query = _run_argv_with_pgkill(
+            ["git", "-C", str(repo_root),
+             "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=repo_root,
+            timeout_sec=_GIT_HEAD_QUERY_TIMEOUT_SEC,
+        )
+        if head_query.timed_out:
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason="git rev-parse --abbrev-ref HEAD timed out",
+            )
+        if head_query.spawn_error is not None:
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason=(
+                    f"git rev-parse spawn failed: {head_query.spawn_error}"
+                ),
+            )
+        if head_query.returncode != 0:
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason=(
+                    f"git rev-parse --abbrev-ref HEAD returned "
+                    f"rc={head_query.returncode}: "
+                    f"{head_query.stderr[-500:]}"
+                ),
+            )
+        head_ref = head_query.stdout.strip()
+        if head_ref != self.ctx.integration_target:
+            # R9 safety: refuse to merge into the wrong branch.
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason=(
+                    f"refusing to merge into HEAD={head_ref!r}: "
+                    f"expected integration_target="
+                    f"{self.ctx.integration_target!r}; "
+                    f"checkout integration_target manually and resume"
+                ),
+            )
+
+        merge_run = _run_argv_with_pgkill(
+            ["git", "-C", str(repo_root),
+             "merge", merge_strategy, self.ctx.branch],
+            cwd=repo_root,
+            timeout_sec=_GIT_MERGE_TIMEOUT_SEC,
+        )
+        if merge_run.timed_out:
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason="git merge timed out",
+            )
+        if merge_run.spawn_error is not None:
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason=(
+                    f"git merge spawn failed: {merge_run.spawn_error}"
+                ),
+            )
+        if merge_run.returncode != 0:
+            # Conflict / non-ff push / hook reject / etc. — surface to
+            # caller as blocked. T19 routes to the R3 mid-merge crash
+            # reconcile menu via blocked.md.
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason=(
+                    f"git merge failed: rc={merge_run.returncode}: "
+                    f"{merge_run.stderr[-500:]}"
+                ),
+            )
+
+        post_query = _run_argv_with_pgkill(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            cwd=repo_root,
+            timeout_sec=_GIT_HEAD_QUERY_TIMEOUT_SEC,
+        )
+        if (
+            post_query.timed_out
+            or post_query.spawn_error is not None
+            or post_query.returncode != 0
+        ):
+            # Forensic edge case: merge applied, but we can't read the
+            # new HEAD. Surface the gap so T19 picks it up via
+            # detect_mid_merge_crash (we never wrote merge_applied).
+            reason = (
+                "post-merge git rev-parse HEAD timed out"
+                if post_query.timed_out
+                else "post-merge git rev-parse spawn failed"
+                if post_query.spawn_error is not None
+                else f"post-merge git rev-parse rc={post_query.returncode}: "
+                     f"{post_query.stderr[-500:]}"
+            )
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason=reason,
+            )
+        target_commit_post_merge = post_query.stdout.strip()
+        if not target_commit_post_merge or len(target_commit_post_merge) < 7:
+            # F-class fail-closed (mirrors create_task_worktree precedent).
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason=(
+                    f"post-merge git rev-parse returned unusable output: "
+                    f"{target_commit_post_merge!r}"
+                ),
+            )
+
+        # Step 7 — merge_applied.
+        append_autonomy_event(
+            self.task_dir, EVENT_MERGE_APPLIED,
+            {
+                "event_id": _new_event_id(),
+                "ts": _now_iso(),
+                "slug": self.ctx.slug,
+                "run_id": self.run_id,
+                "task_id": self.task_id,
+                "worktree_id": self.ctx.worktree_id,
+                "target_commit_post_merge": target_commit_post_merge,
+                "merge_strategy": merge_strategy,
+            },
+        )
+        return MergeResult(
+            status="merged",
+            target_commit_pre_merge=facts.target_commit_pre_merge,
+            target_commit_post_merge=target_commit_post_merge,
+        )
+
+    def _derive_repo_root(self) -> Path:
+        """Resolve the parent git repo from ``ctx.worktree_path``.
+
+        v0.8.1 worktrees live at
+        ``<repo_root>/.claude/worktrees/<worktree_id>/`` so the parent
+        repo is ``worktree_path.parents[2]`` (parents: 0=worktrees,
+        1=.claude, 2=repo_root).
+        """
+        return self.ctx.worktree_path.parents[2]
+
+    def _update_task_status(self, status: str) -> None:
+        """Naïve `progress.md` task-status writer.
+
+        Maintains a single line of the form
+        ``<!-- T14 task_status: <status> -->`` near the top of progress.md
+        (after the H1 title). T14 sets ``merging``; T15 sets
+        ``completed`` / ``failed`` / ``blocked_post_merge`` etc.
+
+        T20 owns lint + schema enforcement (status enum from §8.3.1) and
+        will replace this writer with a structured table. Until then, a
+        clearly marked HTML comment is the smallest disk side-effect that
+        downstream tools can grep for without conflicting with the
+        existing free-form markdown body.
+
+        If progress.md doesn't exist (e.g., test fixture), this is a
+        no-op — the merge sequence is still observable via decisions.jsonl
+        + checkpoints/, which are the authoritative state per §6.
+        """
+        progress_path = self.task_dir / "progress.md"
+        marker_prefix = f"<!-- task_status[{self.task_id}]: "
+        new_line = f"{marker_prefix}{status} -->"
+        if not progress_path.is_file():
+            # Fresh fixture — append a one-line stub. Safe-create.
+            try:
+                progress_path.parent.mkdir(parents=True, exist_ok=True)
+                progress_path.write_text(new_line + "\n", encoding="utf-8")
+            except OSError:
+                # Don't crash the merge sequence on a progress.md write
+                # failure; decisions.jsonl + checkpoints are the
+                # authoritative state. Surface to stderr for visibility.
+                print(
+                    f"WARN: failed to write task_status marker to "
+                    f"{progress_path}",
+                    file=sys.stderr,
+                )
+            return
+        try:
+            text = progress_path.read_text(encoding="utf-8")
+        except OSError:
+            print(
+                f"WARN: failed to read {progress_path} for task_status "
+                f"update", file=sys.stderr,
+            )
+            return
+        lines = text.splitlines(keepends=False)
+        replaced = False
+        for i, line in enumerate(lines):
+            if line.startswith(marker_prefix):
+                lines[i] = new_line
+                replaced = True
+                break
+        if not replaced:
+            # Insert after the first non-empty line (typically `# title`).
+            insert_idx = 0
+            for i, line in enumerate(lines):
+                if line.strip():
+                    insert_idx = i + 1
+                    break
+            lines.insert(insert_idx, new_line)
+        new_text = "\n".join(lines)
+        if not new_text.endswith("\n"):
+            new_text += "\n"
+        try:
+            progress_path.write_text(new_text, encoding="utf-8")
+        except OSError:
+            print(
+                f"WARN: failed to write task_status marker to "
+                f"{progress_path}", file=sys.stderr,
+            )
+
+
+def detect_mid_merge_crash(
+    task_dir: Path, *, run_id: str, task_id: str,
+) -> dict:
+    """R3 mid-merge gap detection (Y5 gap-by-gap state machine).
+
+    Tail-scans ``task_dir/decisions.jsonl`` for autonomy events scoped
+    to ``(run_id, task_id)`` and returns one of:
+
+      - ``{"state": "merge_completed"}`` — ``merge_applied`` paired with
+        either ``task_completed`` or ``post_merge_verify_failed``.
+      - ``{"state": "mid_merge_crash", "block_type":
+        "atomic_merge_crashed", "choices": [...]}`` — ``merge_started``
+        without a paired ``merge_applied``. R3 reconcile choices.
+      - ``{"state": "mid_gate8_crash", "block_type":
+        "post_merge_verify_in_progress_crash", "choices": [...]}`` —
+        ``merge_applied`` without a paired terminal verify event.
+      - ``{"state": "none"}`` — no merge events for this (run, task).
+
+    Pitfalls covered:
+      - **L** (presence vs type): every JSON access uses ``.get(...)``
+        with explicit None handling; equality comparisons use the
+        constants defined in :mod:`flow_state_writer` and never call
+        string methods on the loaded values.
+      - **M** (cross-task pollution): ``decisions.jsonl`` is shared at
+        the slug task dir level. Filter by ``(run_id, task_id)`` BEFORE
+        any kind inspection so events from sibling tasks / runs don't
+        skew the verdict.
+      - **D2** (typed except): ``json.JSONDecodeError`` is caught
+        explicitly so a single garbled line doesn't poison the whole
+        scan; ``OSError`` from a missing file is handled by the
+        ``is_file()`` guard.
+    """
+    path = task_dir / "decisions.jsonl"
+    events: list[dict] = []
+    if path.is_file():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return {"state": "none"}
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            # Scope filter (M-class): events for a different (run, task)
+            # MUST NOT influence our verdict, even if they live in the
+            # same shared file.
+            if (
+                rec.get("run_id") == run_id
+                and rec.get("task_id") == task_id
+            ):
+                events.append(rec)
+
+    # Build kind set with explicit None filtering — `e.get("event")` may
+    # return None if the row is a v0.8.0 DecisionRecord (which has no
+    # `event` field). L-class: never call string ops on the value, only
+    # equality compare with the EVENT_* constants.
+    kinds: set[str] = set()
+    for e in events:
+        ev = e.get("event")
+        if isinstance(ev, str):
+            kinds.add(ev)
+
+    if EVENT_MERGE_STARTED in kinds and EVENT_MERGE_APPLIED not in kinds:
+        return {
+            "state": "mid_merge_crash",
+            "block_type": "atomic_merge_crashed",
+            "choices": [
+                "replay_merge_from_diff_hash",
+                "abort_and_revert_partial",
+                "switch_to_interactive",
+            ],
+        }
+    if (
+        EVENT_MERGE_APPLIED in kinds
+        and EVENT_TASK_COMPLETED not in kinds
+        and EVENT_POST_MERGE_VERIFY_FAILED not in kinds
+    ):
+        return {
+            "state": "mid_gate8_crash",
+            "block_type": "post_merge_verify_in_progress_crash",
+            "choices": [
+                "rerun_post_merge_verify",
+                "abort_and_revert_partial",
+                "switch_to_interactive",
+            ],
+        }
+    if EVENT_MERGE_APPLIED in kinds:
+        return {"state": "merge_completed"}
+    return {"state": "none"}
 
 
 def main(argv: Optional[list[str]] = None) -> int:

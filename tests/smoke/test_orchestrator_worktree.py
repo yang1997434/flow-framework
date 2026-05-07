@@ -25,13 +25,20 @@ from flow_orchestrator import (  # type: ignore
     WorktreeContext, TaskFacts, TaskManifest,
     DispatchOutcome, ManifestVerdict,
     GateResult, BaselineRecord, Phase2Verdict, GateRunner,
+    MergeRunner, MergeResult, detect_mid_merge_crash,
     create_task_worktree, derive_task_facts, auto_dispatch_task,
     verify_manifest_against_facts,
     canonical_issue_id,
 )
 from flow_state_writer import (  # type: ignore
     EVENT_AUTO_ENGAGED,
+    EVENT_TASK_READY_TO_MERGE,
+    EVENT_MERGE_STARTED,
+    EVENT_MERGE_APPLIED,
+    EVENT_TASK_COMPLETED,
+    EVENT_POST_MERGE_VERIFY_FAILED,
     ReviewIssueRecord,
+    append_autonomy_event,
     append_review_issue,
 )
 from flow_contract import (  # type: ignore
@@ -1787,6 +1794,403 @@ class TestRunPhase2InsertsGate4(unittest.TestCase):
         self.assertTrue(v.gate_result.escalate)
         # Gates 5 + 6 must NOT have executed.
         self.assertEqual(calls, ["1", "3", "4"])
+
+
+# ----------------------------------------------------------------------
+# T14 — MergeRunner R3 9-step sequence (steps 1-7) + R9 HEAD safety +
+# detect_mid_merge_crash state machine.
+# ----------------------------------------------------------------------
+
+
+def _make_merge_runner_ctx(
+    tmp: Path,
+) -> tuple[WorktreeContext, Contract, Path]:
+    """Fixture for MergeRunner tests. Builds a real repo + worktree
+    (so `git merge` against `repo_root = worktree_path.parents[2]`
+    actually exercises subprocess + filesystem).
+
+    Differs from `_make_gate_runner_ctx` only in the slug — keeps test
+    fixtures isolated when both gate + merge tests run in the same
+    process.
+    """
+    _init_repo(tmp)
+    ctx = create_task_worktree(
+        repo_root=tmp, slug="t14demo", task_idx=0,
+        integration_target="master",
+    )
+    contract = Contract(
+        contract_schema_version=CONTRACT_SCHEMA_VERSION,
+        autonomy_mode="auto_default",
+        created_at="2026-05-07T00:00:00Z",
+        scope_allowed=["src/**"],
+        scope_forbidden=["secrets/**"],
+    )
+    task_dir = tmp / ".flow" / "tasks" / "t14demo"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    return ctx, contract, task_dir
+
+
+def _commit_in_worktree(ctx: WorktreeContext, filename: str, content: str) -> str:
+    """Make + commit a file inside the worktree. Returns the new HEAD sha."""
+    f = ctx.worktree_path / filename
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(content)
+    subprocess.run(
+        ["git", "-C", str(ctx.worktree_path), "add", filename],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(ctx.worktree_path), "commit", "-q",
+         "-m", f"add {filename}"],
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "-C", str(ctx.worktree_path), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _decisions_jsonl_events(task_dir: Path) -> list[str]:
+    """Return event-name list (in append order) from decisions.jsonl —
+    skip non-autonomy rows (v0.8.0 records that have no `event` key)."""
+    path = task_dir / "decisions.jsonl"
+    if not path.is_file():
+        return []
+    out: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ev = rec.get("event") if isinstance(rec, dict) else None
+        if isinstance(ev, str):
+            out.append(ev)
+    return out
+
+
+class TestMergeTaskHappyPath(unittest.TestCase):
+    """R3 transactional sequence steps 2-7 happy path. Pins:
+      - 4 autonomy events emitted in the right relative order.
+      - Pre-merge checkpoint written.
+      - Repo HEAD advances to the worktree branch's commit.
+      - MergeResult fields populated (target_commit_pre_merge +
+        target_commit_post_merge).
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="t14-merge-happy-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ctx, self.contract, self.task_dir = _make_merge_runner_ctx(
+            self.tmp,
+        )
+        # Make + commit a change in the worktree branch.
+        self.head_sha = _commit_in_worktree(
+            self.ctx, "src/foo.py", "print('hi')\n",
+        )
+        self.facts = TaskFacts(
+            changed_files=["src/foo.py"], newly_added_files=["src/foo.py"],
+            diff_hash="x" * 64, target_commit_pre_merge=self.head_sha,
+        )
+
+    def test_merge_task_emits_4_events_in_order(self) -> None:
+        """task_ready_to_merge → merge_started → merge_applied appear
+        in this relative order in decisions.jsonl. (4 events =
+        auto_engaged optional + the 3 above; this test asserts the 3
+        merge-side events explicitly per Step 14.1 plan.)"""
+        merger = MergeRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r", task_id="T0",
+        )
+        result = merger.merge_task(
+            facts=self.facts, merge_strategy="--ff-only",
+        )
+        self.assertEqual(result.status, "merged")
+        self.assertEqual(
+            result.target_commit_pre_merge, self.head_sha,
+        )
+        self.assertIsNotNone(result.target_commit_post_merge)
+        self.assertEqual(len(result.target_commit_post_merge), 40)
+        events = _decisions_jsonl_events(self.task_dir)
+        # Among any other events, these 3 must appear in this order.
+        for needle, prior in [
+            ("task_ready_to_merge", None),
+            ("merge_started", "task_ready_to_merge"),
+            ("merge_applied", "merge_started"),
+        ]:
+            self.assertIn(needle, events)
+            if prior:
+                self.assertLess(
+                    events.index(prior), events.index(needle),
+                )
+
+    def test_pre_merge_checkpoint_written(self) -> None:
+        """Step 3 — checkpoints/<ts>.md exists with phase=pre_merge."""
+        merger = MergeRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r", task_id="T0",
+        )
+        result = merger.merge_task(
+            facts=self.facts, merge_strategy="--ff-only",
+        )
+        self.assertEqual(result.status, "merged")
+        cp_dir = self.task_dir / "checkpoints"
+        self.assertTrue(cp_dir.is_dir())
+        cp_files = list(cp_dir.glob("*.md"))
+        self.assertEqual(len(cp_files), 1)
+        body = cp_files[0].read_text(encoding="utf-8")
+        self.assertIn("phase: pre_merge", body)
+        self.assertIn(f"diff_hash: {self.facts.diff_hash}", body)
+        self.assertIn(
+            f"target_commit_pre_merge: {self.facts.target_commit_pre_merge}",
+            body,
+        )
+
+    def test_progress_md_status_set_to_merging(self) -> None:
+        """Step 4 — progress.md task_status marker reflects ``merging``."""
+        merger = MergeRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r", task_id="T0",
+        )
+        merger.merge_task(facts=self.facts, merge_strategy="--ff-only")
+        progress_text = (self.task_dir / "progress.md").read_text(
+            encoding="utf-8",
+        )
+        self.assertIn("task_status[T0]: merging", progress_text)
+
+
+class TestMergeRefusesWrongHead(unittest.TestCase):
+    """R9 HEAD safety: refuse to merge when repo HEAD is not on
+    integration_target. Without this, ``git merge`` would silently merge
+    into the user's currently-checked-out feature branch — a destructive
+    footgun.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="t14-merge-r9-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ctx, self.contract, self.task_dir = _make_merge_runner_ctx(
+            self.tmp,
+        )
+        self.head_sha = _commit_in_worktree(
+            self.ctx, "src/foo.py", "print('hi')\n",
+        )
+        self.facts = TaskFacts(
+            changed_files=["src/foo.py"], newly_added_files=["src/foo.py"],
+            diff_hash="x" * 64, target_commit_pre_merge=self.head_sha,
+        )
+
+    def test_refuses_when_head_is_feature_branch(self) -> None:
+        """Repo HEAD on user-feature → block; no merge attempted."""
+        # Switch repo_root HEAD to a different branch.
+        subprocess.run(
+            ["git", "-C", str(self.tmp), "checkout", "-q",
+             "-b", "user-feature"],
+            check=True,
+        )
+        head_before = subprocess.run(
+            ["git", "-C", str(self.tmp), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        merger = MergeRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r", task_id="T0",
+        )
+        result = merger.merge_task(
+            facts=self.facts, merge_strategy="--ff-only",
+        )
+        self.assertEqual(result.status, "blocked")
+        self.assertIn(
+            "refusing to merge into HEAD='user-feature'",
+            result.block_reason,
+        )
+        self.assertIn(
+            "integration_target='master'", result.block_reason,
+        )
+        # Repo HEAD unchanged — no merge happened.
+        head_after = subprocess.run(
+            ["git", "-C", str(self.tmp), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(head_before, head_after)
+        # No merge_applied event written (pre-merge events ran first).
+        events = _decisions_jsonl_events(self.task_dir)
+        self.assertIn("task_ready_to_merge", events)
+        self.assertIn("merge_started", events)
+        self.assertNotIn("merge_applied", events)
+
+    def test_proceeds_when_head_matches_integration_target(self) -> None:
+        """Repo HEAD on master → merge applies cleanly."""
+        # _init_repo + create_task_worktree leaves repo HEAD on master.
+        merger = MergeRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r", task_id="T0",
+        )
+        result = merger.merge_task(
+            facts=self.facts, merge_strategy="--ff-only",
+        )
+        self.assertEqual(result.status, "merged")
+        # Repo HEAD now points at the worktree's commit (ff-merge).
+        head_after = subprocess.run(
+            ["git", "-C", str(self.tmp), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(head_after, self.head_sha)
+
+
+class TestMidMergeCrashDetection(unittest.TestCase):
+    """Y5 gap-by-gap state machine. Pinning T19 dispatch-side recovery
+    contract — a `merge_started` without paired `merge_applied` MUST
+    return state=mid_merge_crash with R3 reconcile choices. M-class:
+    cross-task event filter.
+    """
+
+    def setUp(self) -> None:
+        self.task_dir = Path(tempfile.mkdtemp(prefix="t14-detect-"))
+        self.addCleanup(shutil.rmtree, self.task_dir, ignore_errors=True)
+
+    def _started_fields(
+        self, run_id: str = "r", task_id: str = "T0",
+    ) -> dict:
+        return {
+            "event_id": "e1",
+            "ts": "2026-05-07T00:00:00Z",
+            "slug": "demo",
+            "run_id": run_id,
+            "task_id": task_id,
+            "worktree_id": "demo+t0+abc1234",
+            "worktree_path": "/tmp/wt",
+            "integration_target": "master",
+            "target_commit_pre_merge": "deadbeef" * 5,
+        }
+
+    def _applied_fields(
+        self, run_id: str = "r", task_id: str = "T0",
+        event_id: str = "e2",
+    ) -> dict:
+        return {
+            "event_id": event_id,
+            "ts": "2026-05-07T00:00:01Z",
+            "slug": "demo",
+            "run_id": run_id,
+            "task_id": task_id,
+            "worktree_id": "demo+t0+abc1234",
+            "target_commit_post_merge": "cafebabe" * 5,
+            "merge_strategy": "--ff-only",
+        }
+
+    def _completed_fields(
+        self, run_id: str = "r", task_id: str = "T0",
+        event_id: str = "e3",
+    ) -> dict:
+        return {
+            "event_id": event_id,
+            "ts": "2026-05-07T00:00:02Z",
+            "slug": "demo",
+            "run_id": run_id,
+            "task_id": task_id,
+            "worktree_id": "demo+t0+abc1234",
+            "final_diff_hash": "deadbeef" * 5,
+            "target_commit_post_merge": "cafebabe" * 5,
+        }
+
+    def test_no_events_returns_state_none(self) -> None:
+        state = detect_mid_merge_crash(
+            self.task_dir, run_id="r", task_id="T0",
+        )
+        self.assertEqual(state["state"], "none")
+
+    def test_merge_started_without_merge_applied_blocks(self) -> None:
+        """R3: gap between step 5 and step 7 → mid_merge_crash."""
+        append_autonomy_event(
+            self.task_dir, EVENT_MERGE_STARTED, self._started_fields(),
+        )
+        state = detect_mid_merge_crash(
+            self.task_dir, run_id="r", task_id="T0",
+        )
+        self.assertEqual(state["state"], "mid_merge_crash")
+        self.assertEqual(state["block_type"], "atomic_merge_crashed")
+        for needed in (
+            "replay_merge_from_diff_hash",
+            "abort_and_revert_partial",
+            "switch_to_interactive",
+        ):
+            self.assertIn(needed, state["choices"])
+
+    def test_merge_applied_without_terminal_blocks_mid_gate8(self) -> None:
+        """Y5: merge_applied without task_completed AND without
+        post_merge_verify_failed → mid_gate8_crash (T15 owns gate 8)."""
+        append_autonomy_event(
+            self.task_dir, EVENT_MERGE_STARTED, self._started_fields(),
+        )
+        append_autonomy_event(
+            self.task_dir, EVENT_MERGE_APPLIED, self._applied_fields(),
+        )
+        state = detect_mid_merge_crash(
+            self.task_dir, run_id="r", task_id="T0",
+        )
+        self.assertEqual(state["state"], "mid_gate8_crash")
+        self.assertEqual(
+            state["block_type"], "post_merge_verify_in_progress_crash",
+        )
+        for needed in (
+            "rerun_post_merge_verify",
+            "abort_and_revert_partial",
+            "switch_to_interactive",
+        ):
+            self.assertIn(needed, state["choices"])
+
+    def test_merge_completed_after_task_completed(self) -> None:
+        """Happy path: merge_applied + task_completed → merge_completed."""
+        append_autonomy_event(
+            self.task_dir, EVENT_MERGE_STARTED, self._started_fields(),
+        )
+        append_autonomy_event(
+            self.task_dir, EVENT_MERGE_APPLIED, self._applied_fields(),
+        )
+        append_autonomy_event(
+            self.task_dir, EVENT_TASK_COMPLETED, self._completed_fields(),
+        )
+        state = detect_mid_merge_crash(
+            self.task_dir, run_id="r", task_id="T0",
+        )
+        self.assertEqual(state["state"], "merge_completed")
+
+    def test_cross_task_pollution_filtered(self) -> None:
+        """M-class: an unrelated (run, task) writing merge_started in
+        the SAME shared decisions.jsonl MUST NOT skew our verdict."""
+        # Other task crashed mid-merge.
+        append_autonomy_event(
+            self.task_dir, EVENT_MERGE_STARTED,
+            self._started_fields(run_id="other", task_id="T1"),
+        )
+        # Our task has nothing → state=none, not mid_merge_crash.
+        state = detect_mid_merge_crash(
+            self.task_dir, run_id="r", task_id="T0",
+        )
+        self.assertEqual(state["state"], "none")
+        # Verify the other (run, task) is detected when filtered FOR it.
+        other_state = detect_mid_merge_crash(
+            self.task_dir, run_id="other", task_id="T1",
+        )
+        self.assertEqual(other_state["state"], "mid_merge_crash")
+
+    def test_garbled_jsonl_line_does_not_crash(self) -> None:
+        """D2 typed except: a single non-JSON line MUST NOT poison the
+        scan; valid lines around it should still be read."""
+        append_autonomy_event(
+            self.task_dir, EVENT_MERGE_STARTED, self._started_fields(),
+        )
+        # Inject garbage + a v0.8.0-style row (no `event` field).
+        path = self.task_dir / "decisions.jsonl"
+        with path.open("a", encoding="utf-8") as f:
+            f.write("not-valid-json\n")
+            f.write('{"id": "v080-row", "ts": "x"}\n')  # no `event` key
+        state = detect_mid_merge_crash(
+            self.task_dir, run_id="r", task_id="T0",
+        )
+        self.assertEqual(state["state"], "mid_merge_crash")
 
 
 if __name__ == "__main__":
