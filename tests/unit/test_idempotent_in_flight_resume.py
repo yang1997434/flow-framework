@@ -92,7 +92,7 @@ class _RunnerFixtureBase(unittest.TestCase):
             retry_idx=0,
             criterion_id=f"c{criterion_idx}",
             criterion_idx=criterion_idx,
-            criterion_hash=criterion_hash or ("0" * 64),
+            criterion_hash=("0" * 64) if criterion_hash is None else criterion_hash,
             type=type_,
             method=method,
             idempotent="false" if method == "cmd" else "true",
@@ -575,6 +575,33 @@ class TestResumeAttempt(_RunnerFixtureBase):
         )
         self.assertEqual(verdict.decision, "block_in_flight")
         self.assertIn("shell control characters", verdict.reason.lower())
+
+    def test_resume_blocks_when_recorded_hash_missing(self) -> None:
+        """Codex round-2 [P2]: fail-closed when the in-flight event has no
+        usable ``criterion_hash``. Falsy / non-string hash → block, NOT
+        fall-through to resolver (would re-introduce round-1 vulnerability
+        if a malformed JSONL line slipped past the schema check).
+        """
+        in_flight_crit = self._crit(
+            method="file_exists", path="VERSION", type="smoke", command=None,
+        )
+        (self.tmp / "VERSION").write_text("0.8.1\n")
+        # Empty hash simulates missing field / older schema.
+        self._write_started_only(
+            0,
+            attempt_id="a1",
+            type_="smoke",
+            method="file_exists",
+            criterion_hash="",
+        )
+        verdict, _ = self.runner.resume_attempt(
+            self.tmp,
+            attempt_id="a1",
+            criteria=[in_flight_crit],
+            contract=self._contract(),
+        )
+        self.assertEqual(verdict.decision, "block_in_flight")
+        self.assertIn("lacks a usable criterion_hash", verdict.reason)
 
     def test_cmd_compound_with_explicit_override_unblocks(self) -> None:
         """Operator opts in: per-criterion override with rationale wins

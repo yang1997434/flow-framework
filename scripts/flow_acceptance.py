@@ -1826,31 +1826,48 @@ class AcceptanceRunner:
             )
         criterion = criteria[rp.in_flight_criterion_idx]
 
-        # Identity check (codex round-1 [P1]): the in-flight event recorded
-        # the criterion's hash at started-time (T4+Y7). If the contract was
-        # edited between crash and resume, the criterion at the recorded
-        # idx may now be a DIFFERENT criterion (different method/type/cmd)
-        # than the one that was running — applying R8 against the new shape
-        # would mis-classify the in-flight cell. Compare hashes and fail
-        # closed on mismatch; the operator can resolve via interactive
-        # block (revert contract, switch_to_interactive, abort).
+        # Identity check (codex round-1 [P1] + round-2 [P2] fail-closed):
+        # the in-flight event recorded the criterion's hash at started-time
+        # (T4+Y7). If the contract was edited between crash and resume, the
+        # criterion at the recorded idx may now be a DIFFERENT criterion
+        # (different method/type/cmd) than the one that was running —
+        # applying R8 against the new shape would mis-classify. Fail-closed
+        # rules:
+        #   - recorded_hash missing / falsy (older schema or corrupt JSONL)
+        #     → block (cannot verify identity; fail-open here would
+        #     re-introduce the round-1 vulnerability).
+        #   - recorded_hash != current_hash → block (contract was edited).
+        # The operator resolves via interactive block (revert contract,
+        # switch_to_interactive, abort).
         recorded_hash = (rp.in_flight_event or {}).get("criterion_hash")
-        if recorded_hash:
-            current_hash = self._criterion_hash(criterion)
-            if recorded_hash != current_hash:
-                return (
-                    IdempotencyVerdict(
-                        decision="block_in_flight",
-                        reason=(
-                            f"criterion identity changed mid-attempt "
-                            f"(idx={rp.in_flight_criterion_idx}): recorded "
-                            f"hash {recorded_hash[:12]!r}, current hash "
-                            f"{current_hash[:12]!r}; contract was edited "
-                            f"between started event and resume"
-                        ),
+        if not recorded_hash or not isinstance(recorded_hash, str):
+            return (
+                IdempotencyVerdict(
+                    decision="block_in_flight",
+                    reason=(
+                        f"in-flight event at idx={rp.in_flight_criterion_idx} "
+                        f"lacks a usable criterion_hash; cannot verify "
+                        f"criterion identity for safe resume "
+                        f"(JSONL line may be from older schema or corrupt)"
                     ),
-                    rp,
-                )
+                ),
+                rp,
+            )
+        current_hash = self._criterion_hash(criterion)
+        if recorded_hash != current_hash:
+            return (
+                IdempotencyVerdict(
+                    decision="block_in_flight",
+                    reason=(
+                        f"criterion identity changed mid-attempt "
+                        f"(idx={rp.in_flight_criterion_idx}): recorded "
+                        f"hash {recorded_hash[:12]!r}, current hash "
+                        f"{current_hash[:12]!r}; contract was edited "
+                        f"between started event and resume"
+                    ),
+                ),
+                rp,
+            )
 
         verdict = self.resolve_in_flight_idempotency(
             criterion,
