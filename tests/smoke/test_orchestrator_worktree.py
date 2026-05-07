@@ -2233,6 +2233,101 @@ class TestMergeRefusesBranchHeadDrift(unittest.TestCase):
         )
 
 
+class TestMergeRefusesDetachedOrWrongBranch(unittest.TestCase):
+    """Codex round-2 [P1]: branch identity bypass. Subagent can move
+    the worktree off ``ctx.branch`` (e.g., ``git checkout --detach`` or
+    ``git checkout other-branch``) AFTER fact derivation. Without
+    Check #3 (symbolic HEAD == ctx.branch), Check #2 still passes
+    (worktree HEAD is whatever subagent committed) but step 6 would
+    merge the ORIGINAL ``ctx.branch`` ref — silently dropping the
+    gated commit while ``merge_applied`` reports success.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="t14-merge-symref-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ctx, self.contract, self.task_dir = _make_merge_runner_ctx(
+            self.tmp,
+        )
+        self.head_sha = _commit_in_worktree(
+            self.ctx, "src/foo.py", "print('hi')\n",
+        )
+        self.facts = TaskFacts(
+            changed_files=["src/foo.py"], newly_added_files=["src/foo.py"],
+            diff_hash="x" * 64, target_commit_pre_merge=self.head_sha,
+        )
+
+    def test_refuses_when_worktree_head_is_detached(self) -> None:
+        """Subagent ran ``git checkout --detach``. Even if facts.head
+        matches worktree HEAD, refuse — step 6 would merge the wrong
+        ref."""
+        subprocess.run(
+            ["git", "-C", str(self.ctx.worktree_path),
+             "checkout", "--detach", "-q"],
+            check=True,
+        )
+        merger = MergeRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r", task_id="T0",
+        )
+        result = merger.merge_task(
+            facts=self.facts, merge_strategy="--ff-only",
+        )
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("detached", result.block_reason.lower())
+        events = _decisions_jsonl_events(self.task_dir)
+        self.assertNotIn("merge_started", events)
+        self.assertNotIn("merge_applied", events)
+
+    def test_refuses_when_worktree_on_wrong_branch(self) -> None:
+        """Subagent ran ``git checkout -b other-branch``. block_reason
+        names both the rogue branch and the expected ctx.branch."""
+        subprocess.run(
+            ["git", "-C", str(self.ctx.worktree_path),
+             "checkout", "-q", "-b", "subagent-rogue-branch"],
+            check=True,
+        )
+        merger = MergeRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r", task_id="T0",
+        )
+        result = merger.merge_task(
+            facts=self.facts, merge_strategy="--ff-only",
+        )
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("wrong branch", result.block_reason.lower())
+        self.assertIn("subagent-rogue-branch", result.block_reason)
+        self.assertIn(self.ctx.branch, result.block_reason)
+        events = _decisions_jsonl_events(self.task_dir)
+        self.assertNotIn("merge_started", events)
+        self.assertNotIn("merge_applied", events)
+
+    def test_merge_started_records_branch_at_merge(self) -> None:
+        """merge_started event payload includes ``branch_at_merge``
+        (the verified symbolic ref) for forensic clarity."""
+        merger = MergeRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r", task_id="T0",
+        )
+        result = merger.merge_task(
+            facts=self.facts, merge_strategy="--ff-only",
+        )
+        self.assertEqual(result.status, "merged")
+        # Find the merge_started record and check the branch_at_merge
+        # field equals ctx.branch.
+        path = self.task_dir / "decisions.jsonl"
+        records = [
+            json.loads(line) for line in
+            path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
+        started = [
+            r for r in records
+            if isinstance(r, dict) and r.get("event") == "merge_started"
+        ]
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0].get("branch_at_merge"), self.ctx.branch)
+
+
 class TestMidMergeCrashDetection(unittest.TestCase):
     """Y5 gap-by-gap state machine. Pinning T19 dispatch-side recovery
     contract — a `merge_started` without paired `merge_applied` MUST

@@ -2373,16 +2373,22 @@ class MergeRunner:
         # uncommitted edits as "working". But ``git merge ctx.branch``
         # only integrates COMMITTED commits — leaving the dirty content
         # silently dropped while ``merge_applied`` reports success.
-        # Two pre-checks below close the bypass:
+        # Three pre-checks below close the bypass:
         #   Check #1 — task worktree must be clean (no staged /
         #              unstaged / untracked).
         #   Check #2 — task branch HEAD must equal
         #              facts.target_commit_pre_merge (TOCTOU defense:
         #              another commit landing between fact derivation
         #              and gate 7 invalidates earlier gate verdicts).
-        # Both fail-closed BEFORE merge_started — no phantom gap.
-        # (TOCTOU window between Check #2 and the merge step itself
-        # remains; v0.8.1 single-process orchestrator accepts this.)
+        #   Check #3 — task worktree symbolic HEAD must point at
+        #              ``ctx.branch`` (codex round-2 [P1]: subagent can
+        #              ``git checkout --detach`` or switch branches; w/o
+        #              this, step 6 would merge the original branch ref
+        #              which still points at the pre-task base).
+        # All fail-closed BEFORE merge_started — no phantom gap.
+        # (TOCTOU window between Check #3 and step 6 remains; v0.8.1
+        # single-process orchestrator accepts this. Step 6 also merges
+        # the verified SHA — not the branch ref — as belt-and-suspenders.)
 
         # Check #1 — task worktree clean.
         status = _run_argv_with_pgkill(
@@ -2486,11 +2492,74 @@ class MergeRunner:
                 ),
             )
 
+        # Check #3 — symbolic HEAD must point at ``ctx.branch``. Catches
+        # subagent running ``git checkout --detach`` or switching to
+        # another branch. Without this, Check #2 still passes (worktree
+        # HEAD is whatever subagent committed) but step 6 would merge
+        # the ORIGINAL ``ctx.branch`` ref, which may still point at the
+        # pre-task base — silently dropping the gated commit.
+        symref = _run_argv_with_pgkill(
+            ["git", "-C", str(self.ctx.worktree_path),
+             "symbolic-ref", "--short", "HEAD"],
+            cwd=self.ctx.worktree_path,
+            timeout_sec=_GIT_HEAD_QUERY_TIMEOUT_SEC,
+        )
+        if symref.timed_out:
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason="task worktree symbolic-ref HEAD timed out",
+            )
+        if symref.spawn_error is not None:
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason=(
+                    f"task worktree symbolic-ref spawn failed: "
+                    f"{symref.spawn_error}"
+                ),
+            )
+        if symref.returncode != 0:
+            # symbolic-ref returns non-zero when HEAD is detached
+            # (or any other unreadable state). Fail-closed.
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason=(
+                    f"task worktree HEAD is detached "
+                    f"(symbolic-ref rc={symref.returncode}); subagent "
+                    f"must keep HEAD attached to {self.ctx.branch!r}"
+                ),
+            )
+        actual_branch = symref.stdout.strip()
+        if not actual_branch:
+            # F-class fail-closed: empty stdout despite rc=0 is
+            # malformed git output we refuse to trust.
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason=(
+                    "task worktree symbolic-ref returned empty branch "
+                    "name (unexpected)"
+                ),
+            )
+        if actual_branch != self.ctx.branch:
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason=(
+                    f"task worktree on wrong branch: HEAD points to "
+                    f"{actual_branch!r}, expected {self.ctx.branch!r}"
+                ),
+            )
+
         # Step 5 — merge_started. Emitted ONLY after R9 HEAD pre-check +
-        # Check #1 (clean worktree) + Check #2 (branch HEAD == facts)
-        # all pass; otherwise we'd write a phantom gap that
-        # ``detect_mid_merge_crash`` would mistake for a real
-        # mid_merge_crash (see code-review P1-1 fix).
+        # Check #1 (clean worktree) + Check #2 (branch HEAD == facts) +
+        # Check #3 (symbolic HEAD == ctx.branch) all pass; otherwise we'd
+        # write a phantom gap that detect_mid_merge_crash would mistake
+        # for a real mid_merge_crash (see code-review P1-1 fix).
+        # ``branch_at_merge`` records the verified symbolic ref for
+        # forensic clarity.
         append_autonomy_event(
             self.task_dir, EVENT_MERGE_STARTED,
             {
@@ -2503,13 +2572,17 @@ class MergeRunner:
                 "worktree_path": str(self.ctx.worktree_path),
                 "integration_target": self.ctx.integration_target,
                 "target_commit_pre_merge": facts.target_commit_pre_merge,
+                "branch_at_merge": actual_branch,
             },
         )
 
-        # Step 6 — git merge. R9 HEAD invariant already proven above.
+        # Step 6 — git merge. Codex round-2 [P1]: merge the EXACT verified
+        # SHA, not ``ctx.branch``. Checks #2 + #3 lock down branch state,
+        # but merging the SHA directly eliminates the entire class of
+        # "branch ref might not point at what we think" issues.
         merge_run = _run_argv_with_pgkill(
             ["git", "-C", str(repo_root),
-             "merge", merge_strategy, self.ctx.branch],
+             "merge", merge_strategy, facts.target_commit_pre_merge],
             cwd=repo_root,
             timeout_sec=_GIT_MERGE_TIMEOUT_SEC,
         )
