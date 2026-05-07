@@ -1381,7 +1381,35 @@ class GateRunner:
         # Re-derive facts so gate 3 sees any disk state the baseline
         # command produced. T11's `derive_task_facts` already covers
         # committed + staged + unstaged + untracked layers (G-class).
-        post_baseline_facts = derive_task_facts(self.ctx)
+        #
+        # Codex round-2 [P2] D5 catch-all: a baseline command CAN
+        # corrupt the worktree (delete ``.git``, cause submodule
+        # divergence, exhaust inodes mid-write). Each git invocation
+        # inside ``derive_task_facts`` runs with ``check=True``, so any
+        # corruption surfaces as ``CalledProcessError`` (or ``OSError``
+        # on FS-level failures, ``ValueError`` on unparseable output).
+        # We catch the family and route to ``inconclusive`` so the
+        # orchestrator surfaces operator review instead of crashing
+        # — exactly the role the round-1 refresh promised.
+        try:
+            post_baseline_facts = derive_task_facts(self.ctx)
+        except (
+            subprocess.CalledProcessError,
+            OSError,
+            ValueError,
+        ) as e:
+            return Phase2Verdict(
+                status="blocked",
+                halted_at_gate="gate3_manifest",
+                gate_result=GateResult(
+                    status="inconclusive",
+                    details={
+                        "gate": "gate3_manifest",
+                        "reason": "post_baseline_fact_refresh_failed",
+                        "error": f"{type(e).__name__}: {e}",
+                    },
+                ),
+            )
 
         r = self.gate3_manifest(manifest=manifest, facts=post_baseline_facts)
         if r.status != "pass":

@@ -1126,6 +1126,61 @@ class TestRunPhase2Chain(unittest.TestCase):
             "secrets/key.pem", v.gate_result.details["violations"]
         )
 
+    def test_run_phase2_inconclusive_on_corrupted_worktree_post_baseline(self) -> None:
+        """Codex round-2 [P2]: when the post-baseline fact refresh
+        fails (e.g. baseline corrupted the worktree, ran out of
+        inodes, etc.), run_phase2 must return a controlled
+        inconclusive verdict — NOT propagate the exception and crash
+        the orchestrator.
+
+        We simulate the failure by patching ``derive_task_facts`` for
+        the duration of this call to raise ``CalledProcessError``,
+        which is what real git invocations under check=True surface
+        when the worktree is unreadable. Constructing a real worktree
+        corruption is fragile (git falls back to parent .git on a
+        missing internal pointer) and not worth the indirection.
+        """
+        import flow_orchestrator as fo  # type: ignore
+
+        empty_facts = TaskFacts(
+            changed_files=[], newly_added_files=[],
+            diff_hash="x", target_commit_pre_merge="y",
+        )
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r1", task_id="T0",
+        )
+        original = fo.derive_task_facts
+        try:
+            fo.derive_task_facts = lambda _ctx: (_ for _ in ()).throw(
+                subprocess.CalledProcessError(
+                    returncode=128,
+                    cmd=["git", "diff"],
+                    stderr="fatal: not a git repository",
+                )
+            )
+            v = gr.run_phase2(
+                manifest=self.manifest, facts=empty_facts,
+                criteria=self.criteria,
+                attempt_id="a1", retry_idx=0,
+                baseline_command="true",
+                smoke_command="true",
+            )
+        finally:
+            fo.derive_task_facts = original
+
+        # Must produce a verdict (no exception escape).
+        self.assertEqual(v.status, "blocked")
+        self.assertEqual(v.halted_at_gate, "gate3_manifest")
+        self.assertEqual(v.gate_result.status, "inconclusive")
+        self.assertEqual(
+            v.gate_result.details["reason"],
+            "post_baseline_fact_refresh_failed",
+        )
+        self.assertIn(
+            "CalledProcessError", v.gate_result.details["error"]
+        )
+
     def test_run_phase2_rederive_catches_baseline_side_effects(self) -> None:
         """Codex round-1 [P2]: a baseline command that itself writes
         forbidden files into the worktree must be caught by gate 3.
