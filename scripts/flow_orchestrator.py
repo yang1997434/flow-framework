@@ -3747,6 +3747,22 @@ class CrashRecoveryDispatcher:
         ):
             return self._block_auto_prepare_interrupted(lock_state)
 
+        # ── orphan_lock_post_engaged: T5 §8.1 "consume + warning" ──────
+        # T19 review round 1 [Y2]: detect_auto_prepare_state returns this
+        # synthetic state when (lock present AND auto_engaged event also
+        # present) — the previous run reached engagement but exited
+        # without unlinking the lock. T5 §8.1 contract is explicit:
+        # consume the lock + emit warning, NEVER block. Without consume,
+        # the stale lock survives the run; the next run sees it again
+        # and either re-warns indefinitely or, worse, escalates spuriously
+        # if pid/contract/host bookkeeping drifts. Real safety boundary
+        # is owned by state 2 (interrupted_*) — those are blocks. Falling
+        # through to subsequent state checks is correct: orphan-lock
+        # alone does not determine recovery action.
+        if ls == "orphan_lock_post_engaged":
+            self._consume_stale_lock(lock_state)
+            # fall through — state 4/5/3/1/0 detection still runs.
+
         # ── State 4: mid-merge / mid-gate-8 crash (T14 detector) ────────
         merge_state = detect_mid_merge_crash(
             self.task_dir, run_id=self.run_id, task_id=self.task_id,
@@ -3822,6 +3838,64 @@ class CrashRecoveryDispatcher:
             # clearer error.
             return False
         return meta.autonomy_mode == "auto"
+
+    # ------------------------------------------------------------------
+    # orphan_lock_post_engaged helper — T5 §8.1 "consume + warning".
+    # ------------------------------------------------------------------
+
+    def _consume_stale_lock(self, lock_state: dict) -> None:
+        """T19 round 1 [Y2]: implement T5 §8.1 consume_with_warning
+        contract. Unlink the stale lock + emit a stderr WARN. Failure
+        to unlink does NOT block (T5 contract: warning state, not safety
+        boundary; state-2 ``interrupted_*`` paths still own the real
+        block. If unlink truly fails — permission denied etc. — the next
+        run will see the same orphan_lock_post_engaged state again and
+        re-attempt; if it ever escalates to interrupted_* on a real
+        anomaly, state 2 catches it).
+
+        ``lock_state`` is the dict returned by ``detect_auto_prepare_state``;
+        we read ``lock_path`` from it but fall back to the conventional
+        path (consistent with ``_block_auto_prepare_interrupted``'s same
+        Y8 fallback) so a missing key cannot mask a real lock on disk.
+
+        K-class safety: only ``FileNotFoundError`` (race-safe) and
+        ``OSError`` are caught. Broader except would mask real bugs
+        (D5 reverse: silent except defeats fail-loud propagation that
+        the rest of the dispatcher depends on).
+        """
+        # Prefer disk-derived path for forensic accuracy; fall back to
+        # the conventional location so `lock_path is None` (e.g. exotic
+        # fixture) still resolves to the real file we want to unlink.
+        ls_path = lock_state.get("lock_path")
+        lock_path = (
+            Path(ls_path) if isinstance(ls_path, str) and ls_path
+            else self.task_dir / AUTO_PREPARE_LOCK_FILENAME
+        )
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            # Race-safe: another process already cleaned up. Still emit
+            # the warning so operators know we hit the synthetic state.
+            pass
+        except OSError as e:
+            # Permission denied / read-only fs / etc. Don't block — T5
+            # contract says this is a warning state. Next run will
+            # re-trigger and either succeed or, on a real anomaly,
+            # escalate to interrupted_* via state 2.
+            print(
+                f"WARN: could not consume orphan auto_prepare.lock at "
+                f"{lock_path}: {e}; T5 §8.1 contract — proceeding without "
+                f"block (next run will retry)",
+                file=sys.stderr,
+            )
+            return
+        print(
+            f"WARN: consumed orphan auto_prepare.lock from prior run "
+            f"(slug={self.slug}, task={self.task_id}); T5 §8.1 contract "
+            f"— previous run reached engagement but exited without "
+            f"unlocking; recovery proceeds.",
+            file=sys.stderr,
+        )
 
     # ------------------------------------------------------------------
     # State 2 helper — auto_prepare_interrupted block.
@@ -4141,11 +4215,15 @@ class CrashRecoveryDispatcher:
             "switch_to_interactive",
         ]
         # R-class defense: verify_path is read from disk JSON and could
-        # carry control chars; pass via isinstance(str) check above and
-        # let write_blocked's _reject_frontmatter_line_separators do
-        # final sanitization (it runs on block_type, not the why_blocked
-        # body — the body is escaped inline). Truncate to a reasonable
-        # length for blocked.md readability.
+        # carry control chars. We pass via isinstance(str) above; the
+        # composed `why` then flows through `write_blocked`, which
+        # T19 round-1 hardened to run `_reject_frontmatter_line_separators`
+        # on `why_blocked` itself (Y1 fix: previously only `block_type`
+        # and `frontmatter_extra` str values went through the helper, so
+        # a CR in `verification_worktree_path` would have forged a
+        # frontmatter row. Now any forged char raises ValueError before
+        # the disk write). Truncate to a reasonable length for
+        # blocked.md readability.
         short_path = path_str if len(path_str) <= 200 else (
             path_str[:200] + "…"
         )

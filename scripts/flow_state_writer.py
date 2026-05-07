@@ -382,6 +382,33 @@ def write_blocked(
         # two YAML rows on parsers that honor CR.
         _reject_frontmatter_line_separators(block_type, field_name="block_type")
         bt_line = f"block_type: {block_type}\n"
+    # T19 review round 1 [Y1]: ``why_blocked`` and ``safe_resume_command``
+    # are emitted as raw frontmatter lines (``why_blocked: {why_blocked}``
+    # / ``safe_resume_command: {safe_resume_command}``), so a value
+    # carrying any line-separator-class char would forge frontmatter rows
+    # the same way ``block_type`` could. Pre-existing T1-era gap surfaced
+    # by T19 piping disk-derived path strings (``verification_worktree_path``
+    # from decisions.jsonl) into ``why_blocked``: a corrupt / hand-edited
+    # journal with control chars in the path becomes a R-class injection
+    # vector for EVERY ``write_blocked`` caller, not just T19's. Validate
+    # the same way (isinstance(str) + shared helper) before any frontmatter
+    # composition so the failure is loud (D5: explicit ValueError
+    # propagates; no try/except around atomic_write_text).
+    if not isinstance(why_blocked, str):
+        raise ValueError(
+            f"why_blocked must be a str; got {type(why_blocked).__name__}"
+        )
+    _reject_frontmatter_line_separators(
+        why_blocked, field_name="why_blocked",
+    )
+    if not isinstance(safe_resume_command, str):
+        raise ValueError(
+            f"safe_resume_command must be a str; "
+            f"got {type(safe_resume_command).__name__}"
+        )
+    _reject_frontmatter_line_separators(
+        safe_resume_command, field_name="safe_resume_command",
+    )
     # Validate + format BEFORE any disk write — invalid extras must not
     # leave a partial blocked.md (D5: explicit ValueError propagates;
     # no try/except around atomic_write_text).

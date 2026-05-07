@@ -335,6 +335,80 @@ class TestCrashRecoveryDispatcher(unittest.TestCase):
         ):
             self.assertIn(c, v.choices)
 
+    # ------------------------------------------------------------------
+    # T19 review round 1 [Y2] — orphan_lock_post_engaged consume + warn.
+    # ------------------------------------------------------------------
+    def test_state_orphan_lock_consumed_and_proceeds(self):
+        """[Y2] T5 ``orphan_lock_post_engaged`` is the synthetic state
+        for (lock present AND auto_engaged event also present) — prior
+        run reached engagement but exited without unlocking. Per T5 §8.1
+        contract: consume + WARN, NEVER block. The dispatcher must
+        unlink the stale lock and fall through to subsequent state
+        detection — here the journal also has ``task_completed``, so
+        state-3 (post-engaged crash) does NOT fire and we route to
+        clean / proceed.
+
+        Prior to the fix the lock survived the run (silent fall-through
+        with no unlink), and the next invocation would re-trigger the
+        same state, etc.
+        """
+        # Seed the lock — pid value is irrelevant (the orphan branch
+        # in detect_auto_prepare_state fires on lock+engaged co-presence
+        # alone, before any pid/host/contract probing).
+        lock = AutoPrepareLock(
+            lock_version=1, slug="demo", run_id="r1", task_id="T0",
+            contract_path="/c.json", contract_hash="a" * 64,
+            contract_schema_version=1,
+            created_at="2026-05-06T00:00:00Z",
+            pid=2 ** 31 - 1,
+            host=socket.gethostname(),
+            cwd=str(self.tmp),
+            target_branch="master",
+            intended_first_task_dispatch_at="2026-05-06T00:00:01Z",
+        )
+        write_auto_prepare_lock(self.task_dir, lock)
+        # Emit auto_engaged so detect_auto_prepare_state classifies
+        # (lock_present and engaged) → orphan_lock_post_engaged.
+        append_autonomy_event(self.task_dir, EVENT_AUTO_ENGAGED, {
+            "event_id": "e1", "ts": "2026-05-06T00:00:00Z",
+            "slug": "demo", "run_id": "r1", "task_id": "T0",
+            "worktree_id": "demo+t0+abcdefg",
+            "worktree_path": str(Path(self.tmp) / "wt"),
+            "original_base_commit": "a" * 40,
+            "current_base_commit": "a" * 40,
+            "lifecycle_state": "active", "checkpoint_id": None,
+            "contract_path": "/c.json", "contract_hash": "a" * 64,
+            "contract_schema_version": 1,
+        })
+        # task_completed terminal event — proves the run wrapped up
+        # cleanly past engagement; without it state-3 (post-engaged
+        # crash) would also fire and mask the orphan-lock branch.
+        append_autonomy_event(self.task_dir, EVENT_TASK_COMPLETED, {
+            "event_id": "e2", "ts": "2026-05-06T00:00:01Z",
+            "slug": "demo", "run_id": "r1", "task_id": "T0",
+            "worktree_id": "demo+t0+abcdefg",
+            "final_diff_hash": "f" * 64,
+            "target_commit_post_merge": "deadbeef" + "0" * 32,
+        })
+
+        v = CrashRecoveryDispatcher(
+            task_dir=self.task_dir, slug="demo",
+            run_id="r1", task_id="T0",
+            current_contract_hash="a" * 64,
+            repo_root=Path(self.tmp),
+        ).classify()
+
+        # T5 §8.1 contract: orphan_lock is a "warning" state, not a
+        # block. Recovery proceeds; the only side effect is the lock
+        # gets unlinked + a stderr WARN.
+        self.assertEqual(v.state, "clean")
+        self.assertEqual(v.action, "proceed")
+        # Lock consumed — file removed from disk.
+        self.assertFalse(
+            (self.task_dir / "auto_prepare.lock").exists(),
+            "stale lock must be unlinked by _consume_stale_lock",
+        )
+
     def test_state5_verification_completed_is_clean(self):
         """If post_merge_verification_completed fired, state 5 does
         NOT trigger even if the verify worktree path still exists on
@@ -533,14 +607,62 @@ class TestPostAutoEngagedCrashBlocksEndToEnd(unittest.TestCase):
         )
 
     def test_orchestrator_subprocess_blocks_on_auto_prepare_lock_crash(self):
-        # R10: auto_prepare.lock present, no auto_engaged event,
-        # pid is dead → interrupted_dead_pid → block with
-        # auto_prepare_interrupted.
+        """R10 + T5 §8.1: auto_prepare.lock present + contract_hash
+        mismatch (T5 detection order: contract-mismatch is checked
+        BEFORE pid-liveness per flow_state_writer.py:1012-1014)
+        → ``interrupted_contract_changed`` → block with
+        ``auto_prepare_interrupted``. Both ``interrupted_*`` paths
+        share the same block_type, so the assertion remains tight.
+        T19 review round 1 [M1]: docstring updated to reflect actual
+        T5 detection order — the prior text claimed "dead pid" but
+        the orchestrator runs with current_contract_hash="a"*64
+        (default for an unseeded contract.json) which never matches
+        the lock's "a"*64 hash. Pure dead-pid path is exercised by
+        ``test_orchestrator_subprocess_blocks_on_dead_pid_lock_crash``.
+        """
         (self.slug_dir / "auto_prepare.lock").write_text(json.dumps({
             "lock_version": 1, "slug": self.slug,
             "run_id": "r1", "task_id": "T0",
             "contract_path": "contract.json",
             "contract_hash": "a" * 64,
+            "contract_schema_version": 1,
+            "created_at": "2026-05-06T00:00:00Z",
+            "pid": 2 ** 31 - 1,                 # guaranteed-dead pid
+            "host": socket.gethostname(),
+            "cwd": str(self.slug_dir),
+            "target_branch": "master",
+            "intended_first_task_dispatch_at": "2026-05-06T00:00:01Z",
+        }))
+        r = _run_orchestrator(self.slug, repo_root=self.repo_root)
+        self.assertEqual(
+            r.returncode, 3, msg=f"stderr={r.stderr!r}",
+        )
+        blocked = (self.slug_dir / "blocked.md").read_text()
+        self.assertIn("auto_prepare_interrupted", blocked)
+        self.assertIn("resume_auto_from_prepare", blocked)
+        self.assertIn(
+            "autonomy_mode: auto",
+            (self.slug_dir / "progress.md").read_text(),
+        )
+
+    def test_orchestrator_subprocess_blocks_on_dead_pid_lock_crash(self):
+        """T19 review round 1 [M1]: pure dead-pid path coverage.
+        Compute the real ``sha256(contract.json)`` and seed the lock
+        with it so T5's contract-mismatch check passes; detection then
+        falls through to host check (matches via ``socket.gethostname``)
+        and finally pid liveness, where ``2**31 - 1`` is guaranteed
+        dead. State: ``interrupted_dead_pid`` → same block_type
+        ``auto_prepare_interrupted``. Both T5 routes are now
+        independently asserted at the subprocess boundary.
+        """
+        import hashlib
+        contract_path = self.slug_dir / "contract.json"
+        real_hash = hashlib.sha256(contract_path.read_bytes()).hexdigest()
+        (self.slug_dir / "auto_prepare.lock").write_text(json.dumps({
+            "lock_version": 1, "slug": self.slug,
+            "run_id": "r1", "task_id": "T0",
+            "contract_path": "contract.json",
+            "contract_hash": real_hash,         # match → bypass mismatch
             "contract_schema_version": 1,
             "created_at": "2026-05-06T00:00:00Z",
             "pid": 2 ** 31 - 1,                 # guaranteed-dead pid

@@ -151,6 +151,76 @@ class TestStateWriter(unittest.TestCase):
             )
         self.assertFalse((self.task_dir / "blocked.md").exists())
 
+    # ------------------------------------------------------------------
+    # T19 review round 1 [Y1]: ``why_blocked`` and ``safe_resume_command``
+    # are also frontmatter lines and so MUST run through the same line-
+    # separator helper as ``block_type``. T19 surfaced the gap by piping
+    # disk-derived ``verification_worktree_path`` strings into
+    # ``why_blocked`` — a corrupt journal carrying control chars in the
+    # path becomes a R-class injection vector for every caller. The
+    # following four cases pin the fix on both fields with one
+    # representative separator each (full class is already exercised by
+    # the block_type CR/LSEP/VT cases above; helper coverage is shared).
+    # ------------------------------------------------------------------
+    def test_blocked_md_why_blocked_rejects_newline(self):
+        """[Y1] LF in why_blocked forges a second frontmatter row on
+        every parser. Reject before any disk write.
+        """
+        with self.assertRaises(ValueError) as ctx:
+            write_blocked(
+                self.task_dir,
+                phase=2, task="t1",
+                why_blocked="legit reason\nts: forged",
+                required_choice=["a"], safe_resume_command="r",
+            )
+        self.assertIn("line-separator", str(ctx.exception).lower())
+        self.assertFalse((self.task_dir / "blocked.md").exists())
+
+    def test_blocked_md_why_blocked_rejects_carriage_return(self):
+        """[Y1] CR alone breaks out of the why_blocked line on parsers
+        that respect CR (every spec-conformant YAML 1.2 parser).
+        """
+        with self.assertRaises(ValueError):
+            write_blocked(
+                self.task_dir,
+                phase=2, task="t1",
+                why_blocked="legit\rts: forged",
+                required_choice=["a"], safe_resume_command="r",
+            )
+        self.assertFalse((self.task_dir / "blocked.md").exists())
+
+    def test_blocked_md_why_blocked_rejects_unicode_line_separator(self):
+        """[Y1] ``\u2028`` (LSEP) is in Python's ``str.splitlines()``
+        boundary set. Operator scripts that line-parse blocked.md would
+        see a forged row even if PyYAML itself is strict. Same shared
+        helper covers it. Written as the escape form to keep the source
+        file ASCII-clean (cf. flow_state_writer.py module comment).
+        """
+        with self.assertRaises(ValueError):
+            write_blocked(
+                self.task_dir,
+                phase=2, task="t1",
+                why_blocked="legit\u2028ts: forged",
+                required_choice=["a"], safe_resume_command="r",
+            )
+        self.assertFalse((self.task_dir / "blocked.md").exists())
+
+    def test_blocked_md_safe_resume_command_rejects_newline(self):
+        """[Y1] safe_resume_command emits an unquoted YAML line too;
+        a newline forges a frontmatter row exactly like why_blocked.
+        Pin the field explicitly so a future regression that misses
+        only one of the two emission lines is caught.
+        """
+        with self.assertRaises(ValueError) as ctx:
+            write_blocked(
+                self.task_dir,
+                phase=2, task="t1", why_blocked="x",
+                required_choice=["a"],
+                safe_resume_command="cmd\nfoo: forged",
+            )
+        self.assertIn("line-separator", str(ctx.exception).lower())
+        self.assertFalse((self.task_dir / "blocked.md").exists())
+
 
 def _make_started_event(**overrides) -> AcceptanceProgressEvent:
     """Valid 24-field `started` event with sensible defaults; override per test."""
