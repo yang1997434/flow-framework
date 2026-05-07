@@ -640,6 +640,91 @@ class TestAutoDispatchManifestBlock(unittest.TestCase):
         self.assertIn("manifest_violation", blocked)
         self.assertIn("secrets/key.pem", blocked)
 
+    def test_dispatch_block_on_uncommitted_forbidden_file(self) -> None:
+        """Codex T11 round-1 [P1]: subagent leaves a forbidden file in
+        the working tree without committing it. `derive_task_facts`
+        must include working-tree state via `git status --porcelain`,
+        not just `base..HEAD` diff. Without the fix, this dispatch
+        returned ``ok`` despite the row-3 violation (silent bypass).
+        """
+
+        def stash_dispatch(ctx: WorktreeContext) -> None:
+            secrets_dir = ctx.worktree_path / "secrets"
+            secrets_dir.mkdir(parents=True)
+            (secrets_dir / "key.pem").write_text("PRIVATE\n")
+            # Note: NO git add, NO commit. File sits as untracked in
+            # the working tree.
+
+        outcome = auto_dispatch_task(
+            slug="demo", task_idx=0, repo_root=self.tmp,
+            dispatch_fn=stash_dispatch,
+            contract=self.contract,
+            manifest=self.manifest,
+            run_id="run-uncomm",
+            contract_path=self.tmp / "contract.json",
+            contract_hash="deadbeef" * 8,
+        )
+        self.assertEqual(outcome.status, "blocked")
+        self.assertEqual(outcome.block_type, "manifest_violation")
+        self.assertEqual(outcome.block_row, 3)
+        blocked = outcome.blocked_md_path.read_text()
+        self.assertIn("secrets/key.pem", blocked)
+
+    def test_dispatch_block_on_untracked_outside_scope(self) -> None:
+        """Codex T11 round-1 [P1] — row 4 specifically: subagent creates
+        a brand-new file outside scope and never tracks it. The §1 row 4
+        rule was designed exactly for this; before the working-tree fix
+        the file was invisible to verification.
+        """
+
+        def untracked_dispatch(ctx: WorktreeContext) -> None:
+            (ctx.worktree_path / "infra").mkdir(parents=True)
+            (ctx.worktree_path / "infra" / "deploy.yml").write_text(
+                "# rogue\n"
+            )
+
+        outcome = auto_dispatch_task(
+            slug="demo", task_idx=0, repo_root=self.tmp,
+            dispatch_fn=untracked_dispatch,
+            contract=self.contract,
+            manifest=self.manifest,
+            run_id="run-untracked",
+            contract_path=self.tmp / "contract.json",
+            contract_hash="deadbeef" * 8,
+        )
+        self.assertEqual(outcome.status, "blocked")
+        self.assertEqual(outcome.block_type, "manifest_violation")
+        self.assertEqual(outcome.block_row, 4)  # row 4 = untracked outside scope.
+        blocked = outcome.blocked_md_path.read_text()
+        self.assertIn("infra/deploy.yml", blocked)
+
+    def test_dispatch_block_on_staged_but_uncommitted_forbidden(self) -> None:
+        """Subagent ``git add``s a forbidden file but never commits.
+        Staged-only must also trip the manifest verifier.
+        """
+
+        def staged_dispatch(ctx: WorktreeContext) -> None:
+            secrets_dir = ctx.worktree_path / "secrets"
+            secrets_dir.mkdir(parents=True)
+            (secrets_dir / "key.pem").write_text("PRIVATE\n")
+            subprocess.run(
+                ["git", "-C", str(ctx.worktree_path), "add", "."],
+                check=True,
+            )
+            # NO commit.
+
+        outcome = auto_dispatch_task(
+            slug="demo", task_idx=0, repo_root=self.tmp,
+            dispatch_fn=staged_dispatch,
+            contract=self.contract,
+            manifest=self.manifest,
+            run_id="run-staged",
+            contract_path=self.tmp / "contract.json",
+            contract_hash="deadbeef" * 8,
+        )
+        self.assertEqual(outcome.status, "blocked")
+        self.assertEqual(outcome.block_row, 3)
+
     def test_dispatch_ok_on_clean_diff(self) -> None:
         """Same orchestration shell, but subagent writes only in-scope.
         Outcome.status must be "ok" with no blocked.md side effect."""

@@ -459,12 +459,61 @@ def derive_task_facts(ctx: WorktreeContext) -> TaskFacts:
     # `.split("\n")` — the strip() above existing implementation in plan
     # would map `"a\n\nb"` to `"a\n\nb".splitlines() == ["a","","b"]`
     # which still leaks an empty entry. Filter explicitly.
-    changed_files = [ln for ln in name_only.splitlines() if ln]
+    committed_changed = [ln for ln in name_only.splitlines() if ln]
     added_only = _git(
         ctx.worktree_path, "diff", "--name-only", "--diff-filter=A",
         f"{base}..HEAD",
     ).stdout
-    newly = [ln for ln in added_only.splitlines() if ln]
+    committed_added = [ln for ln in added_only.splitlines() if ln]
+
+    # Codex T11 round-1 [P1]: a subagent could leave forbidden /
+    # out-of-scope files in the WORKING TREE (uncommitted staged,
+    # uncommitted unstaged, or untracked) and bypass the manifest check
+    # entirely — `base..HEAD` only sees committed changes. §1 row 4
+    # ("untracked file added outside scope") is specifically about this
+    # scenario. We merge `git status --porcelain` results so manifest
+    # verification covers the full attack surface.
+    #
+    # `core.quotePath=false` keeps non-ASCII filenames unquoted so the
+    # post-status text is literal repo-relative paths (no shell-escape
+    # processing needed in the parser).
+    # ``--untracked-files=all`` recursively lists every untracked FILE
+    # rather than collapsing newly-created directories into a single
+    # ``?? secrets/`` line. Row 4 detection ("untracked file outside
+    # scope") needs file-level granularity — without this flag a rogue
+    # ``secrets/key.pem`` would appear as the bare directory path,
+    # leaking the actual filename out of `violations` and frustrating
+    # forensics.
+    porcelain = _git(
+        ctx.worktree_path, "-c", "core.quotePath=false",
+        "status", "--porcelain", "--untracked-files=all",
+    ).stdout
+    working_changed: set[str] = set()
+    working_added: set[str] = set()
+    for line in porcelain.splitlines():
+        if len(line) < 4:
+            continue
+        # Porcelain v1 shape: ``XY <space> path[ -> oldpath]?``
+        x, y = line[0], line[1]
+        rest = line[3:]
+        # Renames encode as ``new -> old``; the NEW path is what matters
+        # for manifest verification (where the file ends up in the tree).
+        path = rest.split(" -> ", 1)[1] if " -> " in rest else rest
+        if not path:
+            continue
+        working_changed.add(path)
+        # Untracked (`??`), staged-add (`A_`), or rename-with-add (`R_`
+        # is conceptually delete-old+add-new — and we're already keeping
+        # only the NEW path) all produce a path that did not exist at
+        # the base commit.
+        if x == "A" or x == "R" or line[:2] == "??":
+            working_added.add(path)
+
+    # Merge committed + working-tree views; deduplicate while preserving
+    # a stable sort for downstream determinism.
+    changed_files = sorted(set(committed_changed) | working_changed)
+    newly = sorted(set(committed_added) | working_added)
+
     head = _git(ctx.worktree_path, "rev-parse", "HEAD").stdout.strip()
     if not head or len(head) < 7:
         raise ValueError(
