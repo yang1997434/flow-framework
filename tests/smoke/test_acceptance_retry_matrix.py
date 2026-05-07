@@ -42,9 +42,15 @@ class TestAcceptanceRetryMatrix(unittest.TestCase):
         # Phase 2 — timeout always blocks (e2e escalates per Y1)
         ("unit",        "cmd", 2, "timed_out", False, EvalDecision.BLOCK_ROW5),
         ("e2e",         "cmd", 2, "timed_out", True,  EvalDecision.BLOCKED_ESCALATE_ROW6),
-        # Phase 3 — behavior + e2e escalate (R2)
+        # Phase 3 — never-local types: behavior + e2e + regression escalate (R2)
         ("behavior",    "cmd", 3, "fail",      False, EvalDecision.BLOCKED_ESCALATE_ROW6),
         ("e2e",         "cmd", 3, "fail",      True,  EvalDecision.BLOCKED_ESCALATE_ROW6),
+        # Phase 3 regression — codex round-1 found this cell was unverified
+        # and the branch ordering was routing it to BLOCK_ROW5 instead of
+        # row 6. PHASE3_NEVER_LOCAL_TYPES includes regression; this cell
+        # pins the corrected ordering.
+        ("regression",  "cmd", 3, "fail",      False, EvalDecision.BLOCKED_ESCALATE_ROW6),
+        ("regression",  "cmd", 3, "timed_out", False, EvalDecision.BLOCKED_ESCALATE_ROW6),
         # Phase 3 — unit/integration block (no retry post-merge)
         ("unit",        "cmd", 3, "fail",      False, EvalDecision.BLOCK_ROW5),
         ("integration", "cmd", 3, "fail",      False, EvalDecision.BLOCK_ROW5),

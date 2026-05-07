@@ -1884,6 +1884,21 @@ class TestEvaluateCriterionPhase3(unittest.TestCase):
         self.assertEqual(d, EvalDecision.BLOCK_ROW5)
         self.assertNotEqual(d, EvalDecision.LOCAL_FIX_ALLOWED)
 
+    def test_phase3_regression_fail_escalates_row6(self):
+        """R2 + design line 134: regression in Phase 3 escalates to row 6.
+
+        Codex round-1 caught a branch-ordering bug where the regression
+        catch-all returned BLOCK_ROW5 before the Phase 3 R2 branch could
+        intercept; the constant PHASE3_NEVER_LOCAL_TYPES included
+        regression but the routing did not honor it. This test pins the
+        corrected ordering — Phase 3 R2 fires before the Phase 2
+        regression catch-all.
+        """
+        crit = self._crit(type_="regression", method="cmd")
+        result = RunResult(status="fail", exit_code=1, duration_ms=5)
+        d = self._runner().evaluate_criterion(crit, phase=3, runner_result=result)
+        self.assertEqual(d, EvalDecision.BLOCKED_ESCALATE_ROW6)
+
 
 if __name__ == "__main__":
     unittest.main()

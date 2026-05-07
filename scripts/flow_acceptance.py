@@ -482,10 +482,18 @@ class AcceptanceRunner:
         behavior       as unit (R1)                 fail/timeout→ESCALATE (R2)
         smoke          as unit (R1, plan extends)   as unit
         e2e            ESCALATE (Y1, always)        ESCALATE (always)
-        regression     fail/timeout→BLOCK_ROW5      same
+        regression     fail/timeout→BLOCK_ROW5      fail/timeout→ESCALATE (R2)
         =============  ===========================  ===========================
 
-        Routing-order rationale (C-blindspot — order matters):
+        Phase 2 regression deviates from design §3 line 134 ("always
+        escalate") — the plan matrix pins it to BLOCK_ROW5 and we follow
+        the plan; T13 owns the design alignment. Phase 3 regression
+        matches the constant ``PHASE3_NEVER_LOCAL_TYPES`` and design §3
+        line 134 + R2.
+
+        Routing-order rationale (C-blindspot — order matters; codex
+        round-1 caught the prior mis-ordering where Phase 3 regression
+        was silently masked by the regression catch-all):
           1. ``status == "pass"`` short-circuits regardless of phase/type.
           2. ``inconclusive`` short-circuits to ``INCONCLUSIVE`` (T9 will
              distinguish "tool broke" from "criterion bug").
@@ -494,8 +502,11 @@ class AcceptanceRunner:
              otherwise an e2e criterion authored as ``type=regression``
              would route wrong, and a future executor that sets
              ``escalate=True`` for non-e2e types would be ignored.
-          4. ``regression`` → BLOCK_ROW5 (§3 line 134; never local).
-          5. Phase 3 ∈ {behavior, e2e, regression} → escalate (R2).
+          4. Phase 3 ∈ {behavior, regression} → escalate (R2; e2e already
+             handled above). MUST precede the regression catch-all so
+             Phase 3 regression honors PHASE3_NEVER_LOCAL_TYPES.
+          5. Phase 2 ``regression`` → BLOCK_ROW5 (plan matrix; design
+             deviation tracked for T13).
           6. Phase 2 fail in whitelist → LOCAL_FIX_ALLOWED.
           7. Catch-all → BLOCK_ROW5 (D5 defense-in-depth: timeout for any
              non-e2e type / non-whitelisted Phase 2 fail / Phase 3 unit fail).
@@ -532,15 +543,22 @@ class AcceptanceRunner:
         ):
             return EvalDecision.BLOCKED_ESCALATE_ROW6
 
-        # 4. regression: never local — same verdict in both phases.
-        if criterion.type == "regression":
-            return EvalDecision.BLOCK_ROW5
-
-        # 5. Phase 3 R2: behavior in Phase 3 escalates (e2e already handled
-        # above; regression too). The set membership keeps the rule next to
-        # its definition for future additions.
+        # 4. Phase 3 R2: never-local types (behavior, regression — e2e
+        # already handled above) escalate post-merge. MUST precede the
+        # regression catch-all below; otherwise Phase 3 regression would
+        # be intercepted before reaching this branch and PHASE3_NEVER_LOCAL_TYPES
+        # would silently lie about regression coverage. (Codex round-1 found this
+        # C-blindspot ordering issue; pitfall claude-review-blindspots.md C-class.)
         if phase == 3 and criterion.type in PHASE3_NEVER_LOCAL_TYPES:
             return EvalDecision.BLOCKED_ESCALATE_ROW6
+
+        # 5. Phase 2 regression: never local. Plan matrix pins this to
+        # BLOCK_ROW5; design §3 line 134 reads "always escalate" without a
+        # phase qualifier, suggesting row 6 — flagged as a T13 design
+        # alignment follow-up, not corrected here. Phase 3 regression already
+        # routes to row 6 via the branch above.
+        if criterion.type == "regression":
+            return EvalDecision.BLOCK_ROW5
 
         # 6. Phase 2 R1 retry whitelist: fail (NOT timeout) for whitelisted
         # types → orchestrator may attempt local fix + retry. Timeout falls
