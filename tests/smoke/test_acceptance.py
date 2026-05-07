@@ -1899,6 +1899,23 @@ class TestEvaluateCriterionPhase3(unittest.TestCase):
         d = self._runner().evaluate_criterion(crit, phase=3, runner_result=result)
         self.assertEqual(d, EvalDecision.BLOCKED_ESCALATE_ROW6)
 
+    def test_phase3_never_local_interrupted_falls_to_catchall(self):
+        """Codex round-2 status guard: R2 only escalates fail/timeout.
+
+        ``interrupted`` (signal / orchestrator crash mid-run) means the
+        runner couldn't determine a verdict. The catch-all docstring pins
+        this to BLOCK_ROW5; without a status guard on the Phase 3 R2
+        branch, Phase 3 behavior+regression interrupted would silently
+        promote to the escalate menu.
+        """
+        for type_ in ("regression", "behavior"):
+            with self.subTest(type=type_):
+                crit = self._crit(type_=type_, method="cmd")
+                result = RunResult(status="interrupted", duration_ms=5)
+                d = self._runner().evaluate_criterion(
+                    crit, phase=3, runner_result=result)
+                self.assertEqual(d, EvalDecision.BLOCK_ROW5)
+
 
 if __name__ == "__main__":
     unittest.main()

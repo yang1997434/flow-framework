@@ -502,9 +502,11 @@ class AcceptanceRunner:
              otherwise an e2e criterion authored as ``type=regression``
              would route wrong, and a future executor that sets
              ``escalate=True`` for non-e2e types would be ignored.
-          4. Phase 3 ∈ {behavior, regression} → escalate (R2; e2e already
-             handled above). MUST precede the regression catch-all so
-             Phase 3 regression honors PHASE3_NEVER_LOCAL_TYPES.
+          4. Phase 3 ∈ {behavior, regression} with status ∈ {fail,
+             timed_out} → escalate (R2; e2e already handled above).
+             MUST precede the regression catch-all so Phase 3 regression
+             honors PHASE3_NEVER_LOCAL_TYPES. ``interrupted`` is excluded
+             so it falls to the D5 catch-all (codex round-2).
           5. Phase 2 ``regression`` → BLOCK_ROW5 (plan matrix; design
              deviation tracked for T13).
           6. Phase 2 fail in whitelist → LOCAL_FIX_ALLOWED.
@@ -549,7 +551,18 @@ class AcceptanceRunner:
         # be intercepted before reaching this branch and PHASE3_NEVER_LOCAL_TYPES
         # would silently lie about regression coverage. (Codex round-1 found this
         # C-blindspot ordering issue; pitfall claude-review-blindspots.md C-class.)
-        if phase == 3 and criterion.type in PHASE3_NEVER_LOCAL_TYPES:
+        #
+        # Status guard (codex round-2): R2 documents fail/timeout escalation
+        # only. ``interrupted`` (signal / orchestrator crash mid-run) means we
+        # don't know what happened — it falls through to the D5 catch-all so
+        # it surfaces as a regular row-5 block, matching the catch-all
+        # docstring contract. Without this guard, Phase 3 behavior+regression
+        # interrupted would silently promote to the escalate menu.
+        if (
+            phase == 3
+            and criterion.type in PHASE3_NEVER_LOCAL_TYPES
+            and status in ("fail", "timed_out")
+        ):
             return EvalDecision.BLOCKED_ESCALATE_ROW6
 
         # 5. Phase 2 regression: never local. Plan matrix pins this to
