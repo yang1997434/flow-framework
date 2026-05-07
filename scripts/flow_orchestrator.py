@@ -42,6 +42,8 @@ from flow_state_writer import (  # type: ignore
     EVENT_MERGE_STARTED,
     EVENT_MERGE_APPLIED,
     EVENT_TASK_COMPLETED,
+    EVENT_POST_MERGE_VERIFICATION_STARTED,
+    EVENT_POST_MERGE_VERIFICATION_COMPLETED,
     EVENT_POST_MERGE_VERIFY_FAILED,
     append_autonomy_event, _new_event_id,
     write_blocked, write_checkpoint,
@@ -2750,6 +2752,650 @@ class MergeRunner:
                 f"WARN: failed to write task_status marker to "
                 f"{progress_path}", file=sys.stderr,
             )
+
+
+# ----------------------------------------------------------------------
+# T15 — Gate 8 + 9a/9b transactional sub-steps (post-merge verify) +
+# MergeQueue serialization (S1 wave block) + S3 skip rule.
+#
+# Step 8 of R3 runs in an EPHEMERAL verification worktree created from
+# the integration target's post-merge SHA (§4 Y4). Acceptance criteria
+# (Phase 3) + a final regression smoke run inside that fresh checkout
+# — verifying the merge as observers will see it, not as the task
+# worktree saw it (which is now removed on PASS).
+#
+# Pitfall coverage (per .flow/pitfalls/claude-review-blindspots.md):
+#   - I/K: every subprocess goes through `_run_argv_with_pgkill` /
+#     `_run_shell_with_pgkill` — no plain `subprocess.run`, no
+#     `shell=True` shortcut, no "fixed CLI doesn't need pgkill"
+#     justification (T13 was caught EXACTLY on that).
+#   - N: verification worktree is created from the post-merge SHA
+#     directly (`git worktree add --detach <SHA>`); NEVER a ref. The
+#     path scheme uses the 7-char shortsha so two reruns at different
+#     post-merge commits produce distinct paths.
+#   - G2: verification worktree HEAD == post-merge SHA by
+#     construction. Acceptance reads the same on-disk bytes a future
+#     observer of the integration branch would see, not whatever the
+#     task worktree happened to leave behind (worktree clean
+#     guarantees from T14 cover the merge entry; G2 here covers the
+#     merge exit).
+#   - L: every JSON read uses string-equality comparison only — no
+#     substring scanning of `event` / `run_id` values.
+#   - M: `MergeQueue.can_proceed` filters by `run_id` so an unrelated
+#     run's `post_merge_verify_failed` cannot halt the current run.
+#   - 9a/9b atomicity: the rename-aside on FAIL handles a pre-
+#     existing `verify/aborted/<id>+failed/` by appending a unique
+#     timestamp suffix (overwriting would erase prior diagnostic
+#     evidence; raising would convert a recoverable observation gap
+#     into a crash mid-9b).
+# ----------------------------------------------------------------------
+
+
+@dataclass
+class Gate8Result:
+    """Return type for :meth:`Gate8VerificationRunner.verify`.
+
+    `status`:
+      - "completed": gate 8 PASS → 9a executed (BOTH worktrees cleaned
+        up, `task_completed` event emitted, `phase=post_merge`
+        checkpoint written, progress.md status → completed).
+      - "blocked_post_merge": gate 8 FAIL → 9b executed (verification
+        worktree preserved at verify/aborted/, blocked.md written,
+        merge stays intact, progress.md status → blocked_post_merge).
+    """
+    status: str
+    verification_worktree_id: Optional[str] = None
+    blocked_md_path: Optional[Path] = None
+    criteria_results: list = field(default_factory=list)
+
+
+class Gate8VerificationRunner:
+    """R3 step 8 + sub-steps 9a / 9b — post-merge verification.
+
+    See §3 gate 8 (R4) + §4 Y4 (verification worktree path/lifecycle)
+    + §1 row 18 (`blocked_post_merge` semantics: merge stays intact;
+    user choice set ``{keep_and_fix_interactive, revert_merge,
+    split_followup, abort_run}``).
+
+    The constructor accepts an optional ``notifier`` so the
+    orchestrator dispatch loop (T19 Step 19.11) can inject a single
+    Notifier shared across recovery dispatcher / dispatch / gate
+    runner / merger / gate 8. T15 itself only needs the back-compat
+    direct-write_blocked path — the Notifier branch is exercised by
+    T16+ smoke once Tier 2 lands.
+    """
+
+    def __init__(
+        self, *,
+        ctx: WorktreeContext, contract: Contract, task_dir: Path,
+        run_id: str, task_id: str, target_commit_post_merge: str,
+        notifier: Optional[object] = None,
+    ):
+        if not isinstance(target_commit_post_merge, str) or not target_commit_post_merge:
+            # F-class fail-closed: missing post-merge SHA is non-recoverable
+            # — the verification worktree path scheme depends on it.
+            raise ValueError(
+                f"target_commit_post_merge required; got "
+                f"{target_commit_post_merge!r}"
+            )
+        self.ctx = ctx
+        self.contract = contract
+        self.task_dir = task_dir
+        self.run_id = run_id
+        self.task_id = task_id
+        self.target_commit_post_merge = target_commit_post_merge
+        self.notifier = notifier
+        self.verification_id: Optional[str] = None
+
+    # ------------------------------------------------------------------
+    # Path scheme + worktree creation.
+    # ------------------------------------------------------------------
+
+    def _verification_path(self) -> Path:
+        """Path scheme per §4 Y4:
+        ``<repo_root>/.claude/worktrees/verify/<run_id>+t<idx>+<sha[:7]>/``.
+
+        Uses ``ctx.task_idx`` (the same int that drives the task
+        worktree's `t<n>` segment) so observers can correlate the
+        verification path to the task by visual inspection.
+        """
+        short = self.target_commit_post_merge[:7]
+        name = f"{self.run_id}+t{self.ctx.task_idx}+{short}"
+        return (
+            self._repo_root() / WORKTREE_ROOT / "verify" / name
+        )
+
+    def _repo_root(self) -> Path:
+        """Resolve the parent git repo from ``ctx.worktree_path``.
+
+        Same convention as :meth:`MergeRunner._derive_repo_root`: the
+        task worktree lives at
+        ``<repo_root>/.claude/worktrees/<worktree_id>/`` so the
+        repo is ``worktree_path.parents[2]``.
+        """
+        return self.ctx.worktree_path.parents[2]
+
+    def _create_verification_worktree(self) -> Path:
+        """Create the ephemeral verification worktree at
+        :meth:`_verification_path` from the post-merge SHA.
+
+        N-class hardening: ``git worktree add --detach <SHA>`` —
+        SHA-based, NEVER a ref name. Even if the integration branch
+        ref drifts mid-run, the verification worktree HEAD is pinned
+        to the SHA gate 7 actually merged.
+
+        Failure modes (typed-except per D5):
+          - ``OSError`` creating the parent directory → re-raised as
+            ``RuntimeError`` so the gate 8 entry sees a clear failure
+            (callers can route to operator review).
+          - ``git worktree add`` non-zero rc / timeout → same.
+
+        On success, sets ``self.verification_id`` and returns the
+        path. C-class: this MUST run cleanly BEFORE the
+        ``post_merge_verification_started`` event is emitted (the
+        plan template + T14 4-pre-check pattern); on failure no event
+        is emitted.
+        """
+        path = self._verification_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise RuntimeError(
+                f"failed to create verify/ parent dir for {path}: "
+                f"{type(e).__name__}: {e}"
+            ) from e
+        repo_root = self._repo_root()
+        # I/K-class: route through `_run_argv_with_pgkill`. `_git()` is a
+        # thin `subprocess.run` without timeout/pgkill — using it here
+        # would orphan a slow `git worktree add` on hook timeout. Reuse
+        # the established helper, no exception, no justification comment.
+        result = _run_argv_with_pgkill(
+            ["git", "-C", str(repo_root),
+             "worktree", "add", "--detach",
+             str(path), self.target_commit_post_merge],
+            cwd=repo_root,
+            timeout_sec=_GIT_HEAD_QUERY_TIMEOUT_SEC,
+        )
+        if result.spawn_error is not None or result.timed_out or result.returncode != 0:
+            raise RuntimeError(
+                f"git worktree add failed for verification path {path}: "
+                f"rc={result.returncode}, timed_out={result.timed_out}, "
+                f"spawn_error={result.spawn_error}, "
+                f"stderr={result.stderr[-500:]}"
+            )
+        self.verification_id = path.name
+        return path
+
+    # ------------------------------------------------------------------
+    # Public surface — verify() drives gate 8 + 9a/9b.
+    # ------------------------------------------------------------------
+
+    def verify(
+        self, *,
+        criteria: list,                 # list[AcceptanceCriterion]
+        regression_command: str,
+    ) -> Gate8Result:
+        """Run gate 8 (Phase 3 acceptance + regression smoke) inside an
+        ephemeral verification worktree. Routes to 9a (PASS) or 9b
+        (FAIL).
+
+        Per-criterion ``post_merge_skip=True`` excludes from gate 8
+        (S3 skip rule; T1 enforces the cross-field validation that
+        ``type=regression`` cannot set this flag unless
+        ``contract.post_merge_regression_optional=true``).
+
+        9-step ordering (§6 R3): the
+        ``post_merge_verification_started`` event is emitted ONLY
+        after :meth:`_create_verification_worktree` returns cleanly.
+        Failure of worktree creation propagates as ``RuntimeError``
+        WITHOUT emitting any event — observers see no started/
+        completed pair, no orphan progress entry.
+        """
+        vpath = self._create_verification_worktree()
+        # 8-1: started event (post-creation per C-class ordering).
+        append_autonomy_event(
+            self.task_dir, EVENT_POST_MERGE_VERIFICATION_STARTED,
+            {
+                "event_id": _new_event_id(),
+                "ts": _now_iso(),
+                "slug": self.ctx.slug,
+                "run_id": self.run_id,
+                "task_id": self.task_id,
+                "verification_worktree_id": self.verification_id,
+                "verification_worktree_path": str(vpath),
+                "target_commit_post_merge": self.target_commit_post_merge,
+            },
+        )
+
+        # S3 skip rule: per-criterion `post_merge_skip` excludes
+        # from gate 8 (T1's parser already rejects regression+skip
+        # cross-field unless explicitly opted in via
+        # `contract.post_merge_regression_optional=true`).
+        effective = [c for c in criteria if not getattr(c, "post_merge_skip", False)]
+
+        # Phase 3 acceptance — lazy-import keeps the dry-run path
+        # decoupled from heavier acceptance modules (matches T12/T13
+        # pattern in `GateRunner`).
+        from flow_acceptance import (  # type: ignore
+            AcceptanceRunner, EvalDecision,
+        )
+
+        runner = AcceptanceRunner(
+            worktree_root=vpath,
+            log_dir=self.task_dir / "logs" / "post_merge",
+            slug=self.ctx.slug,
+            task_id=self.task_id,
+            run_id=self.run_id,
+            worktree_id=self.verification_id,
+        )
+
+        results: list = []
+        gate_passed = True
+        for idx, crit in enumerate(effective):
+            rr = runner.run_one(
+                crit, criterion_idx=idx,
+                attempt_id=f"post_merge_{self.run_id}", retry_idx=0,
+                task_dir=self.task_dir,
+            )
+            decision = runner.evaluate_criterion(
+                crit, phase=3, runner_result=rr,
+            )
+            results.append({
+                "idx": idx,
+                "status": getattr(rr, "status", "inconclusive"),
+                "decision": decision.value,
+            })
+            if decision != EvalDecision.PASS:
+                gate_passed = False
+                break
+
+        # Final regression smoke — runs ONLY if all per-criterion
+        # checks passed. I/K-class: route through
+        # `_run_shell_with_pgkill` (T13 was caught on the exact
+        # `subprocess.run(shell=True)` shortcut here).
+        if gate_passed:
+            smoke = _run_shell_with_pgkill(
+                regression_command,
+                cwd=vpath,
+                timeout_sec=_DEFAULT_GATE_TIMEOUT_SEC,
+            )
+            if smoke.spawn_error is not None or smoke.timed_out or smoke.returncode != 0:
+                gate_passed = False
+                results.append({
+                    "regression_smoke": "fail",
+                    "returncode": smoke.returncode,
+                    "timed_out": smoke.timed_out,
+                    "spawn_error": smoke.spawn_error,
+                    "stderr_tail": smoke.stderr[-500:],
+                })
+
+        # 8-2: completed event (always — regardless of pass/fail, so
+        # the `started`/`completed` pair is honored). The 9b path
+        # later emits a separate `post_merge_verify_failed` event
+        # carrying user-choice set + blocked.md path.
+        append_autonomy_event(
+            self.task_dir, EVENT_POST_MERGE_VERIFICATION_COMPLETED,
+            {
+                "event_id": _new_event_id(),
+                "ts": _now_iso(),
+                "slug": self.ctx.slug,
+                "run_id": self.run_id,
+                "task_id": self.task_id,
+                "verification_worktree_id": self.verification_id,
+                "status": "pass" if gate_passed else "fail",
+                "criteria_results": results,
+            },
+        )
+
+        if gate_passed:
+            return self._complete_9a(results)
+        return self._fail_9b(results)
+
+    # ------------------------------------------------------------------
+    # 9a — PASS path (task_completed + checkpoint + cleanup BOTH worktrees).
+    # ------------------------------------------------------------------
+
+    def _complete_9a(self, results: list) -> Gate8Result:
+        """9a sub-steps:
+
+          9a.1: emit ``task_completed`` event with the final
+                cumulative diff hash (computed from the task worktree
+                BEFORE cleanup — once removed we can't read it back).
+          9a.2: write ``phase=post_merge`` checkpoint.
+          9a.3: progress.md status → ``completed``.
+          9a.4: cleanup task worktree (remove + branch -D).
+          9a.5: cleanup verification worktree.
+
+        Steps 9a.4/9a.5 are irreversible — only run on a TRULY clean
+        PASS (all criteria + regression smoke green). Helper choice:
+        every git invocation routes through ``_run_argv_with_pgkill``
+        (I/K-class).
+        """
+        repo_root = self._repo_root()
+
+        # 9a.1: compute cumulative final_diff_hash from the TASK
+        # worktree BEFORE cleanup. The task worktree's HEAD reflects
+        # the post-subagent state; original_base_commit anchors the
+        # diff range. Same hashing convention as T11's
+        # `derive_task_facts.diff_hash`.
+        diff_proc = _run_argv_with_pgkill(
+            ["git", "-C", str(self.ctx.worktree_path),
+             "diff", "--unified=0",
+             f"{self.ctx.original_base_commit}..HEAD"],
+            cwd=self.ctx.worktree_path,
+            timeout_sec=_GIT_HEAD_QUERY_TIMEOUT_SEC,
+        )
+        if diff_proc.spawn_error is not None or diff_proc.timed_out or diff_proc.returncode != 0:
+            # Don't crash the 9a path on a diff read — task_completed
+            # is more important than a perfect hash. Surface the gap
+            # in the event payload via a sentinel hash so audit can
+            # tell the read failed.
+            final_diff_hash = ""
+        else:
+            final_diff_hash = hashlib.sha256(
+                diff_proc.stdout.encode("utf-8"),
+            ).hexdigest()
+
+        append_autonomy_event(
+            self.task_dir, EVENT_TASK_COMPLETED,
+            {
+                "event_id": _new_event_id(),
+                "ts": _now_iso(),
+                "slug": self.ctx.slug,
+                "run_id": self.run_id,
+                "task_id": self.task_id,
+                "worktree_id": self.ctx.worktree_id,
+                "final_diff_hash": final_diff_hash,
+                "target_commit_post_merge": self.target_commit_post_merge,
+            },
+        )
+
+        # 9a.2: phase=post_merge checkpoint.
+        write_checkpoint(
+            self.task_dir, ts=_now_iso(),
+            body=(
+                f"phase: post_merge\n"
+                f"worktree_id: {self.ctx.worktree_id}\n"
+                f"final_diff_hash: {final_diff_hash}\n"
+                f"target_commit_post_merge: {self.target_commit_post_merge}\n"
+            ),
+            git_hash=self.target_commit_post_merge,
+        )
+
+        # 9a.3: progress.md status → completed (T20 owns lint/enum).
+        self._update_task_status("completed")
+
+        # 9a.4: cleanup task worktree. `check=False`-equivalent — log
+        # but don't crash if cleanup fails; the merge is already in
+        # integration target, the verification PASSED, so a stale
+        # worktree dir is cosmetic, not correctness.
+        _run_argv_with_pgkill(
+            ["git", "-C", str(repo_root),
+             "worktree", "remove", "--force",
+             str(self.ctx.worktree_path)],
+            cwd=repo_root,
+            timeout_sec=_GIT_HEAD_QUERY_TIMEOUT_SEC,
+        )
+        _run_argv_with_pgkill(
+            ["git", "-C", str(repo_root),
+             "branch", "-D", self.ctx.branch],
+            cwd=repo_root,
+            timeout_sec=_GIT_HEAD_QUERY_TIMEOUT_SEC,
+        )
+
+        # 9a.5: cleanup verification worktree.
+        _run_argv_with_pgkill(
+            ["git", "-C", str(repo_root),
+             "worktree", "remove", "--force",
+             str(self._verification_path())],
+            cwd=repo_root,
+            timeout_sec=_GIT_HEAD_QUERY_TIMEOUT_SEC,
+        )
+
+        return Gate8Result(
+            status="completed",
+            verification_worktree_id=self.verification_id,
+            criteria_results=results,
+        )
+
+    # ------------------------------------------------------------------
+    # 9b — FAIL path (post_merge_verify_failed + blocked.md + preserve).
+    # ------------------------------------------------------------------
+
+    def _fail_9b(self, results: list) -> Gate8Result:
+        """9b sub-steps:
+
+          9b.1: emit ``post_merge_verify_failed`` event.
+          9b.2: write ``blocked.md`` with §1 row 18 user-choice set
+                ``{keep_and_fix_interactive, revert_merge,
+                split_followup, abort_run}``. Routes through
+                ``Notifier`` when present; otherwise direct
+                ``write_blocked`` call (back-compat for unit tests
+                that don't construct a Notifier).
+          9b.3: progress.md status → ``blocked_post_merge``.
+          9b.4: preserve verification worktree at
+                ``verify/aborted/<id>+failed/`` for post-mortem.
+
+        Merge STAYS intact — NO auto-revert (§1 row 18). Operator
+        chooses one of the four resolution paths via blocked.md.
+        """
+        blocked_md_path = self.task_dir / "blocked.md"
+        choices = [
+            "keep_and_fix_interactive", "revert_merge",
+            "split_followup", "abort_run",
+        ]
+        # Cause/effect string: structured enough for grep, human-
+        # readable enough for blocked.md. T19's recovery dispatcher
+        # reads `block_type` (separate frontmatter field) for routing,
+        # not `why_blocked`.
+        why = (
+            f"post_merge_verify_failed: {len(results)} criteria checked"
+        )
+        resume = f"flow orchestrator --resume {self.ctx.slug}"
+
+        # 9b.1: event emission.
+        append_autonomy_event(
+            self.task_dir, EVENT_POST_MERGE_VERIFY_FAILED,
+            {
+                "event_id": _new_event_id(),
+                "ts": _now_iso(),
+                "slug": self.ctx.slug,
+                "run_id": self.run_id,
+                "task_id": self.task_id,
+                "verification_worktree_id": self.verification_id,
+                "blocked_md_path": str(blocked_md_path),
+                "user_choices": choices,
+            },
+        )
+
+        # 9b.2: blocked.md. Notifier path (T16+) wires Tier 2 (OSC 9
+        # + BEL); back-compat path writes Tier 1 only. Same pattern
+        # as `auto_dispatch_task` (T11): no defensive wrapping —
+        # Notifier exceptions surface to the caller (T19's recovery
+        # dispatcher will fail loud rather than silently producing
+        # half-written blocked.md state).
+        if self.notifier is not None:
+            self.notifier.fire_block(  # type: ignore[attr-defined]
+                block_type="post_merge_verify_failed",
+                phase=3,
+                task_id=self.task_id,
+                issue_id="post_merge_verify_failed",
+                why_blocked=why,
+                required_choice=choices,
+                safe_resume_command=resume,
+            )
+        else:
+            write_blocked(
+                self.task_dir, phase=3, task=self.task_id,
+                why_blocked=why, required_choice=choices,
+                safe_resume_command=resume,
+                block_type="post_merge_verify_failed",
+            )
+
+        # 9b.3: progress.md → blocked_post_merge (T20 enforces enum).
+        self._update_task_status("blocked_post_merge")
+
+        # 9b.4: preserve verification worktree at verify/aborted/.
+        # Atomicity note: `vpath.rename(aborted)` is atomic on the
+        # same filesystem, but fails if `aborted` already exists. A
+        # rerun after operator chose abort_run on a previous failure
+        # will hit this. We append a microsecond timestamp suffix to
+        # produce a unique target — overwriting would erase prior
+        # diagnostic state; raising would convert recoverable
+        # observation into a crash mid-9b.
+        vpath = self._verification_path()
+        aborted_root = vpath.parent / "aborted"
+        try:
+            aborted_root.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            print(
+                f"WARN: failed to create {aborted_root} "
+                f"({type(e).__name__}: {e}); verification worktree "
+                f"left in place at {vpath}",
+                file=sys.stderr,
+            )
+            return Gate8Result(
+                status="blocked_post_merge",
+                verification_worktree_id=self.verification_id,
+                blocked_md_path=blocked_md_path,
+                criteria_results=results,
+            )
+        target = aborted_root / f"{vpath.name}+failed"
+        if target.exists():
+            # Unique-suffix collision avoidance.
+            ts_suffix = datetime.datetime.now(datetime.UTC).strftime(
+                "%Y%m%dT%H%M%S%fZ",
+            )
+            target = aborted_root / f"{vpath.name}+failed+{ts_suffix}"
+        try:
+            vpath.rename(target)
+        except OSError as e:
+            print(
+                f"WARN: failed to preserve verification worktree to "
+                f"{target} ({type(e).__name__}: {e})",
+                file=sys.stderr,
+            )
+
+        return Gate8Result(
+            status="blocked_post_merge",
+            verification_worktree_id=self.verification_id,
+            blocked_md_path=blocked_md_path,
+            criteria_results=results,
+        )
+
+    # ------------------------------------------------------------------
+    # progress.md status writer — delegates to the same naïve table
+    # writer MergeRunner uses, but Gate8 owns its own Path so it can
+    # be invoked without instantiating a MergeRunner. T20 owns
+    # status-enum lint + structured-table replacement.
+    # ------------------------------------------------------------------
+
+    def _update_task_status(self, status: str) -> None:
+        progress_path = self.task_dir / "progress.md"
+        marker_prefix = f"<!-- task_status[{self.task_id}]: "
+        new_line = f"{marker_prefix}{status} -->"
+        if not progress_path.is_file():
+            try:
+                progress_path.parent.mkdir(parents=True, exist_ok=True)
+                progress_path.write_text(new_line + "\n", encoding="utf-8")
+            except OSError:
+                print(
+                    f"WARN: failed to write task_status marker to "
+                    f"{progress_path}",
+                    file=sys.stderr,
+                )
+            return
+        try:
+            text = progress_path.read_text(encoding="utf-8")
+        except OSError:
+            print(
+                f"WARN: failed to read {progress_path} for task_status "
+                f"update", file=sys.stderr,
+            )
+            return
+        lines = text.splitlines(keepends=False)
+        replaced = False
+        for i, line in enumerate(lines):
+            if line.startswith(marker_prefix):
+                lines[i] = new_line
+                replaced = True
+                break
+        if not replaced:
+            insert_idx = 0
+            for i, line in enumerate(lines):
+                if line.strip():
+                    insert_idx = i + 1
+                    break
+            lines.insert(insert_idx, new_line)
+        new_text = "\n".join(lines)
+        if not new_text.endswith("\n"):
+            new_text += "\n"
+        try:
+            progress_path.write_text(new_text, encoding="utf-8")
+        except OSError:
+            print(
+                f"WARN: failed to write task_status marker to "
+                f"{progress_path}", file=sys.stderr,
+            )
+
+
+class MergeQueue:
+    """S1 wave-block (§3 / §6 R3): while ANY task in the current run
+    has an unresolved ``post_merge_verify_failed`` event, every
+    later task MUST halt at ``pending`` (NOT enter gate 7).
+
+    Resolution is detected by T19's recovery dispatcher writing a
+    ``post_merge_resolved`` event (introduced in T19); for T15 the
+    queue checks only for the FAILED event's presence — operator
+    intervention via blocked.md is the unblocking path until T19
+    lands.
+
+    Pitfall coverage:
+      - M (cross-task pollution): filter by ``run_id``. An older /
+        unrelated run's failure cannot halt the current run.
+      - L (type vs presence): compare ``rec.get("event")`` by string
+        equality only — never substring scan / lower() / split.
+      - A (.get falsy): missing fields skip; we never silently treat
+        absent as match.
+      - D5 (typed except on JSON parse): ``json.JSONDecodeError`` is
+        caught; any other exception propagates.
+    """
+
+    def __init__(self, *, task_dir: Path, run_id: str):
+        self.task_dir = task_dir
+        self.run_id = run_id
+
+    def can_proceed(self, *, task_id: str) -> bool:
+        path = self.task_dir / "decisions.jsonl"
+        if not path.is_file():
+            return True
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            # Read failure: fail-CLOSED. We can't prove the queue is
+            # clean → halt. Better a stuck queue (visible) than a
+            # silent advance past a verify failure (invisible).
+            return False
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                # Malformed row: skip. Don't crash the queue check on
+                # one bad line; corrupted journal is T19's recovery
+                # surface.
+                continue
+            if not isinstance(rec, dict):
+                continue
+            # M-class: filter by run_id BEFORE checking event kind so
+            # an unrelated run's failure never halts us.
+            if rec.get("run_id") != self.run_id:
+                continue
+            # L-class: string-equality, no substring scan.
+            if rec.get("event") == EVENT_POST_MERGE_VERIFY_FAILED:
+                return False
+        return True
 
 
 def detect_mid_merge_crash(

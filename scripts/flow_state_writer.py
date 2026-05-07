@@ -171,10 +171,31 @@ def write_blocked(
     why_blocked: str,
     required_choice: list[str],
     safe_resume_command: str,
+    block_type: Optional[str] = None,
 ) -> Path:
-    """Write transient blocked.md. Resume protocol clears it on success."""
+    """Write transient blocked.md. Resume protocol clears it on success.
+
+    ``block_type`` is the §1 routing classifier T19's recovery
+    dispatcher reads to pick the resolver (e.g.,
+    ``manifest_violation``, ``post_merge_verify_failed``,
+    ``atomic_merge_crashed``). Optional for back-compat with v0.8.0
+    callers; T15+ writers SHOULD pass it. When present it is emitted
+    as a frontmatter line so operators can grep without parsing the
+    body. Validation of the value is the caller's responsibility —
+    here we only guard against frontmatter injection by rejecting
+    values that contain a newline (which would break out of the
+    `block_type:` line into adjacent frontmatter rows).
+    """
+    bt_line = ""
+    if block_type is not None:
+        if not isinstance(block_type, str) or "\n" in block_type:
+            raise ValueError(
+                f"block_type must be a single-line str; got {block_type!r}"
+            )
+        bt_line = f"block_type: {block_type}\n"
     body = (
         f"---\n"
+        f"{bt_line}"
         f"phase: {phase}\n"
         f"task: {task}\n"
         f"why_blocked: {why_blocked}\n"
