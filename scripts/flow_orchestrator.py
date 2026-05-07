@@ -2152,6 +2152,38 @@ def _now_iso() -> str:
     )
 
 
+def _summarize_porcelain_z(porcelain_z: str) -> str:
+    """Render a debug-readable file list from ``git status --porcelain -z
+    --untracked-files=all`` output.
+
+    H-class: porcelain ``-z`` is NUL-delimited, status-aware. Renames /
+    copies emit TWO records (status+new-path, then bare old-path); we
+    must consume the old-path record so it is not mis-classified. Reuses
+    the parsing pattern from ``derive_task_facts`` (T11 round-2 P1).
+
+    The output is bounded for use in ``block_reason`` strings — callers
+    further trim with ``[:N]``. Format: ``"XY path[, XY path]..."``.
+    """
+    records = porcelain_z.split("\x00")
+    parts: list[str] = []
+    i = 0
+    while i < len(records):
+        rec = records[i]
+        i += 1
+        if not rec or len(rec) < 4:
+            # Trailing NUL artifact / malformed; skip.
+            continue
+        xy = rec[:2]
+        path = rec[3:]
+        if not path:
+            continue
+        parts.append(f"{xy} {path}")
+        if rec[0] in ("R", "C") and i < len(records):
+            # Consume the old-path record (no status prefix).
+            i += 1
+    return ", ".join(parts)
+
+
 @dataclass
 class MergeResult:
     """Return type for :meth:`MergeRunner.merge_task`.
@@ -2333,8 +2365,130 @@ class MergeRunner:
                 ),
             )
 
-        # Step 5 — merge_started. Emitted ONLY after R9 HEAD pre-check
-        # passes; otherwise we'd write a phantom gap that
+        # Codex round-1 [P1]: Gate 7 silently dropped uncommitted /
+        # untracked content from the integration merge. T11's manifest
+        # verifier (which DOES inspect the working tree) only blocks
+        # out-of-scope writes; it does NOT require the subagent to
+        # commit. Acceptance gates run inside the worktree so they see
+        # uncommitted edits as "working". But ``git merge ctx.branch``
+        # only integrates COMMITTED commits — leaving the dirty content
+        # silently dropped while ``merge_applied`` reports success.
+        # Two pre-checks below close the bypass:
+        #   Check #1 — task worktree must be clean (no staged /
+        #              unstaged / untracked).
+        #   Check #2 — task branch HEAD must equal
+        #              facts.target_commit_pre_merge (TOCTOU defense:
+        #              another commit landing between fact derivation
+        #              and gate 7 invalidates earlier gate verdicts).
+        # Both fail-closed BEFORE merge_started — no phantom gap.
+        # (TOCTOU window between Check #2 and the merge step itself
+        # remains; v0.8.1 single-process orchestrator accepts this.)
+
+        # Check #1 — task worktree clean.
+        status = _run_argv_with_pgkill(
+            ["git", "-C", str(self.ctx.worktree_path),
+             "status", "--porcelain", "-z", "--untracked-files=all"],
+            cwd=self.ctx.worktree_path,
+            timeout_sec=_GIT_HEAD_QUERY_TIMEOUT_SEC,
+        )
+        if status.timed_out:
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason="task worktree status check timed out",
+            )
+        if status.spawn_error is not None:
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason=(
+                    f"task worktree status spawn failed: "
+                    f"{status.spawn_error}"
+                ),
+            )
+        if status.returncode != 0:
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason=(
+                    f"task worktree status check failed: "
+                    f"rc={status.returncode}: {status.stderr[-500:]}"
+                ),
+            )
+        if status.stdout != "":
+            # Parse with the porcelain -z helper (T11 lesson: NUL-delim,
+            # not space-split). Distinguish "untracked only" vs "any
+            # uncommitted" so the block_reason matches the failure mode
+            # for forensics + tests.
+            summary = _summarize_porcelain_z(status.stdout)
+            has_tracked_change = any(
+                rec and len(rec) >= 4 and rec[:2] != "??"
+                for rec in status.stdout.split("\x00")
+            )
+            if has_tracked_change:
+                preface = (
+                    "task worktree has uncommitted or untracked content; "
+                    "subagent must commit all in-scope changes before merge"
+                )
+            else:
+                preface = (
+                    "task worktree has untracked file(s); subagent must "
+                    "commit or remove them before merge"
+                )
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason=f"{preface}. Dirty entries: {summary[:500]}",
+            )
+
+        # Check #2 — task branch HEAD matches facts.target_commit_pre_merge.
+        branch_head = _run_argv_with_pgkill(
+            ["git", "-C", str(self.ctx.worktree_path),
+             "rev-parse", "HEAD"],
+            cwd=self.ctx.worktree_path,
+            timeout_sec=_GIT_HEAD_QUERY_TIMEOUT_SEC,
+        )
+        if branch_head.timed_out:
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason="task branch rev-parse HEAD timed out",
+            )
+        if branch_head.spawn_error is not None:
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason=(
+                    f"task branch rev-parse spawn failed: "
+                    f"{branch_head.spawn_error}"
+                ),
+            )
+        if branch_head.returncode != 0:
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason=(
+                    f"task branch rev-parse failed: "
+                    f"rc={branch_head.returncode}: "
+                    f"{branch_head.stderr[-500:]}"
+                ),
+            )
+        actual_head = branch_head.stdout.strip()
+        if actual_head != facts.target_commit_pre_merge:
+            return MergeResult(
+                status="blocked",
+                target_commit_pre_merge=facts.target_commit_pre_merge,
+                block_reason=(
+                    f"task branch HEAD drifted: facts recorded "
+                    f"{facts.target_commit_pre_merge[:12]} but worktree "
+                    f"HEAD is now {actual_head[:12]}; re-run gates "
+                    f"against the new HEAD"
+                ),
+            )
+
+        # Step 5 — merge_started. Emitted ONLY after R9 HEAD pre-check +
+        # Check #1 (clean worktree) + Check #2 (branch HEAD == facts)
+        # all pass; otherwise we'd write a phantom gap that
         # ``detect_mid_merge_crash`` would mistake for a real
         # mid_merge_crash (see code-review P1-1 fix).
         append_autonomy_event(

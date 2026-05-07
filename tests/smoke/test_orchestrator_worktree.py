@@ -2089,6 +2089,150 @@ class TestMergeStrategyAllowlist(unittest.TestCase):
             self.assertNotIn("merge_started", text)
 
 
+class TestMergeRefusesDirtyWorktree(unittest.TestCase):
+    """Codex round-1 [P1]: Gate 7 silently dropped uncommitted /
+    untracked content from the integration merge. Two pre-checks were
+    added to ``_continue_merge`` between the R9 HEAD assertion and
+    ``merge_started`` emission. This class pins Check #1: task worktree
+    must be clean (no staged / unstaged / untracked) before merge.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="t14-merge-dirty-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ctx, self.contract, self.task_dir = _make_merge_runner_ctx(
+            self.tmp,
+        )
+        self.head_sha = _commit_in_worktree(
+            self.ctx, "src/foo.py", "print('hi')\n",
+        )
+        self.facts = TaskFacts(
+            changed_files=["src/foo.py"], newly_added_files=["src/foo.py"],
+            diff_hash="x" * 64, target_commit_pre_merge=self.head_sha,
+        )
+
+    def _assert_no_merge_started(self) -> None:
+        events = _decisions_jsonl_events(self.task_dir)
+        self.assertNotIn("merge_started", events)
+        self.assertNotIn("merge_applied", events)
+
+    def test_refuses_when_worktree_has_unstaged_change(self) -> None:
+        """Subagent edited a tracked file but never committed → block."""
+        # Modify already-committed src/foo.py without staging.
+        (self.ctx.worktree_path / "src" / "foo.py").write_text(
+            "print('dirty')\n",
+        )
+        merger = MergeRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r", task_id="T0",
+        )
+        result = merger.merge_task(
+            facts=self.facts, merge_strategy="--ff-only",
+        )
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("uncommitted", result.block_reason.lower())
+        self.assertIn("src/foo.py", result.block_reason)
+        self._assert_no_merge_started()
+
+    def test_refuses_when_worktree_has_untracked_file(self) -> None:
+        """Subagent left an untracked .py file → block."""
+        (self.ctx.worktree_path / "leftover.py").write_text(
+            "# untracked\n",
+        )
+        merger = MergeRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r", task_id="T0",
+        )
+        result = merger.merge_task(
+            facts=self.facts, merge_strategy="--ff-only",
+        )
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("untracked", result.block_reason.lower())
+        self.assertIn("leftover.py", result.block_reason)
+        self._assert_no_merge_started()
+
+    def test_refuses_when_worktree_has_staged_change(self) -> None:
+        """Subagent staged but never committed → block."""
+        new_file = self.ctx.worktree_path / "src" / "bar.py"
+        new_file.write_text("print('staged')\n")
+        subprocess.run(
+            ["git", "-C", str(self.ctx.worktree_path), "add", "src/bar.py"],
+            check=True,
+        )
+        merger = MergeRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r", task_id="T0",
+        )
+        result = merger.merge_task(
+            facts=self.facts, merge_strategy="--ff-only",
+        )
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("uncommitted", result.block_reason.lower())
+        self.assertIn("src/bar.py", result.block_reason)
+        self._assert_no_merge_started()
+
+
+class TestMergeRefusesBranchHeadDrift(unittest.TestCase):
+    """Codex round-1 [P1] Check #2: TOCTOU defense. If subagent (or any
+    external process) commits to ``ctx.branch`` between fact derivation
+    and gate 7, ``facts.target_commit_pre_merge`` no longer reflects the
+    actual branch HEAD; earlier gate verdicts are stale and merging
+    would integrate uncovered commits. Block.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="t14-merge-drift-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.ctx, self.contract, self.task_dir = _make_merge_runner_ctx(
+            self.tmp,
+        )
+        self.head_sha = _commit_in_worktree(
+            self.ctx, "src/foo.py", "print('hi')\n",
+        )
+        self.facts = TaskFacts(
+            changed_files=["src/foo.py"], newly_added_files=["src/foo.py"],
+            diff_hash="x" * 64, target_commit_pre_merge=self.head_sha,
+        )
+
+    def test_refuses_when_branch_head_drifted_after_facts(self) -> None:
+        """Another commit lands on the branch AFTER facts → block;
+        block_reason names both old + new HEAD prefixes for forensics."""
+        # Simulate an external process landing a new commit on
+        # ctx.branch — facts.target_commit_pre_merge is now stale.
+        new_head = _commit_in_worktree(
+            self.ctx, "src/baz.py", "print('drift')\n",
+        )
+        self.assertNotEqual(new_head, self.head_sha)
+        merger = MergeRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r", task_id="T0",
+        )
+        result = merger.merge_task(
+            facts=self.facts, merge_strategy="--ff-only",
+        )
+        self.assertEqual(result.status, "blocked")
+        self.assertIn("drifted", result.block_reason.lower())
+        self.assertIn(self.head_sha[:12], result.block_reason)
+        self.assertIn(new_head[:12], result.block_reason)
+        events = _decisions_jsonl_events(self.task_dir)
+        self.assertNotIn("merge_started", events)
+
+    def test_proceeds_when_branch_head_matches_facts(self) -> None:
+        """Happy path: branch HEAD == facts.target_commit_pre_merge AND
+        worktree clean → merge proceeds."""
+        merger = MergeRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r", task_id="T0",
+        )
+        result = merger.merge_task(
+            facts=self.facts, merge_strategy="--ff-only",
+        )
+        self.assertEqual(result.status, "merged")
+        self.assertEqual(
+            result.target_commit_pre_merge, self.head_sha,
+        )
+
+
 class TestMidMergeCrashDetection(unittest.TestCase):
     """Y5 gap-by-gap state machine. Pinning T19 dispatch-side recovery
     contract — a `merge_started` without paired `merge_applied` MUST
