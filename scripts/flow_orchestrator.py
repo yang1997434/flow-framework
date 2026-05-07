@@ -45,10 +45,14 @@ from flow_state_writer import (  # type: ignore
     EVENT_POST_MERGE_VERIFICATION_STARTED,
     EVENT_POST_MERGE_VERIFICATION_COMPLETED,
     EVENT_POST_MERGE_VERIFY_FAILED,
+    EVENT_AUTO_PREPARE_INTERRUPTED,
+    AUTO_PREPARE_LOCK_FILENAME,
+    detect_auto_prepare_state,
     append_autonomy_event, _new_event_id,
     write_blocked, write_checkpoint,
     append_review_issue, ReviewIssueRecord,
 )
+from flow_notification import Notifier  # type: ignore
 
 
 # Files implicitly shared across tasks — copied from flow_wave_planner; v0.8.0
@@ -236,25 +240,12 @@ def _cmd_dry_run(slug: str) -> int:
     return 0
 
 
-def _cmd_auto_execute(slug: str) -> int:
-    # T2 R11: parse + ceiling-check the contract FIRST so a too-new schema
-    # fails closed with a precise version-mismatch message rather than the
-    # generic "v0.8.0 disabled" stub. build_plan() does the parse + ceiling
-    # enforcement and raises SystemExit on a too-new schema; if it returns
-    # we know the contract is parseable and ≤ runtime version, then we
-    # still refuse v0.8.0 dispatch with the long-standing not-yet-implemented msg.
-    # Parse + R11 ceiling check; raises SystemExit on too-new schema before we hit the v0.8.0 stub.
-    build_plan(slug)
-    print(
-        "ERROR: v0.8.0 does not support autonomous dispatch. "
-        "The schema and dry-run preview are stable; the safety stack "
-        "(worktree-per-task isolation, acceptance gate, notification, "
-        "budget enforcement) ships in v0.8.1.\n"
-        "Use `--dry-run` to preview the plan, then upgrade to v0.8.1+ "
-        "before enabling auto execution.",
-        file=sys.stderr,
-    )
-    return 2
+# T19 Step 19.11: replaced v0.8.0 exit-2 stub with the end-to-end
+# dispatch loop defined further down (after CrashRecoveryDispatcher
+# and the helper functions it depends on). The stub historically
+# returned exit 2; the new loop returns exit 0 (success / interactive
+# fallback) or exit 3 (any block). T2 R11 ceiling check is preserved
+# inside `build_plan()` which the new loop calls first.
 
 
 # ----------------------------------------------------------------------
@@ -3615,6 +3606,950 @@ def detect_mid_merge_crash(
     if EVENT_MERGE_APPLIED in kinds:
         return {"state": "merge_completed"}
     return {"state": "none"}
+
+
+# ----------------------------------------------------------------------
+# T19 — CrashRecoveryDispatcher: 5-state pre-dispatch recovery gate.
+#
+# Per design §6 + §7 + §8.1 + §4 Y4 + §1 row 18 + Q7.2.
+#
+# State table (consumed by _cmd_auto_execute Step 19.11):
+#
+#   0. clean → proceed (no boundary marker, no auto-engaged for run/task,
+#      and progress.md does not declare `autonomy_mode: auto`).
+#   1. pre_lock_crash → fail_closed_interactive — LEGAL silent fallback;
+#      only when progress.md declares `autonomy_mode: auto` but no lock,
+#      no auto_engaged event for this run/task. User never opted in to
+#      this attempt (boundary never crossed). §7 line 312.
+#   2. auto_prepare_interrupted → BLOCK (R10). T5's
+#      `detect_auto_prepare_state` returns `interrupted_dead_pid` /
+#      `interrupted_contract_changed` / `interrupted_host_mismatch` /
+#      `interrupted_lock_corrupt` / `interrupted_journal_corrupt` —
+#      all share `block_type=auto_prepare_interrupted`.
+#   3. auto_engaged_crashed → BLOCK (Q7.2 + §6/§7 contradiction-fix).
+#      auto_engaged event present, no terminal event (task_completed /
+#      post_merge_verify_failed / aborted_*) and no mid-merge case 4.
+#      NEVER silent fallback to interactive — explicit user choice
+#      required. Hard rule per §7 line 312.
+#   4. mid_merge_crash / mid_gate8_crash → BLOCK (R3). T14's
+#      `detect_mid_merge_crash` returns `mid_merge_crash` /
+#      `mid_gate8_crash` — different choice sets per design.
+#   5. verification_worktree_orphaned → BLOCK (§4 Y4 + §6 line 250).
+#      Live `verify/` worktree on disk, no matching
+#      `post_merge_verification_completed`. T15 owns lifecycle (create /
+#      cleanup-on-pass / preserve-on-fail); T19 owns ORPHAN recovery —
+#      orchestrator died WHILE gate 8 was still running.
+#
+# Pitfall coverage actively defended:
+#   K (plausible-justification): every classify branch is explicit; we
+#     never wrap detect_auto_prepare_state / detect_mid_merge_crash in
+#     try/except (let exceptions propagate to operator review).
+#   G/G2 (disk-state authoritative): each state reads decisions.jsonl
+#     fresh on every classify(); no in-memory cache.
+#   D5 (typed except): jsonl parse uses `except json.JSONDecodeError
+#     continue` — never broad except.
+#   N (disk-vs-ref identity): mid-merge case uses
+#     `target_commit_pre_merge` SHA (not branch ref); verify orphan case
+#     keys off `verification_worktree_path` (string path, not ref).
+#   F (fail-closed for safety): state 2/3/4/5 ALL block. Only state 1 is
+#     a legal silent fallback (user never opted in this attempt).
+#   R (frontmatter injection): all user-controlled strings reach
+#     blocked.md only via Notifier.fire_block, which delegates to
+#     write_blocked's _reject_frontmatter_line_separators validator.
+# ----------------------------------------------------------------------
+
+
+@dataclass
+class RecoveryVerdict:
+    """Verdict from CrashRecoveryDispatcher.classify(). Caller branches
+    on `action`; `state` and `block_type` are operator-facing labels.
+    """
+    state: str
+    action: str                                        # proceed | fail_closed_interactive | block
+    block_type: Optional[str] = None
+    choices: list = field(default_factory=list)
+    blocked_md_path: Optional[Path] = None
+    details: dict = field(default_factory=dict)
+
+
+# Terminal event kinds for state-3 (post-auto_engaged crash) detection.
+# `aborted_*` lives in the `decision` field (v0.8.0 DecisionRecord
+# convention), not the `event` field — checked separately.
+TERMINAL_TASK_EVENTS: tuple[str, ...] = (
+    EVENT_TASK_COMPLETED,
+    EVENT_POST_MERGE_VERIFY_FAILED,
+)
+
+
+class CrashRecoveryDispatcher:
+    """5-state pre-dispatch recovery classifier.
+
+    Single entry point at orchestrator startup: ``classify()`` returns a
+    ``RecoveryVerdict`` the caller (``_cmd_auto_execute``) consumes to
+    halt-vs-proceed. All blocked verdicts have already written
+    blocked.md (via the injected ``notifier``); the caller only needs
+    to print the path and exit 3.
+
+    Constructor inputs are all keyword-only — positional arg confusion
+    has caused real recovery bugs in prior iterations (K-class trap:
+    "I'll just trust the param order").
+    """
+
+    def __init__(
+        self,
+        *,
+        task_dir: Path,
+        slug: str,
+        run_id: str,
+        task_id: str,
+        current_contract_hash: str,
+        repo_root: Path,
+        notifier: Optional[object] = None,
+    ):
+        self.task_dir = task_dir
+        self.slug = slug
+        self.run_id = run_id
+        self.task_id = task_id
+        self.current_contract_hash = current_contract_hash
+        self.repo_root = repo_root
+        self.notifier = notifier
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def classify(self) -> RecoveryVerdict:
+        """Single classify pass. Order matters — see the state table in
+        the module-level T19 docstring. Detection is fail-loud: any
+        unexpected exception from T5 / T14 detectors propagates so
+        operator review surfaces (K-class: NEVER wrap in try/except just
+        because the call site looks scary).
+        """
+        # ── State 2: lock+dead-pid (T5 boundary marker) ────────────────
+        # detect_auto_prepare_state may raise (e.g. unknown OSError from
+        # _is_pid_alive). We let that propagate per K-class: silent
+        # swallow would mis-classify a real interrupted run as `no_run`.
+        lock_state = detect_auto_prepare_state(
+            self.task_dir,
+            run_id=self.run_id,
+            task_id=self.task_id,
+            current_contract_hash=self.current_contract_hash,
+        )
+        ls = lock_state.get("state")
+        # All `interrupted_*` synthetic states share block_type=
+        # `auto_prepare_interrupted` per T5 design. Route them all here.
+        if ls in (
+            "interrupted_dead_pid",
+            "interrupted_contract_changed",
+            "interrupted_host_mismatch",
+            "interrupted_lock_corrupt",
+            "interrupted_journal_corrupt",
+        ):
+            return self._block_auto_prepare_interrupted(lock_state)
+
+        # ── State 4: mid-merge / mid-gate-8 crash (T14 detector) ────────
+        merge_state = detect_mid_merge_crash(
+            self.task_dir, run_id=self.run_id, task_id=self.task_id,
+        )
+        ms = merge_state.get("state")
+        if ms == "mid_merge_crash":
+            return self._block_mid_merge_crash(merge_state)
+        if ms == "mid_gate8_crash":
+            # mid_gate8 may ALSO be a verify-worktree orphan if the
+            # verify worktree is still live on disk — check that first
+            # so the more specific case wins.
+            orphan = self._classify_verification_orphan()
+            if orphan is not None:
+                return orphan
+            return self._block_mid_gate8_crash(merge_state)
+
+        # ── State 5: verification-worktree orphan (Y4) ─────────────────
+        # Independent check — meaningful AFTER merge_applied event but
+        # the underlying detector (worktree-on-disk + missing-completed)
+        # is correct in any state.
+        orphan = self._classify_verification_orphan()
+        if orphan is not None:
+            return orphan
+
+        # ── State 3: post-auto_engaged crash ───────────────────────────
+        # auto_engaged event present for run/task with no terminal
+        # event AND no mid-merge case caught above.
+        if self._has_post_auto_engaged_crash():
+            return self._block_post_auto_engaged_crash()
+
+        # ── State 1: pre-lock crash (legal silent fallback) ─────────────
+        # progress.md declares autonomy_mode=auto but no boundary marker
+        # was ever written. User never opted in to THIS attempt.
+        if ls == "no_run" and self._was_auto_intended():
+            return RecoveryVerdict(
+                state="pre_lock_crash",
+                action="fail_closed_interactive",
+                details={
+                    "reason": (
+                        "no auto run boundary written; user never "
+                        "opted in this attempt"
+                    ),
+                },
+            )
+
+        # ── State 0: clean → proceed ───────────────────────────────────
+        return RecoveryVerdict(state="clean", action="proceed")
+
+    # ------------------------------------------------------------------
+    # State 1 helper — progress.md autonomy_mode read.
+    # ------------------------------------------------------------------
+
+    def _was_auto_intended(self) -> bool:
+        """Read progress.md frontmatter ``autonomy_mode``. Returns True
+        only on explicit ``autonomy_mode: auto``. Missing file / parse
+        failure → False (fail-closed: do NOT silently classify a
+        recoverable state as state 1 just because the pointer file is
+        broken — let state 0 / clean handle it).
+        """
+        progress_path = self.task_dir / "progress.md"
+        if not progress_path.is_file():
+            return False
+        try:
+            meta = read_progress_meta(progress_path)
+        except Exception:
+            # K-class boundary: read_progress_meta is documented as
+            # fail-soft (returns default ProgressMeta on parse error),
+            # but if it ever raises (corrupt file, IO error), DO NOT
+            # silently treat as "auto intended" — that would route to
+            # state 1 fail-closed-interactive, which is itself silent.
+            # Return False → state 0 clean → proceed; the orchestrator
+            # boundary marker write (T5) will subsequently fail with a
+            # clearer error.
+            return False
+        return meta.autonomy_mode == "auto"
+
+    # ------------------------------------------------------------------
+    # State 2 helper — auto_prepare_interrupted block.
+    # ------------------------------------------------------------------
+
+    def _block_auto_prepare_interrupted(
+        self, lock_state: dict,
+    ) -> RecoveryVerdict:
+        """R10 + Y8 partner: write blocked.md (block_type=
+        auto_prepare_interrupted) + emit
+        ``EVENT_AUTO_PREPARE_INTERRUPTED`` so audit trail records the
+        recovery decision.
+        """
+        choices = [
+            "resume_auto_from_prepare",
+            "abort_task",
+            "switch_to_interactive",
+        ]
+        # R-class defense: lock_state values come from disk JSON and
+        # could in theory carry frontmatter-injection chars. The state
+        # name itself is from a fixed allowlist (we route by string
+        # equality earlier), but we still sanitize the why_blocked
+        # composition by passing the state name through isinstance(str).
+        ls_label = lock_state.get("state")
+        if not isinstance(ls_label, str):
+            ls_label = "unknown"
+        why = (
+            f"auto preparation interrupted ({ls_label}); "
+            f"manual recovery required"
+        )
+        resume = f"flow orchestrator --resume-auto-prepare {self.slug}"
+        blocked_md_path = self.task_dir / "blocked.md"
+        if self.notifier is not None:
+            blocked_md_path = self.notifier.fire_block(  # type: ignore[attr-defined]
+                block_type="auto_prepare_interrupted",
+                phase=2,
+                task_id=self.task_id,
+                issue_id="auto_prepare_interrupted",
+                why_blocked=why,
+                required_choice=choices,
+                safe_resume_command=resume,
+            )
+        else:
+            blocked_md_path = write_blocked(
+                self.task_dir,
+                phase=2,
+                task=self.task_id,
+                why_blocked=why,
+                required_choice=choices,
+                safe_resume_command=resume,
+                block_type="auto_prepare_interrupted",
+            )
+        # Y8 audit event. lock_path may be missing on synthetic states
+        # like interrupted_journal_corrupt (no lock at all). Fall back
+        # to the conventional path so the event still validates.
+        lock_path = lock_state.get("lock_path") or str(
+            self.task_dir / AUTO_PREPARE_LOCK_FILENAME,
+        )
+        append_autonomy_event(
+            self.task_dir,
+            EVENT_AUTO_PREPARE_INTERRUPTED,
+            {
+                "event_id": _new_event_id(),
+                "ts": _now_iso(),
+                "slug": self.slug,
+                "run_id": self.run_id,
+                "task_id": self.task_id,
+                "lock_path": lock_path,
+                "blocked_md_path": str(blocked_md_path),
+            },
+        )
+        return RecoveryVerdict(
+            state="auto_prepare_interrupted",
+            action="block",
+            block_type="auto_prepare_interrupted",
+            choices=choices,
+            blocked_md_path=blocked_md_path,
+            details={"lock_state": ls_label},
+        )
+
+    # ------------------------------------------------------------------
+    # State 3 helpers — post-auto_engaged crash detection + block.
+    # ------------------------------------------------------------------
+
+    def _scan_decisions_jsonl(self) -> list:
+        """Read + filter `decisions.jsonl` for records matching this
+        run/task. D5 typed except: ONLY json.JSONDecodeError on parse
+        skip; OSError on read missing file is handled by is_file()
+        guard above; any other exception propagates.
+        """
+        records: list = []
+        path = self.task_dir / "decisions.jsonl"
+        if not path.is_file():
+            return records
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                # D5: skip malformed lines for state-3 / orphan checks.
+                # T5 has its own `interrupted_journal_corrupt` path that
+                # routes BEFORE we get here; here a malformed line is a
+                # forensic artifact, not a recovery signal.
+                continue
+            if not isinstance(rec, dict):
+                continue
+            if (
+                rec.get("run_id") == self.run_id
+                and rec.get("task_id") == self.task_id
+            ):
+                records.append(rec)
+        return records
+
+    def _has_post_auto_engaged_crash(self) -> bool:
+        """auto_engaged event present + no terminal event for this
+        (run, task). Terminal kinds: TASK_COMPLETED /
+        POST_MERGE_VERIFY_FAILED / aborted_* (decision field).
+        """
+        records = self._scan_decisions_jsonl()
+        # Build the `event` set explicitly with isinstance check (L-class:
+        # never assume the value is a string just because v0.8.0 producers
+        # always wrote one).
+        event_kinds: set = set()
+        decisions: list = []
+        for rec in records:
+            ev = rec.get("event")
+            if isinstance(ev, str):
+                event_kinds.add(ev)
+            dec = rec.get("decision")
+            if isinstance(dec, str):
+                decisions.append(dec)
+        if EVENT_AUTO_ENGAGED not in event_kinds:
+            return False
+        for terminal in TERMINAL_TASK_EVENTS:
+            if terminal in event_kinds:
+                return False
+        # aborted_* lives in the v0.8.0 `decision` field, not `event`.
+        if any(d.startswith("aborted_") for d in decisions):
+            return False
+        return True
+
+    def _block_post_auto_engaged_crash(self) -> RecoveryVerdict:
+        """Q7.2 + §6/§7 contradiction-fix: BLOCK + user choice. NEVER
+        silent fallback to interactive. Hard rule per §7 line 312.
+        """
+        choices = [
+            "resume_from_last_safe_state",
+            "abort_task",
+            "switch_to_interactive",
+        ]
+        why = (
+            "auto run interrupted post-engagement; "
+            "explicit user choice required"
+        )
+        resume = f"flow orchestrator --resume {self.slug}"
+        blocked_md_path = self.task_dir / "blocked.md"
+        if self.notifier is not None:
+            blocked_md_path = self.notifier.fire_block(  # type: ignore[attr-defined]
+                block_type="auto_engaged_crashed",
+                phase=2,
+                task_id=self.task_id,
+                issue_id="auto_engaged_crashed",
+                why_blocked=why,
+                required_choice=choices,
+                safe_resume_command=resume,
+            )
+        else:
+            blocked_md_path = write_blocked(
+                self.task_dir,
+                phase=2,
+                task=self.task_id,
+                why_blocked=why,
+                required_choice=choices,
+                safe_resume_command=resume,
+                block_type="auto_engaged_crashed",
+            )
+        return RecoveryVerdict(
+            state="auto_engaged_crashed",
+            action="block",
+            block_type="auto_engaged_crashed",
+            choices=choices,
+            blocked_md_path=blocked_md_path,
+        )
+
+    # ------------------------------------------------------------------
+    # State 4 helpers — mid-merge + mid-gate8 block.
+    # ------------------------------------------------------------------
+
+    def _block_mid_merge_crash(self, merge_state: dict) -> RecoveryVerdict:
+        choices = list(merge_state.get("choices") or [])
+        why = (
+            "git merge transaction crashed between "
+            "merge_started and merge_applied"
+        )
+        resume = f"flow orchestrator --resume {self.slug}"
+        blocked_md_path = self.task_dir / "blocked.md"
+        if self.notifier is not None:
+            blocked_md_path = self.notifier.fire_block(  # type: ignore[attr-defined]
+                block_type="atomic_merge_crashed",
+                phase=2,
+                task_id=self.task_id,
+                issue_id="atomic_merge_crashed",
+                why_blocked=why,
+                required_choice=choices,
+                safe_resume_command=resume,
+            )
+        else:
+            blocked_md_path = write_blocked(
+                self.task_dir,
+                phase=2,
+                task=self.task_id,
+                why_blocked=why,
+                required_choice=choices,
+                safe_resume_command=resume,
+                block_type="atomic_merge_crashed",
+            )
+        return RecoveryVerdict(
+            state="mid_merge_crash",
+            action="block",
+            block_type="atomic_merge_crashed",
+            choices=choices,
+            blocked_md_path=blocked_md_path,
+        )
+
+    def _block_mid_gate8_crash(self, merge_state: dict) -> RecoveryVerdict:
+        choices = list(merge_state.get("choices") or [
+            "rerun_post_merge_verify",
+            "abort_and_revert_partial",
+            "switch_to_interactive",
+        ])
+        why = (
+            "post-merge verification was running when orchestrator "
+            "crashed; user must choose rerun / revert / interactive"
+        )
+        resume = f"flow orchestrator --resume {self.slug}"
+        blocked_md_path = self.task_dir / "blocked.md"
+        if self.notifier is not None:
+            blocked_md_path = self.notifier.fire_block(  # type: ignore[attr-defined]
+                block_type="post_merge_verify_in_progress_crash",
+                phase=3,
+                task_id=self.task_id,
+                issue_id="post_merge_verify_in_progress_crash",
+                why_blocked=why,
+                required_choice=choices,
+                safe_resume_command=resume,
+            )
+        else:
+            blocked_md_path = write_blocked(
+                self.task_dir,
+                phase=3,
+                task=self.task_id,
+                why_blocked=why,
+                required_choice=choices,
+                safe_resume_command=resume,
+                block_type="post_merge_verify_in_progress_crash",
+            )
+        return RecoveryVerdict(
+            state="mid_gate8_crash",
+            action="block",
+            block_type="post_merge_verify_in_progress_crash",
+            choices=choices,
+            blocked_md_path=blocked_md_path,
+        )
+
+    # ------------------------------------------------------------------
+    # State 5 helper — verification-worktree orphan.
+    # ------------------------------------------------------------------
+
+    def _classify_verification_orphan(self) -> Optional[RecoveryVerdict]:
+        """§4 Y4 + §6 line 250: live verify worktree path + no matching
+        post_merge_verification_completed event for this (run, task).
+        Returns RecoveryVerdict on orphan, None when no orphan is
+        detected (state 5 didn't fire).
+
+        Orchestrator pid liveness is already covered by state 2 (T5's
+        lock-based check). Here we trust that if we got past state 2
+        without a lock, the orchestrator that emitted the
+        post_merge_verification_started event is dead — otherwise it
+        would be holding the lock or have written the completed event.
+        """
+        records = self._scan_decisions_jsonl()
+        started: list = []
+        completed: list = []
+        for rec in records:
+            ev = rec.get("event")
+            if ev == EVENT_POST_MERGE_VERIFICATION_STARTED:
+                started.append(rec)
+            elif ev == EVENT_POST_MERGE_VERIFICATION_COMPLETED:
+                completed.append(rec)
+        if not started or completed:
+            # Either never started for this (run, task), or properly
+            # completed — not an orphan.
+            return None
+
+        # Latest started event is the operative one; older starteds are
+        # superseded if they happen to exist (they shouldn't on a clean
+        # 9-step sequence, but the scan is forensic-minded).
+        latest = started[-1]
+        path_str = latest.get("verification_worktree_path")
+        if not isinstance(path_str, str) or not path_str:
+            # Malformed event — no path to check. Return None (don't
+            # silently mis-classify as orphan); the corrupt event will
+            # surface elsewhere.
+            return None
+        verify_path = Path(path_str)
+        if not verify_path.is_dir():
+            # Worktree already cleaned up — not an orphan.
+            return None
+
+        # Live worktree on disk + no completion event → orphan.
+        choices = [
+            "rerun_post_merge_verify",
+            "accept_merge_anyway",
+            "revert_merge",
+            "switch_to_interactive",
+        ]
+        # R-class defense: verify_path is read from disk JSON and could
+        # carry control chars; pass via isinstance(str) check above and
+        # let write_blocked's _reject_frontmatter_line_separators do
+        # final sanitization (it runs on block_type, not the why_blocked
+        # body — the body is escaped inline). Truncate to a reasonable
+        # length for blocked.md readability.
+        short_path = path_str if len(path_str) <= 200 else (
+            path_str[:200] + "…"
+        )
+        why = (
+            f"verification worktree {short_path} alive but no "
+            f"post_merge_verification_completed event for "
+            f"run={self.run_id} task={self.task_id}"
+        )
+        resume = f"flow orchestrator --resume {self.slug}"
+        blocked_md_path = self.task_dir / "blocked.md"
+        if self.notifier is not None:
+            blocked_md_path = self.notifier.fire_block(  # type: ignore[attr-defined]
+                block_type="verification_worktree_orphaned",
+                phase=3,
+                task_id=self.task_id,
+                issue_id="verification_worktree_orphaned",
+                why_blocked=why,
+                required_choice=choices,
+                safe_resume_command=resume,
+            )
+        else:
+            blocked_md_path = write_blocked(
+                self.task_dir,
+                phase=3,
+                task=self.task_id,
+                why_blocked=why,
+                required_choice=choices,
+                safe_resume_command=resume,
+                block_type="verification_worktree_orphaned",
+            )
+        return RecoveryVerdict(
+            state="verification_worktree_orphaned",
+            action="block",
+            block_type="verification_worktree_orphaned",
+            choices=choices,
+            blocked_md_path=blocked_md_path,
+            details={"verification_worktree_path": path_str},
+        )
+
+
+# ----------------------------------------------------------------------
+# T19 — _cmd_auto_execute end-to-end dispatch loop helpers.
+#
+# Per Step 19.11 design: replaces v0.8.0 exit-2 stub with the full
+# loop (recovery → dispatch → gates 1-6 → merge → gate 8). Single
+# Notifier created at entry threaded through every component.
+# ----------------------------------------------------------------------
+
+
+def _resolve_gate_commands(contract: Contract) -> dict:
+    """Source baseline / smoke / codex / merge_strategy commands.
+
+    Honors a forward-compat ``gates`` dict on the contract raw (added
+    in v0.8.2 per PRD §3 Future); falls back to v0.8.0 repo-convention
+    defaults. v0.8.1 schema validator silently accepts the field as
+    forward-compat — see flow_contract.parse_contract `unknown_fields`.
+    """
+    raw = getattr(contract, "_raw_gates", None) or {}
+    return {
+        "baseline": raw.get("baseline_command", "bash tests/smoke/run.sh"),
+        "smoke": raw.get("smoke_command", "bash tests/smoke/run.sh"),
+        "codex": raw.get("codex_command", "codex review --diff-only --json"),
+        "merge_strategy": raw.get("merge_strategy", "--ff-only"),
+    }
+
+
+def _resolve_integration_target(contract: Contract) -> str:
+    """Forward-compat field. v0.8.1 default = "master". v0.8.2 may
+    promote to required-validated; the schema validator silently
+    accepts the field today.
+    """
+    return getattr(contract, "integration_target", None) or "master"
+
+
+def _resolve_or_create_run_id(task_dir: Path) -> str:
+    """Resolve the current auto-run id from `decisions.jsonl` or mint
+    a fresh one. The run boundary writer (T6) appends a `run_started`
+    decision when an auto run begins; until that lands we MUST mint
+    locally so the dispatch loop has a stable id to thread through
+    every component's keyword args.
+
+    Strategy: scan `decisions.jsonl` for the most-recent record with a
+    `run_id` field. If present, reuse; else mint `auto-<utc-iso-z>`
+    (collision-resistant for a single-orchestrator-per-task contract).
+    """
+    path = task_dir / "decisions.jsonl"
+    if path.is_file():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        for raw_line in reversed(text.splitlines()):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(rec, dict):
+                continue
+            rid = rec.get("run_id")
+            if isinstance(rid, str) and rid:
+                return rid
+    # Mint fresh: ISO ts + a small uuid suffix so two orchestrators on
+    # the same machine that start in the same second don't collide.
+    ts = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
+    return f"auto-{ts}-{_new_event_id()[:6]}"
+
+
+def _load_prior_baseline(task_dir: Path, task_id: str) -> Optional[BaselineRecord]:
+    """Read any prior `BaselineRecord` from `acceptance-progress.jsonl`
+    (T4 writer). Returns None if no prior record exists for this task —
+    F-class fail-closed treats that as "any current failure is newly
+    broken" per gate 1's design.
+
+    v0.8.1: BaselineRecord is just a `failing: list[str]` carrier. We
+    materialize it from the most recent record whose `task_id` matches
+    and whose record-kind is `baseline`. If the schema lacks `task_id`
+    or `kind`, we conservatively return None.
+    """
+    path = task_dir / "acceptance-progress.jsonl"
+    if not path.is_file():
+        return None
+    failing: Optional[list] = None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for raw_line in reversed(text.splitlines()):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if (
+            rec.get("task_id") == task_id
+            and rec.get("kind") == "baseline"
+        ):
+            f = rec.get("failing")
+            if isinstance(f, list):
+                failing = list(f)
+                break
+    if failing is None:
+        return None
+    return BaselineRecord(failing=failing)
+
+
+def _invoke_subagent_dispatch(ctx: WorktreeContext, **kw) -> None:
+    """Subagent dispatch shim. T22 owns the SKILL implementation that
+    actually invokes Claude CLI via the configured capability.
+
+    T19 defines the import boundary so the dispatch loop is testable
+    with a fake_dispatch fixture. Production callable resolved lazily
+    from `claude/capabilities/defaults.json::autonomy_orchestrator`.
+
+    K-class trap defended: ImportError MUST raise RuntimeError with a
+    clear pointer (NOT silently no-op). Silent no-op would let the
+    dispatch loop reach `derive_task_facts` immediately after worktree
+    creation, see an empty diff, and route every task to a phantom
+    pass — invisible in CI until production. Loud RuntimeError is the
+    correct fail-closed posture.
+    """
+    from importlib import import_module
+    try:
+        mod = import_module("flow_subagent_dispatch")  # T22 module
+    except ImportError as e:
+        raise RuntimeError(
+            "subagent dispatch capability not wired — set "
+            "FLOW_SUBAGENT_DISPATCH_CMD env var or implement "
+            "scripts/flow_subagent_dispatch.py via T22 SKILL"
+        ) from e
+    mod.invoke(ctx, **kw)
+
+
+def _cmd_auto_execute(slug: str) -> int:
+    """T19 Step 19.11 — end-to-end dispatch loop. Replaces v0.8.0 exit-2
+    stub. Per manifest:
+
+      1. CrashRecoveryDispatcher.classify() (recovery gate; T19)
+      2. auto_dispatch_task() (T10/T11) → DispatchOutcome{ctx, facts}
+      3. GateRunner.run_phase2() — gates 1→3→4→5→6 (T12+T13)
+      4. MergeRunner.merge_task() — gate 7 + R3 steps 1-7 (T14)
+      5. Gate8VerificationRunner.verify() — gate 8 + 9a/9b (T15)
+      6. MergeQueue.can_proceed() — S1 wave block (T15)
+
+    Exit codes:
+      0 = all manifests merged + verified, OR contract missing →
+          interactive fallback, OR pre-lock recovery → fail-closed
+          interactive (legal silent — user never opted in this attempt).
+      3 = block raised at any phase (recovery / dispatch / gate 1-6 /
+          merge / gate 8 / wave halt). Distinct from exit 4 (S5
+          nested-autonomy aborted_nested) and exit 2 (v0.8.0 stub —
+          no longer reachable on auto-execute path).
+
+    Staleness gate (T20) is OUT-OF-LOOP for v0.8.1 — operator runs
+    `flow doctor <slug>` manually before invoking --auto-execute.
+    v0.8.2 promotes to gate-0 in the dispatch loop.
+
+    AFK / Budget / retry budget all DEFERRED to v0.8.2 per route-A
+    re-scope. T17/T18/in-loop-staleness/T20-routing all v0.8.2.
+    """
+    # Parse + R11 ceiling check via build_plan; raises SystemExit on
+    # too-new schema before we touch the dispatch loop.
+    plan = build_plan(slug)
+    if plan.contract is None:
+        # v0.8.0 fallback: contract missing/invalid → interactive.
+        # Print to stderr so the test fixture can grep for the reason.
+        print(
+            f"INFO: {plan.fallback_reason} — running interactive instead.",
+            file=sys.stderr,
+        )
+        return 0
+
+    task_dir = _resolve_slug_dir(slug)
+    # task_dir = .flow/tasks/<slug>  →  parents[2] = repo root
+    repo_root = task_dir.parents[2]
+    contract_path = task_dir / "contract.json"
+    contract_hash = hashlib.sha256(contract_path.read_bytes()).hexdigest()
+    run_id = _resolve_or_create_run_id(task_dir)
+    gate_cmds = _resolve_gate_commands(plan.contract)
+    integration_target = _resolve_integration_target(plan.contract)
+    criteria = list(plan.contract.acceptance_criteria or [])
+    notifier = Notifier(
+        contract=plan.contract, slug=slug, task_dir=task_dir,
+    )
+
+    for task_idx, manifest in enumerate(plan.manifests):
+        task_id = manifest.id
+
+        # ── Recovery gate (T19) ────────────────────────────────────────
+        dispatcher = CrashRecoveryDispatcher(
+            task_dir=task_dir,
+            slug=slug,
+            run_id=run_id,
+            task_id=task_id,
+            current_contract_hash=contract_hash,
+            repo_root=repo_root,
+            notifier=notifier,
+        )
+        v = dispatcher.classify()
+        if v.action == "block":
+            print(
+                f"BLOCKED: {v.block_type} → see {v.blocked_md_path}",
+                file=sys.stderr,
+            )
+            return 3
+        if v.action == "fail_closed_interactive":
+            # Pre-lock crash: user never opted in to this attempt.
+            # Distinct from post-auto_engaged crash (which MUST block).
+            reason = v.details.get("reason") if v.details else ""
+            print(
+                f"WARN: {reason} — interactive fallback",
+                file=sys.stderr,
+            )
+            return 0
+        # v.action == "proceed"
+
+        # ── T10 / T11: dispatch subagent + verify manifest ─────────────
+        outcome = auto_dispatch_task(
+            slug=slug,
+            task_idx=task_idx,
+            repo_root=repo_root,
+            dispatch_fn=_invoke_subagent_dispatch,  # T22 SKILL impl
+            contract=plan.contract,
+            manifest=manifest,
+            run_id=run_id,
+            contract_path=contract_path,
+            contract_hash=contract_hash,
+            integration_target=integration_target,
+            notifier=notifier,
+        )
+        if outcome.status == "blocked":
+            print(
+                f"BLOCKED: {outcome.block_type} → see "
+                f"{outcome.blocked_md_path}",
+                file=sys.stderr,
+            )
+            return 3
+        ctx, facts = outcome.ctx, outcome.facts
+
+        # ── T20 staleness — DEFERRED v0.8.2 ─────────────────────────────
+        # Codex round-4 R4: staleness gate position should be BEFORE
+        # auto_dispatch_task (else worktree+auto_engaged+subagent run
+        # against stale state). v0.8.1 punts to out-of-band check via
+        # `flow doctor <slug>`; user runs manually before invoking
+        # --auto-execute. v0.8.2 adds StalenessChecker.check_all here.
+
+        # ── T12 + T13: Phase 2 gates 1→3→4→5→6 ─────────────────────────
+        gate_runner = GateRunner(
+            ctx=ctx,
+            contract=plan.contract,
+            task_dir=task_dir,
+            run_id=run_id,
+            task_id=task_id,
+            prior_baseline=_load_prior_baseline(task_dir, task_id),
+        )
+        attempt_id = f"{run_id}+{task_id}"
+        verdict = gate_runner.run_phase2(
+            manifest=manifest,
+            facts=facts,
+            criteria=criteria,
+            attempt_id=attempt_id,
+            retry_idx=0,
+            baseline_command=gate_cmds["baseline"],
+            codex_command=gate_cmds["codex"],
+            smoke_command=gate_cmds["smoke"],
+        )
+        if verdict.status != "pass":
+            # GateRunner methods do NOT write blocked.md themselves.
+            # Fire block here using the halted-gate context. Retry loop
+            # is OUT OF SCOPE for v0.8.1 (T17/T18 v0.8.2 deferred).
+            gr = verdict.gate_result
+            details = (gr.details if gr is not None else None) or {}
+            issue_id = details.get("issue_id", verdict.halted_at_gate or "phase2_halted")
+            block_row = details.get("block_row", "?")
+            why = (
+                f"phase 2 halted at {verdict.halted_at_gate}: "
+                f"block_row={block_row}"
+            )
+            notifier.fire_block(
+                block_type=verdict.halted_at_gate or "phase2_halted",
+                phase=2,
+                task_id=task_id,
+                issue_id=str(issue_id),
+                why_blocked=why,
+                required_choice=["abort_task", "switch_to_interactive"],
+                safe_resume_command=f"flow orchestrator --resume {slug}",
+            )
+            return 3
+
+        # ── T14: gate 7 atomic merge (R3 9-step sequence steps 1-7) ─────
+        merger = MergeRunner(
+            ctx=ctx,
+            contract=plan.contract,
+            task_dir=task_dir,
+            run_id=run_id,
+            task_id=task_id,
+        )
+        mr = merger.merge_task(
+            facts=facts, merge_strategy=gate_cmds["merge_strategy"],
+        )
+        if mr.status != "merged":
+            # MergeRunner returns blocked status on git-merge fail (clean
+            # return; mid-merge crash is caught by state 4 on next
+            # startup). Here the merge failed but didn't crash.
+            notifier.fire_block(
+                block_type="atomic_merge_failed",
+                phase=2,
+                task_id=task_id,
+                issue_id="atomic_merge_failed",
+                why_blocked=mr.block_reason or "git merge failed",
+                required_choice=[
+                    "replay_merge_from_diff_hash",
+                    "abort_and_revert_partial",
+                    "switch_to_interactive",
+                ],
+                safe_resume_command=f"flow orchestrator --resume {slug}",
+            )
+            return 3
+
+        # ── T15: gate 8 post-merge verify (9a PASS / 9b FAIL) ───────────
+        gate8 = Gate8VerificationRunner(
+            ctx=ctx,
+            contract=plan.contract,
+            task_dir=task_dir,
+            run_id=run_id,
+            task_id=task_id,
+            target_commit_post_merge=mr.target_commit_post_merge,
+            notifier=notifier,
+        )
+        g8 = gate8.verify(
+            criteria=criteria,
+            regression_command=gate_cmds["smoke"],
+        )
+        if g8.status != "completed":
+            # 9b path already wrote blocked.md via the injected notifier.
+            print(
+                f"BLOCKED: post_merge_verify_failed → see "
+                f"{g8.blocked_md_path}",
+                file=sys.stderr,
+            )
+            return 3
+
+        # ── T15 S1: serialization gate before next task ─────────────────
+        if not MergeQueue(
+            task_dir=task_dir, run_id=run_id,
+        ).can_proceed(task_id=task_id):
+            # Earlier task in this run is unresolved blocked_post_merge.
+            # MergeQueue is the wave-level halt; the originating block
+            # was already emitted, no notifier fire here.
+            print(
+                f"WAVE_HALTED: prior task in run {run_id} is "
+                f"unresolved blocked_post_merge",
+                file=sys.stderr,
+            )
+            return 3
+
+    # All manifests merged + verified.
+    return 0
 
 
 def main(argv: Optional[list[str]] = None) -> int:

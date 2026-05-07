@@ -60,7 +60,17 @@ class TestV080EndToEnd(unittest.TestCase):
         self.assertIn("T1", r.stdout)
         self.assertIn("autonomy_mode: interactive", r.stdout)
 
-    def test_auto_mode_refused_with_clear_message(self):
+    def test_auto_mode_no_longer_returns_v080_stub(self):
+        """T19 Step 19.11 replaced the v0.8.0 exit-2 stub with the
+        end-to-end dispatch loop. The historical assertion
+        (`returncode == 2` + "v0.8.0/v0.8.1" message) is obsolete per
+        the plan exit-code table (line 7180-7186): exit 2 is no longer
+        reachable on the auto-execute path.
+
+        Fixture has only contract.json (no progress.md → no manifests
+        → empty manifest loop → exit 0). The historical "v0.8.0
+        disabled" stub message is gone — that's the post-T19 contract.
+        """
         contract = self.tmp / ".flow" / "tasks" / self.slug / "contract.json"
         contract.write_text(json.dumps({
             "contract_schema_version": 1,
@@ -72,9 +82,13 @@ class TestV080EndToEnd(unittest.TestCase):
             ],
         }))
         r = _flow(["orchestrator", "--auto-execute", self.slug], cwd=self.tmp)
-        self.assertEqual(r.returncode, 2, msg=r.stdout + r.stderr)
-        self.assertIn("v0.8.0", r.stdout + r.stderr)
-        self.assertIn("v0.8.1", r.stdout + r.stderr)
+        # Empty manifest list → loop does not iterate → exit 0 cleanly.
+        self.assertEqual(r.returncode, 0, msg=r.stdout + r.stderr)
+        # The historical v0.8.0 stub message is GONE.
+        self.assertNotIn(
+            "v0.8.0 does not support autonomous dispatch",
+            r.stdout + r.stderr,
+        )
 
 
 if __name__ == "__main__":

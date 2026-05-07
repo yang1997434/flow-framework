@@ -53,7 +53,22 @@ class TestOrchestratorDryRun(unittest.TestCase):
         self.assertIn("T2", result.stdout)
         self.assertIn("manifest", result.stdout.lower())
 
-    def test_dryrun_refuses_auto_dispatch(self):
+    def test_auto_dispatch_pre_lock_crash_falls_back_interactive(self):
+        """T19 Step 19.11 replaced the v0.8.0 exit-2 stub with the
+        end-to-end dispatch loop. The historical assertion
+        (`returncode == 2` + "v0.8.0 disabled" message) is obsolete
+        per the plan exit-code table (line 7180-7186): exit 2 is no
+        longer reachable on the auto-execute path.
+
+        Fixture state (autonomy_mode=auto in progress.md, no lock,
+        no auto_engaged event for this run/task) is exactly state 1
+        in T19's CrashRecoveryDispatcher: the user never opted in
+        to THIS attempt (no boundary marker was ever written), so
+        the dispatcher returns `fail_closed_interactive` and the
+        orchestrator exits 0 with a stderr WARN. This is the LEGAL
+        silent fallback per §7 line 312 (state 1 is the only state
+        permitted to silently degrade to interactive).
+        """
         _setup_task(self.tmp, "demo", {
             "contract_schema_version": 1,
             "autonomy_mode": "auto",
@@ -63,11 +78,20 @@ class TestOrchestratorDryRun(unittest.TestCase):
                 {"description": "u", "type": "unit", "command": "true"},
             ],
         }, "tasks:\n  - id: T1\n    writes: ['src/a.py']\n")
-        result = _run_flow(["orchestrator", "--auto-execute", "demo"], cwd=self.tmp)
-        self.assertNotEqual(result.returncode, 0)
+        result = _run_flow(
+            ["orchestrator", "--auto-execute", "demo"], cwd=self.tmp,
+        )
+        # State 1 returns exit 0 (legal silent fallback to
+        # interactive — user never opted in).
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        # The historical v0.8.0 stub message is GONE.
         msg = result.stdout + result.stderr
-        self.assertIn("v0.8.0", msg)
-        self.assertIn("dispatch", msg.lower())
+        self.assertNotIn(
+            "ERROR: v0.8.0 does not support autonomous dispatch", msg,
+        )
+        # The new fallback path emits a stderr WARN for operator
+        # visibility (different from silent — operators can grep).
+        self.assertIn("interactive fallback", result.stderr)
 
     def test_dryrun_missing_contract_falls_back_to_interactive(self):
         slug = "demo"
