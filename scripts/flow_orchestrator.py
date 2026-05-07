@@ -4868,15 +4868,31 @@ def _cmd_auto_execute(slug: str) -> int:
 # resume path) bypass the guard.
 AUTONOMY_PARENT_PID_ENV = "FLOW_AUTONOMY_PARENT_PID"
 
+# [P3 stderr parity] codex round-1: use the SAME generic stderr message
+# for both slug-exists and slug-missing paths. Earlier versions printed
+# distinct messages (one named the slug as "not found", the other named
+# the decisions.jsonl path) — that lets an adversary enumerate slugs via
+# stderr text even though the exit code (4) is parity. The detail
+# (parent_pid, slug, task_dir) belongs in the decisions.jsonl audit trail
+# when the slug resolves; operators read that journal, not stderr.
+NESTED_ABORT_STDERR = (
+    "ERROR: aborted_nested - orchestrator was invoked from a subagent "
+    "context. Nested autonomy is forbidden (see safety stack plan, "
+    "section 1 row 16)."
+)
+
 
 def _guard_against_nested_autonomy(slug: str) -> Optional[int]:
     """Return exit code 4 when the env var indicates a nested attempt;
     return ``None`` to let the top-level orchestrator proceed.
 
     Side effects on guard fire:
+      * stderr always prints the same generic ``NESTED_ABORT_STDERR``
+        message (no slug / parent_pid leak).
       * Decision record `aborted_nested` appended to
-        ``decisions.jsonl`` (when the slug exists).
-      * stderr message names the env var so operators can diagnose.
+        ``decisions.jsonl`` when the slug resolves; ``parent_pid`` is
+        ``repr()``-escaped before interpolation (R-class
+        defense-in-depth: control chars become readable ``\\n``/``\\r``).
 
     The slug-not-found branch is intentionally treated as "still abort
     with 4" rather than "report missing slug" — see plan 7670-7677.
@@ -4886,23 +4902,29 @@ def _guard_against_nested_autonomy(slug: str) -> Optional[int]:
     parent_pid = os.environ.get(AUTONOMY_PARENT_PID_ENV)
     if not parent_pid:
         return None
+
+    # [P3 stderr parity] Generic message first; identical for both
+    # branches below. parent_pid + slug context live in decisions.jsonl
+    # when task_dir resolves.
+    print(NESTED_ABORT_STDERR, file=sys.stderr)
+
     try:
         task_dir = _resolve_slug_dir(slug)
     except SystemExit:
         # Slug-not-found: still abort (no info leak). No task_dir to
-        # write a decision into; stderr remains the only signal.
-        print(
-            f"ERROR: nested autonomy attempt detected "
-            f"({AUTONOMY_PARENT_PID_ENV}={parent_pid}); "
-            f"slug {slug!r} not found. "
-            f"Aborted (aborted_nested, exit 4).",
-            file=sys.stderr,
-        )
+        # write a decision into. stderr already printed above; we
+        # deliberately emit nothing more here to keep parity with the
+        # slug-exists path.
         return 4
-    # R-class: parent_pid is user-controlled; we journal it via the
-    # DecisionRecord helper, which goes through `append_jsonl_locked`
-    # (json.dumps, not raw concat) — newlines/control chars survive
-    # as escaped JSON, no frontmatter injection vector.
+    # [P3 R-class] parent_pid comes from an env var (user-controlled);
+    # repr() converts \n, \r, \t, ANSI ESC, OSC, BEL etc. into readable
+    # backslash escapes. Strip the surrounding quotes so the reason
+    # field reads naturally. json.dumps inside append_jsonl_locked is
+    # the primary defense for the JSONL file format; this is
+    # defense-in-depth on input so any *future* downstream consumer that
+    # renders ``reason`` directly (terminal, HTML diff, log tail) is
+    # also safe.
+    parent_pid_safe = repr(parent_pid)[1:-1]
     append_decision(task_dir, DecisionRecord(
         id=f"aborted-nested-{_new_event_id()}",
         ts=_now_iso(),
@@ -4911,25 +4933,27 @@ def _guard_against_nested_autonomy(slug: str) -> Optional[int]:
         decision="aborted_nested",
         reason=(
             f"--auto-execute called with "
-            f"{AUTONOMY_PARENT_PID_ENV}={parent_pid}; "
+            f"{AUTONOMY_PARENT_PID_ENV}={parent_pid_safe}; "
             f"nested autonomy is forbidden (§1 row 16)"
         ),
     ))
-    print(
-        f"ERROR: aborted_nested — orchestrator was invoked from a "
-        f"subagent context ({AUTONOMY_PARENT_PID_ENV}={parent_pid}). "
-        f"Nested autonomy is forbidden; see §1 row 16. "
-        f"Decision logged to {task_dir / 'decisions.jsonl'}.",
-        file=sys.stderr,
-    )
     return 4
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="flow orchestrator")
-    parser.add_argument("--dry-run", metavar="SLUG", help="Print plan + manifest")
-    parser.add_argument("--auto-execute", metavar="SLUG",
-                        help="(disabled in v0.8.0) attempt autonomous run")
+    # [P2] codex round-1: --dry-run and --auto-execute are mutually
+    # exclusive. T21 changed the routing order in main() so that
+    # `args.auto_execute` is checked BEFORE `args.dry_run` (the guard
+    # has to run on the auto-execute path), which silently turned
+    # `flow orchestrator --dry-run demo --auto-execute demo` into an
+    # auto-execute call. argparse now raises SystemExit(2) with a
+    # helpful "not allowed with" message when both flags are supplied.
+    grp = parser.add_mutually_exclusive_group()
+    grp.add_argument("--dry-run", metavar="SLUG",
+                     help="Print plan + manifest")
+    grp.add_argument("--auto-execute", metavar="SLUG",
+                     help="(disabled in v0.8.0) attempt autonomous run")
     args = parser.parse_args(argv)
 
     if args.auto_execute:

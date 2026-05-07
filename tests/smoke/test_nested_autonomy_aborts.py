@@ -115,8 +115,10 @@ class TestNestedAutonomySubprocess(unittest.TestCase):
             msg=f"stdout={r.stdout!r} stderr={r.stderr!r}",
         )
         self.assertIn("aborted_nested", r.stderr.lower())
-        # The env var name must surface so operators can diagnose.
-        self.assertIn(AUTONOMY_PARENT_PID_ENV, r.stderr)
+        # codex round-1 [P3 stderr parity]: env var name MUST NOT
+        # appear on stderr (slug-existence enumeration risk). It does
+        # appear in decisions.jsonl reason — see assertion below.
+        self.assertNotIn(AUTONOMY_PARENT_PID_ENV, r.stderr)
         # Decision record landed on disk.
         dec_path = task_dir / "decisions.jsonl"
         self.assertTrue(dec_path.is_file(), msg=r.stderr)
@@ -134,8 +136,11 @@ class TestNestedAutonomySubprocess(unittest.TestCase):
         rec = nested[0]
         self.assertEqual(rec["task"], "demo")
         self.assertEqual(rec["phase"], 2)
-        # parent_pid surfaces in `reason` for forensic recovery.
+        # parent_pid surfaces in `reason` (audit trail) for forensic
+        # recovery. Numeric PID survives repr() unchanged.
         self.assertIn(str(os.getpid()), rec["reason"])
+        # Env var name remains in reason so operators can grep.
+        self.assertIn(AUTONOMY_PARENT_PID_ENV, rec["reason"])
 
     def test_env_var_set_with_missing_slug_still_aborts_exit_4(self):
         """Security-positive default (plan 7670-7677): even when the
@@ -154,10 +159,12 @@ class TestNestedAutonomySubprocess(unittest.TestCase):
             r.returncode, 4,
             msg=f"stdout={r.stdout!r} stderr={r.stderr!r}",
         )
-        # The env var name surfaces; the absent slug is named in the
-        # error but no decisions.jsonl is created (no task_dir to
-        # write into).
-        self.assertIn(AUTONOMY_PARENT_PID_ENV, r.stderr)
+        # codex round-1 [P3 stderr parity]: stderr MUST NOT name the
+        # slug or env var; it's the same generic message as the
+        # slug-exists path so an attacker can't enumerate slugs.
+        self.assertNotIn(AUTONOMY_PARENT_PID_ENV, r.stderr)
+        self.assertNotIn("no-such-slug", r.stderr)
+        self.assertIn("aborted_nested", r.stderr.lower())
         self.assertIn("nested autonomy", r.stderr.lower())
 
     def test_no_env_var_proceeds_to_interactive_fallback(self):
@@ -268,6 +275,142 @@ class TestAutoDispatchPropagatesParentPid(unittest.TestCase):
         # Sanity: env is a copy, not the live os.environ — orchestrator
         # never mutates parent process state.
         self.assertIsNot(env, os.environ)
+
+
+class TestCodexRound1Fixes(unittest.TestCase):
+    """codex round-1 fix-pass:
+
+    [P2] argparse mutually-exclusive `--dry-run` / `--auto-execute`.
+    [P3 stderr parity] guard fires same generic message regardless of
+        slug existence; cross-checked here that the two paths produce
+        byte-identical stderr.
+    [P3 R-class] parent_pid env var with control chars / ANSI escapes
+        is repr()-escaped before reaching decisions.jsonl reason; a raw
+        terminal-injection payload never lands on the audit trail.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(
+            lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True),
+        )
+
+    def test_main_rejects_dry_run_and_auto_execute_combo(self):
+        """argparse must SystemExit(2) when both --dry-run and
+        --auto-execute are supplied. Was: T21 main() routed
+        args.auto_execute first, so the dry-run flag was silently
+        discarded — extremely surprising at best, security-relevant at
+        worst (operator believed they were dry-running).
+
+        We use a real subprocess so we exercise the *installed* CLI
+        path the user would hit, not an in-process parse.
+        """
+        # Slug not even needed — argparse rejects before guard runs.
+        env = os.environ.copy()
+        env.pop(AUTONOMY_PARENT_PID_ENV, None)
+        r = _run_flow(
+            ["orchestrator", "--dry-run", "demo", "--auto-execute", "demo"],
+            cwd=self.tmp, env=env,
+        )
+        self.assertEqual(
+            r.returncode, 2,
+            msg=f"expected argparse SystemExit(2); "
+                f"stdout={r.stdout!r} stderr={r.stderr!r}",
+        )
+        # argparse's standard mutually-exclusive error contains
+        # "not allowed with" — we pin it so a reword (e.g. someone
+        # silently broadening the group) is caught.
+        self.assertIn("not allowed with", r.stderr)
+
+    def test_stderr_byte_identical_for_slug_exists_and_missing(self):
+        """[P3 stderr parity] After the fix, the two guard branches
+        print exactly the same stderr. We assert byte-identity, not
+        just "no slug name leak", because any future divergence (even
+        a path glob, a timestamp, a quoted slug) is by itself an
+        enumeration oracle.
+        """
+        # Path A: slug exists.
+        _setup_minimal_slug(self.tmp, "demo")
+        env = os.environ.copy()
+        env[AUTONOMY_PARENT_PID_ENV] = str(os.getpid())
+        r_exists = _run_flow(
+            ["orchestrator", "--auto-execute", "demo"],
+            cwd=self.tmp, env=env,
+        )
+        # Path B: slug missing — fresh tmp avoids interaction with
+        # the demo slug created above.
+        tmp_missing = Path(tempfile.mkdtemp())
+        self.addCleanup(
+            lambda: __import__("shutil").rmtree(
+                tmp_missing, ignore_errors=True,
+            ),
+        )
+        r_missing = _run_flow(
+            ["orchestrator", "--auto-execute", "demo"],
+            cwd=tmp_missing, env=env,
+        )
+        self.assertEqual(r_exists.returncode, 4)
+        self.assertEqual(r_missing.returncode, 4)
+        self.assertEqual(
+            r_exists.stderr, r_missing.stderr,
+            msg=f"stderr divergence — slug enumeration oracle.\n"
+                f"exists  ={r_exists.stderr!r}\n"
+                f"missing ={r_missing.stderr!r}",
+        )
+        # Sanity: stderr does not contain anything slug-derived.
+        self.assertNotIn("demo", r_exists.stderr)
+        self.assertNotIn("decisions.jsonl", r_exists.stderr)
+
+    def test_parent_pid_with_control_chars_does_not_inject(self):
+        """[P3 R-class] parent_pid is user-controlled (any process can
+        set the env var). A value like ``"123\\n\\x1b]0;HACKED"``
+        would, if interpolated raw into a terminal-rendered string,
+        rewrite the operator's window title via the OSC 9/0 sequence.
+
+        We assert the persisted reason field contains repr()-style
+        escapes (``\\n``, ``\\x1b``) and NO raw control bytes. The
+        JSONL file is read as text via ``read_text()`` to mirror what
+        a downstream consumer would see.
+        """
+        task_dir = _setup_minimal_slug(self.tmp, "demo")
+        env = os.environ.copy()
+        # Newline + ESC (OSC start) + closing chars. If un-escaped, a
+        # terminal would interpret the OSC sequence.
+        env[AUTONOMY_PARENT_PID_ENV] = "123\n\x1b]0;HACKED\x07"
+        r = _run_flow(
+            ["orchestrator", "--auto-execute", "demo"],
+            cwd=self.tmp, env=env,
+        )
+        self.assertEqual(
+            r.returncode, 4,
+            msg=f"stdout={r.stdout!r} stderr={r.stderr!r}",
+        )
+        # stderr is the generic message — no parent_pid leak at all.
+        self.assertNotIn("HACKED", r.stderr)
+        self.assertNotIn("\x1b]0", r.stderr)
+        # Audit trail: reason must contain *escaped* form, never raw
+        # bytes. repr() emits ``\\n`` for newline and ``\\x1b`` for
+        # ESC, both as ASCII.
+        dec_path = task_dir / "decisions.jsonl"
+        self.assertTrue(dec_path.is_file(), msg=r.stderr)
+        records = [
+            json.loads(ln) for ln in
+            dec_path.read_text().splitlines() if ln.strip()
+        ]
+        nested = [
+            rec for rec in records
+            if rec.get("decision") == "aborted_nested"
+        ]
+        self.assertEqual(len(nested), 1, msg=f"records={records}")
+        reason = nested[0]["reason"]
+        # No raw control characters survived to the reason field.
+        self.assertNotIn("\n", reason.split("=", 1)[-1].split(";", 1)[0])
+        self.assertNotIn("\x1b", reason)
+        self.assertNotIn("\x07", reason)
+        # Escaped forms ARE present (verifies repr() ran, not just a
+        # silent strip).
+        self.assertIn("\\n", reason)
+        self.assertIn("\\x1b", reason)
 
 
 if __name__ == "__main__":
