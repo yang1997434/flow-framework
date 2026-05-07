@@ -20,6 +20,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -47,7 +48,10 @@ from flow_state_writer import (  # type: ignore
     EVENT_POST_MERGE_VERIFY_FAILED,
     EVENT_AUTO_PREPARE_INTERRUPTED,
     AUTO_PREPARE_LOCK_FILENAME,
+    AutoPrepareLock,
     detect_auto_prepare_state,
+    write_auto_prepare_lock,
+    consume_auto_prepare_lock,
     append_autonomy_event, _new_event_id,
     write_blocked, write_checkpoint,
     append_review_issue, ReviewIssueRecord,
@@ -752,6 +756,50 @@ def auto_dispatch_task(
             f"got {type(manifest).__name__}"
         )
     task_dir = repo_root / ".flow" / "tasks" / slug
+    # ── [P2 codex round-1] T5 §8.1 lock wire-up ───────────────────────
+    # Production path was missing this; state-2 (R10) recovery was
+    # therefore unreachable in real runs (only fixture tests could
+    # synthesize the lock). Contract per T5 design §8.1:
+    #
+    #   1. write_auto_prepare_lock BEFORE worktree creation, so a crash
+    #      between here and the auto_engaged event is recoverable via
+    #      detect_auto_prepare_state → interrupted_dead_pid.
+    #   2. consume_auto_prepare_lock AFTER auto_engaged is durably
+    #      appended to decisions.jsonl — past this point state-3
+    #      (auto_engaged_crashed) is the operative recovery class.
+    #
+    # K-class (no try/except swallow): a lock-write failure must
+    # propagate. If the disk is wedged enough that we can't write the
+    # lock, we MUST NOT proceed to create a worktree — that would leave
+    # an orphan worktree with no recovery boundary marker on disk. The
+    # whole point of T5 §8.1 is the lock is the durable boundary.
+    #
+    # P-class scope: the lock dataclass intentionally pins (run_id,
+    # task_id, contract_hash) so the next run's detect_auto_prepare_state
+    # can compare and either consume (matched) or block (mismatched).
+    now_ts = _now_iso()
+    lock = AutoPrepareLock(
+        lock_version=1,
+        slug=slug,
+        run_id=run_id,
+        task_id=manifest.id,
+        contract_path=str(contract_path),
+        contract_hash=contract_hash,
+        contract_schema_version=contract.contract_schema_version,
+        created_at=now_ts,
+        pid=os.getpid(),
+        host=socket.gethostname(),
+        cwd=str(task_dir),
+        target_branch=integration_target,
+        intended_first_task_dispatch_at=now_ts,
+    )
+    write_auto_prepare_lock(task_dir, lock)
+    # NOTE: any exception between here and consume_auto_prepare_lock
+    # below MUST propagate without unlinking the lock. The next run's
+    # CrashRecoveryDispatcher will see the orphaned lock + dead pid and
+    # route to state 2 (auto_prepare_interrupted). DO NOT add a
+    # try/except that calls consume_auto_prepare_lock on failure.
+
     ctx = create_task_worktree(
         repo_root=repo_root,
         slug=slug,
@@ -780,6 +828,15 @@ def auto_dispatch_task(
             "contract_hash": contract_hash,
             "contract_schema_version": contract.contract_schema_version,
         },
+    )
+    # [P2] Boundary marker durable on disk; consume the lock so state-3
+    # (post-auto_engaged crash) is the operative recovery path beyond
+    # this point. consume_auto_prepare_lock is os.replace + Y8 event;
+    # K-class: errors propagate so we never leave an inconsistent
+    # boundary (would manifest as orphan_lock_post_engaged on next run,
+    # which is recoverable but warrants a loud failure here).
+    consume_auto_prepare_lock(
+        task_dir, slug=slug, run_id=run_id, task_id=manifest.id,
     )
     # Subagent boundary — opaque. Return value INTENTIONALLY discarded
     # (PRD §1.2: subagent narrative is advisory, never structured data).
@@ -3760,7 +3817,23 @@ class CrashRecoveryDispatcher:
         # through to subsequent state checks is correct: orphan-lock
         # alone does not determine recovery action.
         if ls == "orphan_lock_post_engaged":
-            self._consume_stale_lock(lock_state)
+            consume = self._consume_stale_lock(lock_state)
+            if not consume.get("consumed"):
+                # [P2] codex round-1: failed to remove the stale lock
+                # (PermissionError / read-only fs / etc.). Fail-closed
+                # to state-2 block instead of silently proceeding —
+                # otherwise the lock survives indefinitely, every
+                # subsequent run silently re-warns + falls through, and
+                # any genuine pid/contract/host drift would never be
+                # caught (the orphan branch always wins over real
+                # interrupted_* in detect_auto_prepare_state).
+                synthetic = dict(lock_state)
+                synthetic["state"] = "interrupted_dead_pid"
+                synthetic["consume_failure_reason"] = consume.get("reason")
+                synthetic["consume_failure_exception_type"] = (
+                    consume.get("exception_type")
+                )
+                return self._block_auto_prepare_interrupted(synthetic)
             # fall through — state 4/5/3/1/0 detection still runs.
 
         # ── State 4: mid-merge / mid-gate-8 crash (T14 detector) ────────
@@ -3843,25 +3916,28 @@ class CrashRecoveryDispatcher:
     # orphan_lock_post_engaged helper — T5 §8.1 "consume + warning".
     # ------------------------------------------------------------------
 
-    def _consume_stale_lock(self, lock_state: dict) -> None:
-        """T19 round 1 [Y2]: implement T5 §8.1 consume_with_warning
-        contract. Unlink the stale lock + emit a stderr WARN. Failure
-        to unlink does NOT block (T5 contract: warning state, not safety
-        boundary; state-2 ``interrupted_*`` paths still own the real
-        block. If unlink truly fails — permission denied etc. — the next
-        run will see the same orphan_lock_post_engaged state again and
-        re-attempt; if it ever escalates to interrupted_* on a real
-        anomaly, state 2 catches it).
+    def _consume_stale_lock(self, lock_state: dict) -> dict:
+        """T19 round 1 [Y2] + codex round-1 [P2]: T5 §8.1
+        consume_with_warning contract, fail-closed on non-race unlink
+        failure.
 
-        ``lock_state`` is the dict returned by ``detect_auto_prepare_state``;
-        we read ``lock_path`` from it but fall back to the conventional
-        path (consistent with ``_block_auto_prepare_interrupted``'s same
-        Y8 fallback) so a missing key cannot mask a real lock on disk.
+        Returns ``{"consumed": True, ...}`` on success or race-safe
+        FileNotFoundError; returns
+        ``{"consumed": False, "reason": str, "exception_type": str}``
+        on any other ``OSError`` (PermissionError / IsADirectoryError /
+        read-only fs / etc.). Caller MUST handle ``consumed=False`` by
+        escalating to a state-2 block — silently proceeding with a
+        stale lock still on disk is the F-class silent-pass that codex
+        round-1 flagged: a stale lock that we can't remove is
+        indistinguishable from a real interrupted run from the next
+        attempt's perspective, so the safe posture is to block visibly
+        rather than ship an invisible pass.
 
         K-class safety: only ``FileNotFoundError`` (race-safe) and
-        ``OSError`` are caught. Broader except would mask real bugs
-        (D5 reverse: silent except defeats fail-loud propagation that
-        the rest of the dispatcher depends on).
+        ``OSError`` (catchable failure) are matched. Broader except
+        would mask real bugs (D5 reverse: silent except defeats
+        fail-loud propagation that the rest of the dispatcher depends
+        on).
         """
         # Prefer disk-derived path for forensic accuracy; fall back to
         # the conventional location so `lock_path is None` (e.g. exotic
@@ -3874,21 +3950,18 @@ class CrashRecoveryDispatcher:
         try:
             lock_path.unlink()
         except FileNotFoundError:
-            # Race-safe: another process already cleaned up. Still emit
-            # the warning so operators know we hit the synthetic state.
-            pass
+            # Race-safe: another process already cleaned up. Treat as
+            # consumed so caller proceeds (the boundary marker is gone
+            # from disk regardless of who removed it).
+            return {"consumed": True, "note": "lock already gone"}
         except OSError as e:
-            # Permission denied / read-only fs / etc. Don't block — T5
-            # contract says this is a warning state. Next run will
-            # re-trigger and either succeed or, on a real anomaly,
-            # escalate to interrupted_* via state 2.
-            print(
-                f"WARN: could not consume orphan auto_prepare.lock at "
-                f"{lock_path}: {e}; T5 §8.1 contract — proceeding without "
-                f"block (next run will retry)",
-                file=sys.stderr,
-            )
-            return
+            # [P2] codex round-1: do NOT silently print + proceed.
+            # Caller will fail-closed to state-2 block.
+            return {
+                "consumed": False,
+                "reason": str(e),
+                "exception_type": type(e).__name__,
+            }
         print(
             f"WARN: consumed orphan auto_prepare.lock from prior run "
             f"(slug={self.slug}, task={self.task_id}); T5 §8.1 contract "
@@ -3896,6 +3969,7 @@ class CrashRecoveryDispatcher:
             f"unlocking; recovery proceeds.",
             file=sys.stderr,
         )
+        return {"consumed": True}
 
     # ------------------------------------------------------------------
     # State 2 helper — auto_prepare_interrupted block.
@@ -4180,22 +4254,46 @@ class CrashRecoveryDispatcher:
         """
         records = self._scan_decisions_jsonl()
         started: list = []
-        completed: list = []
+        completed_ids: set = set()
         for rec in records:
             ev = rec.get("event")
             if ev == EVENT_POST_MERGE_VERIFICATION_STARTED:
                 started.append(rec)
             elif ev == EVENT_POST_MERGE_VERIFICATION_COMPLETED:
-                completed.append(rec)
-        if not started or completed:
-            # Either never started for this (run, task), or properly
-            # completed — not an orphan.
+                # [P2 codex round-1] Pair completed events to their
+                # started event by `verification_worktree_id`. Previous
+                # logic used `not started or completed:` which masked
+                # an orphaned LATER verify pass whenever ANY earlier
+                # verify pass had completed in the same journal. That
+                # made retry / re-verify scenarios silently bypass
+                # state 5.
+                #
+                # L-class type-check: only accept str ids before set
+                # membership; a non-string id can't be paired and is
+                # treated as malformed (the started event with a
+                # malformed id will return None via the path check
+                # below, which is the conservative outcome — never
+                # silently mis-classify as orphan).
+                wid = rec.get("verification_worktree_id")
+                if isinstance(wid, str) and wid:
+                    completed_ids.add(wid)
+        if not started:
+            # Never started for this (run, task) — not an orphan.
             return None
 
         # Latest started event is the operative one; older starteds are
         # superseded if they happen to exist (they shouldn't on a clean
         # 9-step sequence, but the scan is forensic-minded).
         latest = started[-1]
+        latest_id = latest.get("verification_worktree_id")
+        if not isinstance(latest_id, str) or not latest_id:
+            # Malformed event — no id to pair. Conservative: return
+            # None (don't mis-classify as orphan); corrupt event will
+            # surface elsewhere.
+            return None
+        if latest_id in completed_ids:
+            # Latest started has matching completed → not orphaned.
+            return None
         path_str = latest.get("verification_worktree_path")
         if not isinstance(path_str, str) or not path_str:
             # Malformed event — no path to check. Return None (don't
@@ -4296,6 +4394,73 @@ def _resolve_integration_target(contract: Contract) -> str:
     accepts the field today.
     """
     return getattr(contract, "integration_target", None) or "master"
+
+
+def _task_already_completed(
+    task_dir: Path, *, run_id: str, task_id: str,
+) -> bool:
+    """[P1] T19 codex round-1: scan ``decisions.jsonl`` for a terminal
+    ``task_completed`` event matching this ``(run_id, task_id)`` pair.
+
+    Why: ``_resolve_or_create_run_id`` reuses the most-recent run_id from
+    decisions.jsonl, which is correct — we don't want to mint a fresh
+    run_id every time the operator pokes ``--auto-execute``. But
+    ``CrashRecoveryDispatcher.classify`` only routes CRASH states; a
+    journal that already contains a clean
+    ``auto_engaged + merge_applied + post_merge_verification_completed
+    + task_completed`` sequence is not a crash, so classify returns
+    ``clean / proceed``. Without this skip, the manifest loop then
+    re-dispatches the already-merged task — re-creating the worktree,
+    re-running the subagent, re-merging.
+
+    Scope (P-class): filter strictly by ``(run_id, task_id)`` BEFORE
+    matching the event field. A task_completed event for a different
+    run or a different task in the same journal MUST NOT mark this
+    pair as completed.
+
+    Type-check (L-class): isinstance(str) on ``event`` field before
+    equality, mirroring the dispatcher's defensive read pattern.
+
+    Failure semantics (D5): only ``json.JSONDecodeError`` is caught
+    on per-line parse; other exceptions propagate. Missing journal
+    file → return False (fail-open here is correct: a missing journal
+    means no record of completion, so the dispatcher still needs to
+    run; if there was a real prior run, state-1 / state-2 / state-3
+    paths in the dispatcher will catch it before this skip is even
+    relevant).
+
+    NOTE: ``post_merge_verify_failed`` and ``aborted_*`` are NOT
+    "completed" — those land in CrashRecoveryDispatcher's state-3
+    path (terminal-but-failed). This helper only matches the explicit
+    success-completion event.
+    """
+    path = task_dir / "decisions.jsonl"
+    if not path.is_file():
+        return False
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        # Journal unreadable → don't claim completed. The dispatcher's
+        # state checks will surface the real issue (e.g.
+        # interrupted_journal_corrupt).
+        return False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            # Malformed line — skip; same posture as
+            # CrashRecoveryDispatcher._scan_decisions_jsonl.
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("run_id") != run_id or rec.get("task_id") != task_id:
+            continue
+        ev = rec.get("event")
+        if isinstance(ev, str) and ev == EVENT_TASK_COMPLETED:
+            return True
+    return False
 
 
 def _resolve_or_create_run_id(task_dir: Path) -> str:
@@ -4457,6 +4622,27 @@ def _cmd_auto_execute(slug: str) -> int:
 
     for task_idx, manifest in enumerate(plan.manifests):
         task_id = manifest.id
+
+        # ── [P1 codex round-1] skip already-completed tasks ────────────
+        # CrashRecoveryDispatcher only classifies CRASH states; a journal
+        # with a clean task_completed event for this (run_id, task_id)
+        # is NOT a crash → classify returns clean / proceed. Without
+        # this gate, rerunning ``--auto-execute`` against a
+        # half-finished plan re-dispatches and re-merges already-merged
+        # tasks. Per-task completion is the resume-correctness boundary;
+        # we keep it OUTSIDE the dispatcher so the dispatcher's job
+        # (crash-state classification) stays focused (separation of
+        # concerns — sticking it inside classify() would mean future
+        # readers conflate "no crash" with "no work to do").
+        if _task_already_completed(
+            task_dir, run_id=run_id, task_id=task_id,
+        ):
+            print(
+                f"INFO: task {task_id} already completed for run "
+                f"{run_id}; skipping.",
+                file=sys.stderr,
+            )
+            continue
 
         # ── Recovery gate (T19) ────────────────────────────────────────
         dispatcher = CrashRecoveryDispatcher(

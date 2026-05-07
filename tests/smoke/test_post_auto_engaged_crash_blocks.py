@@ -461,6 +461,333 @@ class TestCrashRecoveryDispatcher(unittest.TestCase):
         # No state 5; could be clean or terminal (not our concern here).
         self.assertNotEqual(v.state, "verification_worktree_orphaned")
 
+    # ------------------------------------------------------------------
+    # [P2 codex round-1] state 5 — verification orphan id-pairing.
+    # ------------------------------------------------------------------
+    def test_state5_orphan_when_prior_completed_exists(self):
+        """[P2] codex round-1: previous logic was
+        ``if not started or completed: return None`` — meaning ANY
+        completed event in the journal masked an orphaned LATER verify
+        pass. Fixture: A→started, A→completed, B→started (no B→completed)
+        with verify path B alive on disk → state 5 must fire.
+        """
+        from flow_orchestrator import CrashRecoveryDispatcher  # noqa
+        verify_path_b = (
+            Path(self.tmp) / ".claude" / "worktrees" / "verify"
+            / "r1+t0+wt_b"
+        )
+        verify_path_b.mkdir(parents=True)
+        append_autonomy_event(self.task_dir, EVENT_MERGE_APPLIED, {
+            "event_id": "e1", "ts": "t",
+            "slug": "demo", "run_id": "r1", "task_id": "T0",
+            "worktree_id": "w",
+            "target_commit_post_merge": "deadbeef" + "0" * 32,
+            "merge_strategy": "--ff-only",
+        })
+        # First verify pass — completed cleanly. (e.g. operator re-ran.)
+        append_autonomy_event(
+            self.task_dir, EVENT_POST_MERGE_VERIFICATION_STARTED, {
+                "event_id": "e2", "ts": "t",
+                "slug": "demo", "run_id": "r1", "task_id": "T0",
+                "verification_worktree_id": "r1+t0+wt_a",
+                "verification_worktree_path": str(self.tmp) + "/wt_a",
+                "target_commit_post_merge": "deadbeef" + "0" * 32,
+            },
+        )
+        append_autonomy_event(
+            self.task_dir, EVENT_POST_MERGE_VERIFICATION_COMPLETED, {
+                "event_id": "e3", "ts": "t",
+                "slug": "demo", "run_id": "r1", "task_id": "T0",
+                "verification_worktree_id": "r1+t0+wt_a",
+                "status": "passed", "criteria_results": [],
+            },
+        )
+        # Second verify pass — started, no matching completed. The B
+        # worktree directory is alive on disk (orphan condition).
+        append_autonomy_event(
+            self.task_dir, EVENT_POST_MERGE_VERIFICATION_STARTED, {
+                "event_id": "e4", "ts": "t",
+                "slug": "demo", "run_id": "r1", "task_id": "T0",
+                "verification_worktree_id": "r1+t0+wt_b",
+                "verification_worktree_path": str(verify_path_b),
+                "target_commit_post_merge": "deadbeef" + "0" * 32,
+            },
+        )
+        v = CrashRecoveryDispatcher(
+            task_dir=self.task_dir, slug="demo",
+            run_id="r1", task_id="T0",
+            current_contract_hash="a" * 64,
+            repo_root=Path(self.tmp),
+        ).classify()
+        self.assertEqual(v.state, "verification_worktree_orphaned")
+        self.assertEqual(v.action, "block")
+
+    def test_state5_clean_when_latest_paired(self):
+        """Counter-test: A→started+completed, B→started+completed —
+        both paired. State 5 must NOT fire even though there are two
+        started events in the journal.
+        """
+        from flow_orchestrator import CrashRecoveryDispatcher  # noqa
+        append_autonomy_event(self.task_dir, EVENT_MERGE_APPLIED, {
+            "event_id": "e1", "ts": "t",
+            "slug": "demo", "run_id": "r1", "task_id": "T0",
+            "worktree_id": "w",
+            "target_commit_post_merge": "deadbeef" + "0" * 32,
+            "merge_strategy": "--ff-only",
+        })
+        for letter, eid_s, eid_c in (
+            ("a", "e2", "e3"), ("b", "e4", "e5"),
+        ):
+            wid = f"r1+t0+wt_{letter}"
+            append_autonomy_event(
+                self.task_dir, EVENT_POST_MERGE_VERIFICATION_STARTED, {
+                    "event_id": eid_s, "ts": "t",
+                    "slug": "demo", "run_id": "r1", "task_id": "T0",
+                    "verification_worktree_id": wid,
+                    "verification_worktree_path": str(self.tmp) + f"/wt_{letter}",
+                    "target_commit_post_merge": "deadbeef" + "0" * 32,
+                },
+            )
+            append_autonomy_event(
+                self.task_dir, EVENT_POST_MERGE_VERIFICATION_COMPLETED, {
+                    "event_id": eid_c, "ts": "t",
+                    "slug": "demo", "run_id": "r1", "task_id": "T0",
+                    "verification_worktree_id": wid,
+                    "status": "passed", "criteria_results": [],
+                },
+            )
+        v = CrashRecoveryDispatcher(
+            task_dir=self.task_dir, slug="demo",
+            run_id="r1", task_id="T0",
+            current_contract_hash="a" * 64,
+            repo_root=Path(self.tmp),
+        ).classify()
+        self.assertNotEqual(v.state, "verification_worktree_orphaned")
+
+    # ------------------------------------------------------------------
+    # [P2 codex round-1] _consume_stale_lock fail-closed on OSError.
+    # ------------------------------------------------------------------
+    def test_consume_stale_lock_permission_error_blocks(self):
+        """[P2] codex round-1: PermissionError on unlink → caller MUST
+        fail-closed to state-2 block instead of silently proceeding.
+        Otherwise stale lock survives indefinitely + every rerun
+        silently bypasses real interrupted_* signals.
+        """
+        from unittest import mock
+        from flow_orchestrator import CrashRecoveryDispatcher  # noqa
+        # Seed lock + auto_engaged → orphan_lock_post_engaged route.
+        lock = AutoPrepareLock(
+            lock_version=1, slug="demo", run_id="r1", task_id="T0",
+            contract_path="/c.json", contract_hash="a" * 64,
+            contract_schema_version=1,
+            created_at="2026-05-06T00:00:00Z",
+            pid=2 ** 31 - 1,
+            host=socket.gethostname(),
+            cwd=str(self.tmp),
+            target_branch="master",
+            intended_first_task_dispatch_at="2026-05-06T00:00:01Z",
+        )
+        write_auto_prepare_lock(self.task_dir, lock)
+        append_autonomy_event(self.task_dir, EVENT_AUTO_ENGAGED, {
+            "event_id": "e1", "ts": "2026-05-06T00:00:00Z",
+            "slug": "demo", "run_id": "r1", "task_id": "T0",
+            "worktree_id": "demo+t0+abcdefg",
+            "worktree_path": str(Path(self.tmp) / "wt"),
+            "original_base_commit": "a" * 40,
+            "current_base_commit": "a" * 40,
+            "lifecycle_state": "active", "checkpoint_id": None,
+            "contract_path": "/c.json", "contract_hash": "a" * 64,
+            "contract_schema_version": 1,
+        })
+
+        # Mock Path.unlink to raise PermissionError; classify MUST
+        # block on state-2 (auto_prepare_interrupted) rather than
+        # silently fall through.
+        original_unlink = Path.unlink
+
+        def fake_unlink(self, *a, **kw):
+            if self.name == "auto_prepare.lock":
+                raise PermissionError("EACCES")
+            return original_unlink(self, *a, **kw)
+
+        with mock.patch.object(Path, "unlink", fake_unlink):
+            v = CrashRecoveryDispatcher(
+                task_dir=self.task_dir, slug="demo",
+                run_id="r1", task_id="T0",
+                current_contract_hash="a" * 64,
+                repo_root=Path(self.tmp),
+            ).classify()
+        self.assertEqual(v.state, "auto_prepare_interrupted")
+        self.assertEqual(v.action, "block")
+        # The lock is STILL on disk — we couldn't remove it. That's
+        # the entire reason we're blocking (otherwise the next run
+        # would re-warn forever).
+        self.assertTrue(
+            (self.task_dir / "auto_prepare.lock").exists(),
+            "lock should remain on disk when unlink fails",
+        )
+
+    def test_consume_stale_lock_file_not_found_proceeds(self):
+        """[P2] codex round-1: FileNotFoundError on unlink is the
+        race-safe path — another process / earlier classify() pass
+        already removed it. Treat as consumed; classify proceeds.
+        """
+        from unittest import mock
+        from flow_orchestrator import CrashRecoveryDispatcher  # noqa
+        lock = AutoPrepareLock(
+            lock_version=1, slug="demo", run_id="r1", task_id="T0",
+            contract_path="/c.json", contract_hash="a" * 64,
+            contract_schema_version=1,
+            created_at="2026-05-06T00:00:00Z",
+            pid=2 ** 31 - 1,
+            host=socket.gethostname(),
+            cwd=str(self.tmp),
+            target_branch="master",
+            intended_first_task_dispatch_at="2026-05-06T00:00:01Z",
+        )
+        write_auto_prepare_lock(self.task_dir, lock)
+        append_autonomy_event(self.task_dir, EVENT_AUTO_ENGAGED, {
+            "event_id": "e1", "ts": "2026-05-06T00:00:00Z",
+            "slug": "demo", "run_id": "r1", "task_id": "T0",
+            "worktree_id": "demo+t0+abcdefg",
+            "worktree_path": str(Path(self.tmp) / "wt"),
+            "original_base_commit": "a" * 40,
+            "current_base_commit": "a" * 40,
+            "lifecycle_state": "active", "checkpoint_id": None,
+            "contract_path": "/c.json", "contract_hash": "a" * 64,
+            "contract_schema_version": 1,
+        })
+        append_autonomy_event(self.task_dir, EVENT_TASK_COMPLETED, {
+            "event_id": "e2", "ts": "2026-05-06T00:00:01Z",
+            "slug": "demo", "run_id": "r1", "task_id": "T0",
+            "worktree_id": "demo+t0+abcdefg",
+            "final_diff_hash": "f" * 64,
+            "target_commit_post_merge": "deadbeef" + "0" * 32,
+        })
+        original_unlink = Path.unlink
+
+        def fake_unlink(self, *a, **kw):
+            if self.name == "auto_prepare.lock":
+                raise FileNotFoundError(f"{self} already gone")
+            return original_unlink(self, *a, **kw)
+
+        with mock.patch.object(Path, "unlink", fake_unlink):
+            v = CrashRecoveryDispatcher(
+                task_dir=self.task_dir, slug="demo",
+                run_id="r1", task_id="T0",
+                current_contract_hash="a" * 64,
+                repo_root=Path(self.tmp),
+            ).classify()
+        # FileNotFoundError = race-safe consume → fall through to
+        # subsequent state checks; task_completed terminal makes
+        # state 3 not fire → clean.
+        self.assertEqual(v.state, "clean")
+        self.assertEqual(v.action, "proceed")
+
+
+# ----------------------------------------------------------------------
+# [P1 codex round-1] _task_already_completed + skip-on-rerun.
+# ----------------------------------------------------------------------
+class TestAlreadyCompletedSkip(unittest.TestCase):
+    """Per-task completion gate is the resume-correctness boundary.
+    CrashRecoveryDispatcher only classifies CRASH states; a clean
+    task_completed history for the current run_id must SKIP redispatch
+    (otherwise rerunning ``--auto-execute`` re-merges already-merged
+    work).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.task_dir = Path(self.tmp) / ".flow" / "tasks" / "demo"
+        self.task_dir.mkdir(parents=True)
+
+    def test_helper_returns_true_for_matching_pair(self):
+        """[P1] (run_id, task_id) match + task_completed event → True."""
+        from flow_orchestrator import _task_already_completed
+        append_autonomy_event(self.task_dir, EVENT_TASK_COMPLETED, {
+            "event_id": "e1", "ts": "t",
+            "slug": "demo", "run_id": "r1", "task_id": "T0",
+            "worktree_id": "w", "final_diff_hash": "f" * 64,
+            "target_commit_post_merge": "deadbeef" + "0" * 32,
+        })
+        self.assertTrue(_task_already_completed(
+            self.task_dir, run_id="r1", task_id="T0",
+        ))
+
+    def test_helper_returns_false_for_different_run_id(self):
+        """[P1] M-class scope: task_completed for run_id=r1 MUST NOT
+        mark run_id=r2 as completed.
+        """
+        from flow_orchestrator import _task_already_completed
+        append_autonomy_event(self.task_dir, EVENT_TASK_COMPLETED, {
+            "event_id": "e1", "ts": "t",
+            "slug": "demo", "run_id": "r1", "task_id": "T0",
+            "worktree_id": "w", "final_diff_hash": "f" * 64,
+            "target_commit_post_merge": "deadbeef" + "0" * 32,
+        })
+        self.assertFalse(_task_already_completed(
+            self.task_dir, run_id="r2", task_id="T0",
+        ))
+
+    def test_helper_returns_false_for_different_task_id(self):
+        """[P1] M-class scope: task_completed for T0 MUST NOT mark T1
+        as completed.
+        """
+        from flow_orchestrator import _task_already_completed
+        append_autonomy_event(self.task_dir, EVENT_TASK_COMPLETED, {
+            "event_id": "e1", "ts": "t",
+            "slug": "demo", "run_id": "r1", "task_id": "T0",
+            "worktree_id": "w", "final_diff_hash": "f" * 64,
+            "target_commit_post_merge": "deadbeef" + "0" * 32,
+        })
+        self.assertFalse(_task_already_completed(
+            self.task_dir, run_id="r1", task_id="T1",
+        ))
+
+    def test_helper_returns_false_for_no_journal(self):
+        """[P1] Missing journal → fail-open False (let dispatcher
+        classify state-1/state-2/state-3 on the real recovery).
+        """
+        from flow_orchestrator import _task_already_completed
+        self.assertFalse(_task_already_completed(
+            self.task_dir, run_id="r1", task_id="T0",
+        ))
+
+    def test_helper_returns_false_for_post_merge_verify_failed(self):
+        """[P1] D6 status guard: post_merge_verify_failed is NOT a
+        success-completion event; it routes to state-3 / aborted_*
+        elsewhere, NOT to skip.
+        """
+        from flow_orchestrator import _task_already_completed
+        # Hand-write the event line (avoids T6's required-field schema
+        # — we only care that the helper differentiates event names).
+        (self.task_dir / "decisions.jsonl").write_text(json.dumps({
+            "event": "post_merge_verify_failed",
+            "run_id": "r1", "task_id": "T0",
+        }) + "\n")
+        self.assertFalse(_task_already_completed(
+            self.task_dir, run_id="r1", task_id="T0",
+        ))
+
+    def test_helper_skips_malformed_jsonl(self):
+        """[P1] D5 typed-except: a malformed line on disk is forensic
+        litter, not a recovery signal. The helper skips it without
+        propagating json.JSONDecodeError.
+        """
+        from flow_orchestrator import _task_already_completed
+        # Pre-seed with a malformed line.
+        (self.task_dir / "decisions.jsonl").write_text(
+            "{not json\n"
+            + json.dumps({
+                "event": EVENT_TASK_COMPLETED,
+                "run_id": "r1", "task_id": "T0",
+            }) + "\n"
+        )
+        self.assertTrue(_task_already_completed(
+            self.task_dir, run_id="r1", task_id="T0",
+        ))
+
 
 # ----------------------------------------------------------------------
 # Subprocess tests — full orchestrator entry path. Step 19.12.
@@ -681,6 +1008,104 @@ class TestPostAutoEngagedCrashBlocksEndToEnd(unittest.TestCase):
         self.assertIn(
             "autonomy_mode: auto",
             (self.slug_dir / "progress.md").read_text(),
+        )
+
+
+class TestAlreadyCompletedSkipSubprocess(unittest.TestCase):
+    """[P1] codex round-1: rerun against a journal with task_completed
+    must SKIP redispatch instead of re-merging. This is the smoking-gun
+    integration test — without the helper, the manifest loop calls
+    auto_dispatch_task again and rewrites blocked.md / re-creates the
+    worktree.
+    """
+
+    def setUp(self):
+        self.repo_root = Path(tempfile.mkdtemp(prefix="flow-test-"))
+        self.addCleanup(
+            lambda: shutil.rmtree(self.repo_root, ignore_errors=True),
+        )
+        subprocess.run(
+            ["git", "init", "-q", str(self.repo_root)], check=True,
+        )
+        (self.repo_root / "README.md").write_text("# fixture\n")
+        subprocess.run(
+            ["git", "-C", str(self.repo_root), "add", "README.md"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo_root), "commit",
+             "-q", "-m", "init"],
+            check=True,
+            env={
+                **os.environ,
+                "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+            },
+        )
+        self.slug = "demo"
+        self.slug_dir = self.repo_root / ".flow" / "tasks" / self.slug
+        _seed_task(self.slug_dir)
+
+    def test_completed_task_skipped_on_rerun(self):
+        """Seed auto_engaged + post_merge_verification_completed +
+        task_completed for run_id=r1 task_id=T0; rerun --auto-execute;
+        expect INFO skip message + return 0 (all manifests done).
+        """
+        # Build a clean terminal sequence so _resolve_or_create_run_id
+        # picks up r1, then _task_already_completed returns True for T0.
+        events = [
+            {
+                "event": "auto_engaged", "event_id": "e1",
+                "ts": "2026-05-06T00:00:00Z",
+                "slug": self.slug, "run_id": "r1", "task_id": "T0",
+                "worktree_id": "demo+t0+abcdefg",
+                "worktree_path": "/tmp/wt",
+                "original_base_commit": "a" * 40,
+                "current_base_commit": "a" * 40,
+                "lifecycle_state": "active", "checkpoint_id": None,
+                "contract_path": "contract.json",
+                "contract_hash": "a" * 64,
+                "contract_schema_version": 1,
+            },
+            {
+                "event": "task_completed", "event_id": "e2",
+                "ts": "2026-05-06T00:00:01Z",
+                "slug": self.slug, "run_id": "r1", "task_id": "T0",
+                "worktree_id": "demo+t0+abcdefg",
+                "final_diff_hash": "f" * 64,
+                "target_commit_post_merge": "deadbeef" + "0" * 32,
+            },
+        ]
+        (self.slug_dir / "decisions.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in events) + "\n",
+        )
+        r = _run_orchestrator(self.slug, repo_root=self.repo_root)
+        # Expected: skip → all manifests done → return 0; stderr
+        # carries the INFO line so operators can see what happened.
+        self.assertEqual(
+            r.returncode, 0,
+            msg=(
+                f"expected exit 0 (skip + done); got {r.returncode}\n"
+                f"stdout={r.stdout!r}\nstderr={r.stderr!r}"
+            ),
+        )
+        self.assertIn("already completed for run r1", r.stderr)
+        # No new dispatch → no new auto_engaged event (only the seeded
+        # one). If skip failed and dispatch ran, we'd see auto_engaged
+        # from the rerun appended to the journal.
+        records = [
+            json.loads(ln)
+            for ln in (
+                self.slug_dir / "decisions.jsonl"
+            ).read_text().splitlines() if ln
+        ]
+        engaged_events = [
+            r for r in records if r.get("event") == "auto_engaged"
+        ]
+        self.assertEqual(
+            len(engaged_events), 1,
+            f"redispatch happened — found {len(engaged_events)} "
+            f"auto_engaged events (expected 1 from seed only)",
         )
 
 
