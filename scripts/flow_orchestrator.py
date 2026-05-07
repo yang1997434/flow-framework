@@ -525,6 +525,17 @@ def auto_dispatch_task(
     content) and produce a corrupt audit record. We reject them here so
     the orchestrator boundary fails loud.
     """
+    # Codex round-1 [P2]: validate `contract` BEFORE create_task_worktree.
+    # The type hint isn't runtime-enforced, so without this guard a None
+    # or wrong-type `contract` would create the worktree on disk first,
+    # then crash at `contract.contract_schema_version` below — leaving an
+    # orphaned worktree and skipping the auto_engaged boundary marker
+    # (which is the very Q7.2 invariant T10 promises).
+    if not isinstance(contract, Contract):
+        raise ValueError(
+            f"auto_dispatch_task: contract must be a Contract instance; "
+            f"got {type(contract).__name__}"
+        )
     for field_name, field_value in (
         ("run_id", run_id),
         ("contract_hash", contract_hash),

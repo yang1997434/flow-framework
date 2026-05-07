@@ -372,6 +372,32 @@ class TestAutoDispatchTaskValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._call(contract_path="contract.json")  # type: ignore[arg-type]
 
+    def test_none_contract_rejected_before_side_effects(self) -> None:
+        """Codex round-1 [P2]: a None / wrong-type contract must fail
+        BEFORE create_task_worktree runs — otherwise an orphaned worktree
+        would be left on disk and the Q7.2 auto_engaged boundary marker
+        would be skipped for the invalid-input path.
+        """
+        worktrees_root = self.tmp / ".claude" / "worktrees"
+        before = (
+            sorted(p.name for p in worktrees_root.iterdir())
+            if worktrees_root.exists() else []
+        )
+        with self.assertRaises(ValueError):
+            self._call(contract=None)  # type: ignore[arg-type]
+        after = (
+            sorted(p.name for p in worktrees_root.iterdir())
+            if worktrees_root.exists() else []
+        )
+        self.assertEqual(
+            before, after,
+            "auto_dispatch_task created a worktree before validating contract",
+        )
+
+    def test_wrong_type_contract_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self._call(contract={"contract_schema_version": 1})  # type: ignore[arg-type]
+
 
 if __name__ == "__main__":
     unittest.main()
