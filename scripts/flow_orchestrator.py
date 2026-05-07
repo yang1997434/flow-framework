@@ -2154,6 +2154,25 @@ def _now_iso() -> str:
     )
 
 
+def _now_iso_micro() -> str:
+    """ISO 8601 UTC timestamp with microsecond precision and `Z` suffix.
+
+    Used for checkpoint filenames where second-precision collisions are
+    possible (TOCTOU between MergeRunner pre_merge and Gate8 9a
+    post_merge writes for fast tasks — both call ``write_checkpoint``,
+    which derives the filename from the timestamp; same-second writes
+    raise ``FileExistsError``). Microsecond precision disambiguates the
+    filenames without requiring a retry loop.
+
+    The `:` characters in HH:MM:SS still need to be sanitized by
+    ``write_checkpoint`` (as for ``_now_iso``); the `.` separator
+    introduced by ``%f`` is filesystem-safe on all targets we support.
+    """
+    return datetime.datetime.now(datetime.UTC).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+    )
+
+
 def _summarize_porcelain_z(porcelain_z: str) -> str:
     """Render a debug-readable file list from ``git status --porcelain -z
     --untracked-files=all`` output.
@@ -2268,8 +2287,11 @@ class MergeRunner:
                 "target_commit_pre_merge": facts.target_commit_pre_merge,
             },
         )
-        # Step 3 — pre_merge checkpoint.
-        ts = _now_iso()
+        # Step 3 — pre_merge checkpoint. Use microsecond precision so
+        # a fast task whose Gate8 9a post_merge checkpoint lands in the
+        # same wall-clock second as this pre_merge write does NOT
+        # collide on the derived filename (TOCTOU; Codex round-1 P1).
+        ts = _now_iso_micro()
         write_checkpoint(
             self.task_dir, ts=ts,
             body=(
@@ -2971,7 +2993,16 @@ class Gate8VerificationRunner:
         # from gate 8 (T1's parser already rejects regression+skip
         # cross-field unless explicitly opted in via
         # `contract.post_merge_regression_optional=true`).
-        effective = [c for c in criteria if not getattr(c, "post_merge_skip", False)]
+        #
+        # Codex round-1 P2: build (orig_idx, crit) pairs BEFORE
+        # filtering so ``criterion_idx`` and ``results[*].idx`` track
+        # the ORIGINAL contract index. A naïve ``enumerate(effective)``
+        # collapses indices after a leading skip, mismatching audit
+        # trail vs contract definition.
+        indexed = [
+            (i, c) for i, c in enumerate(criteria)
+            if not getattr(c, "post_merge_skip", False)
+        ]
 
         # Phase 3 acceptance — lazy-import keeps the dry-run path
         # decoupled from heavier acceptance modules (matches T12/T13
@@ -2989,19 +3020,29 @@ class Gate8VerificationRunner:
             worktree_id=self.verification_id,
         )
 
+        # Codex round-1 P2: attempt_id MUST be task-scoped, not just
+        # run-scoped. ``AcceptanceRunner.find_resume_point`` filters
+        # ``acceptance-progress.jsonl`` solely by ``attempt_id``; a
+        # multi-task run would otherwise have all tasks' gate-8 rows
+        # share the same ``post_merge_<run_id>`` key and cross-pollute
+        # on resume.
+        post_merge_attempt_id = (
+            f"post_merge_{self.run_id}_{self.task_id}"
+        )
+
         results: list = []
         gate_passed = True
-        for idx, crit in enumerate(effective):
+        for orig_idx, crit in indexed:
             rr = runner.run_one(
-                crit, criterion_idx=idx,
-                attempt_id=f"post_merge_{self.run_id}", retry_idx=0,
+                crit, criterion_idx=orig_idx,
+                attempt_id=post_merge_attempt_id, retry_idx=0,
                 task_dir=self.task_dir,
             )
             decision = runner.evaluate_criterion(
                 crit, phase=3, runner_result=rr,
             )
             results.append({
-                "idx": idx,
+                "idx": orig_idx,
                 "status": getattr(rr, "status", "inconclusive"),
                 "decision": decision.value,
             })
@@ -3110,9 +3151,11 @@ class Gate8VerificationRunner:
             },
         )
 
-        # 9a.2: phase=post_merge checkpoint.
+        # 9a.2: phase=post_merge checkpoint. Use microsecond precision
+        # to avoid a same-second collision with MergeRunner's pre_merge
+        # checkpoint on a fast task (Codex round-1 P1 TOCTOU).
         write_checkpoint(
-            self.task_dir, ts=_now_iso(),
+            self.task_dir, ts=_now_iso_micro(),
             body=(
                 f"phase: post_merge\n"
                 f"worktree_id: {self.ctx.worktree_id}\n"
@@ -3303,22 +3346,26 @@ class Gate8VerificationRunner:
             timeout_sec=_GIT_HEAD_QUERY_TIMEOUT_SEC,
         )
         if move.timed_out or move.spawn_error is not None or move.returncode != 0:
+            # Codex round-1 P2: do NOT fall back to ``Path.rename``.
+            # That fallback was the original review-pass-1 motivation
+            # to switch to ``git worktree move``: a plain rename leaves
+            # ``.git/worktrees/<id>/gitdir`` pointing at the OLD path,
+            # so the preserved dir is no longer git-usable for post-
+            # mortem (operator's ``git status``/``git log`` inside the
+            # preserved dir errors out — exactly the broken-worktree
+            # state we documented in the deferred T19 recovery design).
+            # Leave the verification worktree at its ORIGINAL path:
+            # still git-usable, operator can inspect / repair manually,
+            # T19's recovery dispatcher routes from the
+            # ``post_merge_verify_failed`` event already emitted at 9b.1.
             print(
                 f"WARN: git worktree move failed "
-                f"({vpath} → {target}): "
-                f"{move.stderr[-500:] or move.spawn_error or 'timeout'}",
+                f"({vpath} -> {target}): "
+                f"{move.stderr[-500:] or move.spawn_error or 'timeout'}. "
+                f"Verification worktree left at original path: {vpath}. "
+                f"Operator must inspect / repair manually before next run.",
                 file=sys.stderr,
             )
-            # Defensive fallback: filesystem rename so the dir is still
-            # preserved (registry will mismatch — operator can repair).
-            try:
-                vpath.rename(target)
-            except OSError as e:
-                print(
-                    f"WARN: filesystem rename also failed "
-                    f"({type(e).__name__}: {e})",
-                    file=sys.stderr,
-                )
 
         return Gate8Result(
             status="blocked_post_merge",

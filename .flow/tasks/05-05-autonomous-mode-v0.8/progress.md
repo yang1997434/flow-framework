@@ -44,6 +44,7 @@
 | 2026-05-06 18:00 | main + codex | Batch 1 sanity review (resume session 019dfb47) | YELLOW — 9 issues：Y1 dependency col / Y5 split T12 / Y2 staleness explicit / Y3-Y4-Y7-Y9 wording; Y6/Y8 deferred to detail |
 | 2026-05-06 18:10 | main | Batch 1 → 23-task index 修订 | T12 split → T12 (gate harness) + T13 (codex review)；新增 Depends-on 列；event 数 9→10；T20 5 staleness triggers 显式；T22 SKILL 标注 codex sandbox limit；T23 release 加 7 项 validation checklist。**全 task DAG 顺序在末尾标注**。准备 Batch 2 |
 | 2026-05-06 18:30 | main | plan Batch 2 — T1-T3 Group A Contract schema TDD detail | doc 166→713 行 (+547 lines)。T1 字段加 + 9 testcase / T2 ceiling enforce + 3 cases / T3 forward-compat 用 v0.8.0 tag worktree (Y9 fix)。Group A complete |
+| 2026-05-07 (T15 codex round-2 fix) | main | T15 codex round-1 RED → fix-pass | 4 个 finding 全修：[P1] Fix-1 引入 `_now_iso_micro()` 把 pre_merge + 9a post_merge checkpoint 时间戳切到微秒精度（消除 same-second `FileExistsError` TOCTOU；先前作为 T15 P2 deferred 的 microsecond-race concern 至此 obsolete）；[P2] Fix-2 把 `attempt_id` 改成 task-scoped (`post_merge_<run_id>_<task_id>`)；[P2] Fix-3 用 `(orig_idx, crit)` 对保留原始 contract 索引；[P2] Fix-4 删除 9b 的 `Path.rename` 文件系统 fallback（保留 git-usable 原路径 + WARN）。Tests 636 → 639（+3 new in `test_post_merge_verify_failed_blocks.py::TestGate8CodexRound1Fixes`）。 |
 
 ## Verify Report
 

@@ -311,5 +311,154 @@ class TestGate8S3SkipRule(_Gate8Fixture):
         self.assertEqual(len(result.criteria_results), 1)
 
 
+class TestGate8CodexRound1Fixes(_Gate8Fixture):
+    """Codex round-1 RED — three [P1]+[P2] regressions targeted by the
+    round-2 fix-pass. One test per finding so a future regression names
+    itself in the failure header."""
+
+    def test_post_merge_checkpoint_does_not_collide_with_pre_merge(self) -> None:
+        """[P1] Fix-1 — checkpoint filename collision (TOCTOU).
+
+        MergeRunner's pre_merge checkpoint and Gate8 9a's post_merge
+        checkpoint are both derived from a wall-clock timestamp via
+        ``write_checkpoint``. A fast task can hit the same second on
+        both writes; ``write_checkpoint`` raises ``FileExistsError``
+        on derived-filename clashes. The 9a path crashes AFTER
+        ``task_completed`` is appended → recovery sees a completed
+        task whose progress/cleanup never ran.
+
+        Microsecond-precision timestamps disambiguate the filenames
+        without a retry loop or shared lock.
+        """
+        from flow_state_writer import write_checkpoint  # type: ignore
+        from flow_orchestrator import _now_iso  # type: ignore
+
+        runner = Gate8VerificationRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="run1", task_id="T0",
+            target_commit_post_merge=self.post_merge_sha,
+        )
+        # Pre-write a second-precision checkpoint to simulate
+        # MergeRunner's pre_merge artifact landing in the same second
+        # the 9a path will hit. Same-second second-precision is
+        # exactly the prior crash signature — the fix MUST tolerate
+        # it.
+        pre_ts = _now_iso()
+        write_checkpoint(
+            self.task_dir, ts=pre_ts,
+            body="phase: pre_merge\nworktree_id: simulated\n",
+            git_hash="aaaaaaa",
+        )
+        result = runner.verify(
+            criteria=[_crit("x", command="true")],
+            regression_command="true",
+        )
+        self.assertEqual(result.status, "completed")
+        cps = sorted((self.task_dir / "checkpoints").glob("*.md"))
+        # Both checkpoints exist — pre_merge (second precision) AND
+        # post_merge (microsecond precision). No collision.
+        self.assertEqual(
+            len(cps), 2,
+            msg=f"expected 2 checkpoints, got {[p.name for p in cps]}",
+        )
+        bodies = [p.read_text(encoding="utf-8") for p in cps]
+        self.assertTrue(
+            any("phase: pre_merge" in b for b in bodies),
+            msg="pre_merge checkpoint missing from glob",
+        )
+        self.assertTrue(
+            any("phase: post_merge" in b for b in bodies),
+            msg="post_merge checkpoint missing from glob",
+        )
+
+    def test_post_merge_attempt_id_includes_task_id(self) -> None:
+        """[P2] Fix-2 — attempt_id must be task-scoped.
+
+        ``AcceptanceRunner.find_resume_point`` keys resume state on
+        ``attempt_id`` only. Run-scoped ``post_merge_<run_id>`` lets
+        every task in a multi-task run share the same key →
+        cross-task pollution on resume.
+        """
+        runner = Gate8VerificationRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="abc12345", task_id="T7",
+            target_commit_post_merge=self.post_merge_sha,
+        )
+        result = runner.verify(
+            criteria=[_crit("x", command="true")],
+            regression_command="true",
+        )
+        self.assertEqual(result.status, "completed")
+        accept_path = self.task_dir / "acceptance-progress.jsonl"
+        self.assertTrue(
+            accept_path.is_file(),
+            msg="expected acceptance-progress.jsonl from gate 8 run",
+        )
+        rows = [
+            json.loads(line)
+            for line in accept_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertTrue(rows, msg="no acceptance-progress rows written")
+        attempt_ids = {r.get("attempt_id") for r in rows if r.get("attempt_id")}
+        # attempt_id must include BOTH the run_id and the task_id so
+        # the ``post_merge_*`` key is unique per (run, task).
+        for aid in attempt_ids:
+            self.assertIn("T7", aid, msg=f"task_id missing from {aid!r}")
+            self.assertIn("abc12345", aid, msg=f"run_id missing from {aid!r}")
+            self.assertTrue(
+                aid.startswith("post_merge_"),
+                msg=f"unexpected attempt_id prefix: {aid!r}",
+            )
+
+    def test_post_merge_skip_preserves_original_indices_in_results(self) -> None:
+        """[P2] Fix-3 — original contract indices preserved through skip.
+
+        With criterion 0 marked ``post_merge_skip=true`` and criterion
+        1 kept, the kept criterion must report ``idx=1`` (its original
+        contract index) in ``criteria_results``, not ``idx=0`` (the
+        post-filter enumerate position). Audit trail correctness +
+        downstream resume keying both depend on this.
+        """
+        runner = Gate8VerificationRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="run1", task_id="T0",
+            target_commit_post_merge=self.post_merge_sha,
+        )
+        criteria = [
+            _crit("skipped", command="false", post_merge_skip=True),  # idx 0
+            _crit("kept", command="true"),  # idx 1
+        ]
+        result = runner.verify(
+            criteria=criteria, regression_command="true",
+        )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(len(result.criteria_results), 1)
+        self.assertEqual(
+            result.criteria_results[0]["idx"], 1,
+            msg="kept criterion must keep its ORIGINAL contract idx (1), "
+                "not its post-filter enumerate position (0)",
+        )
+        # The acceptance-progress row for the kept criterion must
+        # carry criterion_idx=1 too — the resume key downstream is
+        # derived from that field.
+        accept_path = self.task_dir / "acceptance-progress.jsonl"
+        rows = [
+            json.loads(line)
+            for line in accept_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        idxs = {r.get("criterion_idx") for r in rows if r.get("criterion_idx") is not None}
+        self.assertIn(
+            1, idxs,
+            msg=f"acceptance-progress.jsonl missing criterion_idx=1; got {idxs}",
+        )
+        self.assertNotIn(
+            0, idxs,
+            msg="skipped criterion (idx 0) should not appear in acceptance "
+                "progress — but it did, indicating S3 filter bypassed",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
