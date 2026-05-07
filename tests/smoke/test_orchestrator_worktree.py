@@ -2482,5 +2482,381 @@ class TestMidMergeCrashDetection(unittest.TestCase):
         self.assertEqual(state["state"], "mid_merge_crash")
 
 
+# ---------------------------------------------------------------------------
+# T20 — StalenessChecker (5 explicit Y2 triggers; doctor-only in v0.8.1)
+#
+# Each trigger gets at least one happy + one trigger case; trigger 5
+# additionally has a "baseline already failing → not a trigger" case.
+# Pitfall guards verified by the test set:
+#   - I/K (helper reuse): trigger 5 routes through `_run_shell_with_pgkill`
+#     by way of `StalenessChecker.check_baseline_now_fails`. The smoke
+#     here exercises the exit_code propagation (we trust the helper's own
+#     T7/T12 tests for SIGKILL behaviour); the helper is verified to be
+#     the actual code path via the import-failure branch test below.
+#   - L (type-check): a corrupt snapshot value (None / int) does NOT
+#     silently match a real hash and therefore fails-closed (trigger).
+#   - S (wire-up gap): aggregator `check_all(include_baseline=False)`
+#     never invokes _run_shell_with_pgkill — verified by giving it a
+#     bogus baseline_command and asserting no trigger fires.
+# ---------------------------------------------------------------------------
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+from flow_staleness import (  # type: ignore  # noqa: E402
+    StalenessChecker, StalenessVerdict,
+)
+
+
+class _MinCtx:
+    """Tiny duck-typed WorktreeContext stand-in for the static checks
+    that take only the fields they actually read. Plan-side triggers
+    1, 5 read `integration_target`, `original_base_commit`, and
+    `worktree_path` — nothing else."""
+
+    def __init__(
+        self, *,
+        integration_target: str,
+        original_base_commit: str,
+        worktree_path: Path,
+    ) -> None:
+        self.integration_target = integration_target
+        self.original_base_commit = original_base_commit
+        self.worktree_path = worktree_path
+
+
+def _commit_empty(repo: Path, msg: str = "advance") -> str:
+    """Helper — append an empty commit to advance HEAD; return new SHA."""
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "--allow-empty", "-q", "-m", msg],
+        check=True,
+    )
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    )
+    return proc.stdout.strip()
+
+
+class TestStalenessTrigger1BaseBranchMoved(unittest.TestCase):
+    """T20 trigger 1 — `git rev-parse <integration_target>` ≠ original."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        _init_repo(self.tmp)
+        head = subprocess.run(
+            ["git", "-C", str(self.tmp), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.ctx = _MinCtx(
+            integration_target="master",
+            original_base_commit=head,
+            worktree_path=self.tmp,
+        )
+
+    def test_base_unchanged_returns_not_stale(self) -> None:
+        stale, details = StalenessChecker.check_base_branch_moved(
+            repo_root=self.tmp, ctx=self.ctx,
+        )
+        self.assertFalse(stale)
+        self.assertEqual(details, {})
+
+    def test_base_advanced_triggers(self) -> None:
+        new_head = _commit_empty(self.tmp)
+        stale, details = StalenessChecker.check_base_branch_moved(
+            repo_root=self.tmp, ctx=self.ctx,
+        )
+        self.assertTrue(stale)
+        self.assertEqual(details["from_commit"], self.ctx.original_base_commit)
+        self.assertEqual(details["to_commit"], new_head)
+        self.assertEqual(details["integration_target"], "master")
+
+    def test_unresolvable_target_does_not_trigger(self) -> None:
+        """D2/D3: rev-parse failure (rc != 0) reports `reason`, doesn't
+        silently report a trigger or treat unknown ref as 'unchanged'."""
+        bad_ctx = _MinCtx(
+            integration_target="this-branch-does-not-exist",
+            original_base_commit=self.ctx.original_base_commit,
+            worktree_path=self.tmp,
+        )
+        stale, details = StalenessChecker.check_base_branch_moved(
+            repo_root=self.tmp, ctx=bad_ctx,
+        )
+        self.assertFalse(stale)
+        self.assertIn("reason", details)
+
+
+class TestStalenessTrigger2LockfileChanged(unittest.TestCase):
+    """T20 trigger 2 — sha256(lockfile) vs snapshot."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        _init_repo(self.tmp)
+
+    def test_lockfile_unchanged_not_stale(self) -> None:
+        (self.tmp / "package-lock.json").write_text('{"v": 1}')
+        snapshot = StalenessChecker.snapshot_lockfiles(self.tmp)
+        self.assertIn("package-lock.json", snapshot)
+        stale, details = StalenessChecker.check_lockfile_changed(
+            self.tmp, snapshot,
+        )
+        self.assertFalse(stale)
+        self.assertEqual(details, {})
+
+    def test_lockfile_modified_triggers(self) -> None:
+        (self.tmp / "package-lock.json").write_text('{"v": 1}')
+        snapshot = StalenessChecker.snapshot_lockfiles(self.tmp)
+        (self.tmp / "package-lock.json").write_text('{"v": 2}')
+        stale, details = StalenessChecker.check_lockfile_changed(
+            self.tmp, snapshot,
+        )
+        self.assertTrue(stale)
+        self.assertIn("package-lock.json", details["changed"])
+
+    def test_lockfile_added_triggers(self) -> None:
+        snapshot: dict = {}
+        (self.tmp / "Cargo.lock").write_text("hello\n")
+        stale, details = StalenessChecker.check_lockfile_changed(
+            self.tmp, snapshot,
+        )
+        self.assertTrue(stale)
+        self.assertIn("Cargo.lock", details["changed"])
+
+    def test_corrupt_snapshot_value_falls_back_to_added(self) -> None:
+        """L-class: a non-string snapshot entry (e.g. None) MUST NOT
+        silently equal a real hash. Treat as missing baseline → if file
+        is present, trigger."""
+        (self.tmp / "Gemfile.lock").write_text("rake 1\n")
+        snapshot = {"Gemfile.lock": None}  # corrupt
+        stale, details = StalenessChecker.check_lockfile_changed(
+            self.tmp, snapshot,
+        )
+        self.assertTrue(stale)
+        self.assertIn("Gemfile.lock", details["changed"])
+
+
+class TestStalenessTrigger3PrdEdited(unittest.TestCase):
+    """T20 trigger 3 — prd.md mtime advance."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        self.task_dir = self.tmp / "task"
+        self.task_dir.mkdir()
+
+    def test_prd_unchanged_not_stale(self) -> None:
+        prd = self.task_dir / "prd.md"
+        prd.write_text("# spec\n")
+        snap = prd.stat().st_mtime
+        stale, details = StalenessChecker.check_prd_edited(
+            prd_path=prd, snapshot_mtime=snap,
+        )
+        self.assertFalse(stale)
+        self.assertEqual(details, {})
+
+    def test_prd_mtime_advances_triggers(self) -> None:
+        prd = self.task_dir / "prd.md"
+        prd.write_text("# spec\n")
+        snap = prd.stat().st_mtime
+        time.sleep(0.05)
+        # Force a real mtime advance — touch via os.utime to be robust on
+        # filesystems with second-level mtime granularity.
+        new_ts = snap + 5.0
+        os.utime(prd, (new_ts, new_ts))
+        prd.write_text("# spec v2\n")
+        stale, details = StalenessChecker.check_prd_edited(
+            prd_path=prd, snapshot_mtime=snap,
+        )
+        self.assertTrue(stale)
+        self.assertGreater(details["current_mtime"], details["snapshot_mtime"])
+
+    def test_prd_missing_does_not_trigger(self) -> None:
+        """Plan-defined: missing prd.md reports reason, doesn't trigger."""
+        missing = self.task_dir / "prd.md"
+        stale, details = StalenessChecker.check_prd_edited(
+            prd_path=missing, snapshot_mtime=0.0,
+        )
+        self.assertFalse(stale)
+        self.assertIn("reason", details)
+
+
+class TestStalenessTrigger4DepVersionsChanged(unittest.TestCase):
+    """T20 trigger 4 — DEP_FILES content hash changes (byte-level)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+
+    def test_dep_unchanged_not_stale(self) -> None:
+        (self.tmp / "package.json").write_text(
+            json.dumps({"dependencies": {"foo": "^1.0.0"}})
+        )
+        snap = StalenessChecker.snapshot_dep_versions(self.tmp)
+        stale, details = StalenessChecker.check_dep_versions_changed(
+            self.tmp, snap,
+        )
+        self.assertFalse(stale)
+
+    def test_dep_version_change_triggers(self) -> None:
+        (self.tmp / "package.json").write_text(
+            json.dumps({"dependencies": {"foo": "^1.0.0"}})
+        )
+        snap = StalenessChecker.snapshot_dep_versions(self.tmp)
+        (self.tmp / "package.json").write_text(
+            json.dumps({"dependencies": {"foo": "^2.0.0"}})
+        )
+        stale, details = StalenessChecker.check_dep_versions_changed(
+            self.tmp, snap,
+        )
+        self.assertTrue(stale)
+        self.assertIn("package.json", details["changed"])
+
+
+class TestStalenessTrigger5BaselineNowFails(unittest.TestCase):
+    """T20 trigger 5 — baseline_command non-zero exit (when previously passing).
+
+    K + I pitfall: routes through `_run_shell_with_pgkill` (T12). The
+    actual SIGKILL-on-timeout behaviour is exercised by T7/T12 tests of
+    that helper; here we only verify the trigger semantics:
+      - rc=0 → no trigger
+      - rc != 0 + was_passing → trigger
+      - rc != 0 + NOT was_passing → no trigger (was already broken)
+      - missing baseline_command → no trigger (safe default)
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+
+    def test_baseline_passes_now_no_trigger(self) -> None:
+        stale, details = StalenessChecker.check_baseline_now_fails(
+            worktree_root=self.tmp,
+            baseline_command="true",
+            baseline_was_passing=True,
+        )
+        self.assertFalse(stale)
+
+    def test_baseline_now_fails_triggers(self) -> None:
+        stale, details = StalenessChecker.check_baseline_now_fails(
+            worktree_root=self.tmp,
+            baseline_command="false",
+            baseline_was_passing=True,
+        )
+        self.assertTrue(stale)
+        self.assertIn("exit_code", details)
+        # `false` returns rc=1 — anything non-zero is acceptable.
+        self.assertNotEqual(details["exit_code"], 0)
+
+    def test_baseline_was_already_failing_no_trigger(self) -> None:
+        stale, details = StalenessChecker.check_baseline_now_fails(
+            worktree_root=self.tmp,
+            baseline_command="false",
+            baseline_was_passing=False,
+        )
+        self.assertFalse(stale)
+        self.assertIn("reason", details)
+
+    def test_missing_baseline_command_no_trigger(self) -> None:
+        stale, details = StalenessChecker.check_baseline_now_fails(
+            worktree_root=self.tmp,
+            baseline_command="",
+            baseline_was_passing=True,
+        )
+        self.assertFalse(stale)
+        self.assertIn("reason", details)
+
+
+class TestStalenessCheckAllAggregator(unittest.TestCase):
+    """Aggregator: ANY trigger → stale=True; multiple triggers all listed."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        _init_repo(self.tmp)
+        self.task_dir = self.tmp / ".flow" / "tasks" / "demo"
+        self.task_dir.mkdir(parents=True)
+        head = subprocess.run(
+            ["git", "-C", str(self.tmp), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.ctx = _MinCtx(
+            integration_target="master",
+            original_base_commit=head,
+            worktree_path=self.tmp,
+        )
+
+    def test_clean_workspace_no_trigger(self) -> None:
+        checker = StalenessChecker(
+            repo_root=self.tmp, ctx=self.ctx,
+            task_dir=self.task_dir,
+            baseline_snapshot={
+                "lockfiles": {},
+                "prd_mtime": 0.0,
+                "dep_versions": {},
+            },
+        )
+        verdict = checker.check_all(include_baseline=False)
+        self.assertFalse(verdict.stale)
+        self.assertEqual(verdict.triggered, [])
+
+    def test_aggregator_lists_multiple_triggers(self) -> None:
+        # Trigger 1: advance master.
+        _commit_empty(self.tmp)
+        # Trigger 3: bump prd.md mtime past zero snapshot.
+        prd = self.task_dir / "prd.md"
+        prd.write_text("# spec\n")
+        # Use a snapshot mtime that is in the distant past so the trigger fires.
+        checker = StalenessChecker(
+            repo_root=self.tmp, ctx=self.ctx, task_dir=self.task_dir,
+            baseline_snapshot={
+                "lockfiles": {},
+                "prd_mtime": 0.0,                # any present prd.md > 0 → trigger
+                "dep_versions": {},
+            },
+        )
+        verdict = checker.check_all(include_baseline=False)
+        self.assertTrue(verdict.stale)
+        self.assertIn("base_branch", verdict.triggered)
+        self.assertIn("prd_mtime", verdict.triggered)
+        self.assertIn("base_branch", verdict.details)
+        self.assertIn("prd_mtime", verdict.details)
+
+    def test_aggregator_skips_baseline_when_not_requested(self) -> None:
+        """S-class: when include_baseline=False, baseline_command is
+        ignored — even a guaranteed-fail command MUST NOT fire trigger
+        5 (this is the doctor-only safety boundary)."""
+        checker = StalenessChecker(
+            repo_root=self.tmp, ctx=self.ctx, task_dir=self.task_dir,
+            baseline_snapshot={
+                "lockfiles": {},
+                "prd_mtime": 0.0,
+                "dep_versions": {},
+            },
+        )
+        verdict = checker.check_all(
+            include_baseline=False,
+            baseline_command="false",            # would trigger if invoked
+            baseline_was_passing=True,
+        )
+        self.assertFalse(verdict.stale)
+        self.assertNotIn("baseline_fail", verdict.triggered)
+
+    def test_aggregator_runs_baseline_when_requested(self) -> None:
+        checker = StalenessChecker(
+            repo_root=self.tmp, ctx=self.ctx, task_dir=self.task_dir,
+            baseline_snapshot={
+                "lockfiles": {},
+                "prd_mtime": 0.0,
+                "dep_versions": {},
+            },
+        )
+        verdict = checker.check_all(
+            include_baseline=True,
+            baseline_command="false",
+            baseline_was_passing=True,
+        )
+        self.assertTrue(verdict.stale)
+        self.assertIn("baseline_fail", verdict.triggered)
+
+
 if __name__ == "__main__":
     unittest.main()

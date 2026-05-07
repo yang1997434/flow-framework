@@ -487,6 +487,197 @@ def check_wave_plans() -> int:
     return 0
 
 
+def check_staleness() -> int:
+    """T20 (v0.8.1) — task workspace staleness diagnostic.
+
+    For every active task with a worktree on disk, run all 5 Y2 triggers
+    via `StalenessChecker.check_all(include_baseline=True)` and surface
+    the verdict. v0.8.1 ships this as the **only** staleness surface —
+    `_cmd_auto_execute` / `auto_dispatch_task` integration is DEFERRED
+    to v0.8.2 per route-A re-scope (codex round-4 R4 + round-5 R3).
+
+    Active task discovery (v0.8.1 minimal): a task is "active" if
+    `.flow/tasks/<slug>/contract.json` exists AND there is a matching
+    `.claude/worktrees/<slug>+t*+<shortsha>` directory. Tasks without
+    either are silently skipped (interactive-only / archived).
+
+    Returns 0 always (warnings only — staleness is informational; the
+    operator decides whether to abort `--auto-execute`). R-class
+    (frontmatter injection): the `repr()` form is used when echoing
+    user-controlled file paths into stdout to avoid raw control
+    characters from filenames affecting terminal state.
+    """
+    section("Staleness (v0.8.1 doctor-only — orchestrator integration deferred to v0.8.2)")
+
+    project_root = _find_project_root_from_cwd()
+    if project_root is None:
+        ok("no Flow project at cwd — skipping")
+        return 0
+    tasks_dir = project_root / ".flow" / "tasks"
+    if not tasks_dir.is_dir():
+        ok("no .flow/tasks/ — skipping")
+        return 0
+
+    _scripts = str(REPO_ROOT / "scripts")
+    if _scripts not in sys.path:
+        sys.path.insert(0, _scripts)
+    try:
+        from flow_staleness import StalenessChecker  # noqa: E402
+    except (ImportError, ModuleNotFoundError) as e:
+        warn(f"could not import StalenessChecker: {type(e).__name__}: {e}")
+        return 0
+
+    worktrees_root = project_root / ".claude" / "worktrees"
+    active_count = 0
+    stale_count = 0
+
+    for slug_dir in sorted(tasks_dir.iterdir()):
+        if not slug_dir.is_dir() or slug_dir.name == "archive":
+            continue
+        contract_path = slug_dir / "contract.json"
+        if not contract_path.is_file():
+            continue
+        # Find matching worktree directory: <slug>+t*+<shortsha>.
+        slug = slug_dir.name
+        candidates: list[Path] = []
+        if worktrees_root.is_dir():
+            for child in worktrees_root.iterdir():
+                if not child.is_dir():
+                    continue
+                if child.name.startswith(f"{slug}+t"):
+                    candidates.append(child)
+        if not candidates:
+            continue  # no live worktree — interactive task, skip
+        # Pick the most recently modified worktree as the "current"
+        # active one. Multiple worktrees per slug is uncommon; doctor
+        # informs about the most recent.
+        try:
+            wt = max(candidates, key=lambda p: p.stat().st_mtime)
+        except (OSError, PermissionError):
+            continue
+
+        # Read contract for integration_target + baseline_command. Also
+        # pull `original_base_commit` if persisted (v0.8.1 may not have
+        # it stored — fall back to current rev as a best-effort).
+        try:
+            contract_data = json.loads(contract_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            warn(f"{slug}: contract.json unreadable — {type(e).__name__}: {e}")
+            continue
+        integration_target = (
+            contract_data.get("integration_target") or "master"
+        )
+        baseline_command = (
+            contract_data.get("baseline_command")
+            or contract_data.get("baseline", {}).get("command")
+            or ""
+        )
+
+        # Resolve original_base_commit: prefer the value stored in the
+        # task dir (T10 records it via auto_engaged event); fall back
+        # to current HEAD of integration_target so trigger 1 reports
+        # "no change" rather than firing falsely.
+        original_base = ""
+        decisions = slug_dir / "decisions.jsonl"
+        if decisions.is_file():
+            try:
+                for line_text in decisions.read_text(encoding="utf-8").splitlines():
+                    if not line_text.strip():
+                        continue
+                    try:
+                        rec = json.loads(line_text)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    obc = rec.get("original_base_commit")
+                    if isinstance(obc, str) and obc:
+                        original_base = obc
+                        break
+            except (OSError, PermissionError):
+                pass
+        if not original_base:
+            try:
+                proc = subprocess.run(
+                    ["git", "-C", str(project_root), "rev-parse",
+                     integration_target],
+                    capture_output=True, text=True, check=False,
+                )
+                if proc.returncode == 0:
+                    original_base = proc.stdout.strip()
+            except (OSError, FileNotFoundError):
+                pass
+
+        class _Ctx:
+            pass
+        ctx = _Ctx()
+        ctx.integration_target = integration_target
+        ctx.original_base_commit = original_base
+        ctx.worktree_path = wt
+
+        active_count += 1
+        checker = StalenessChecker(
+            repo_root=project_root, ctx=ctx, task_dir=slug_dir,
+            baseline_snapshot={
+                # v0.8.1 doctor-only: no persisted snapshot yet
+                # (orchestrator capture deferred to v0.8.2). Doctor
+                # reports against an empty snapshot — triggers 2/3/4
+                # only fire if the file is present (treated as added)
+                # which is the conservative default for "you have not
+                # captured a baseline yet".
+                "lockfiles": {},
+                "prd_mtime": 0.0,
+                "dep_versions": {},
+            },
+        )
+        verdict = checker.check_all(
+            include_baseline=bool(baseline_command),
+            baseline_command=baseline_command,
+            baseline_was_passing=True,
+            baseline_timeout_sec=300,
+        )
+        # R-class: do not echo unfiltered slug content (slugs are
+        # validated upstream but defense-in-depth — repr() prevents
+        # control chars).
+        slug_safe = repr(slug)[1:-1]  # strip surrounding quotes
+        if verdict.stale:
+            stale_count += 1
+            warn(
+                f"{slug_safe}: STALE — triggers: "
+                f"{', '.join(verdict.triggered)}",
+                detail=f"worktree: {wt.name}",
+            )
+            for trig, det in verdict.details.items():
+                if not isinstance(det, dict):
+                    continue
+                if trig == "base_branch":
+                    print(f"      base_branch: "
+                          f"{det.get('from_commit', '?')[:7]} → "
+                          f"{det.get('to_commit', '?')[:7]} "
+                          f"({det.get('integration_target', '?')})")
+                elif trig in ("lockfile", "dep_version"):
+                    changed = det.get("changed", [])
+                    print(f"      {trig}: {', '.join(repr(x)[1:-1] for x in changed)}")
+                elif trig == "prd_mtime":
+                    print(f"      prd_mtime: snapshot="
+                          f"{det.get('snapshot_mtime', 0):.0f} "
+                          f"current={det.get('current_mtime', 0):.0f}")
+                elif trig == "baseline_fail":
+                    print(f"      baseline_fail: exit_code="
+                          f"{det.get('exit_code', '?')}")
+        else:
+            ok(
+                f"{slug_safe}: clean",
+                detail=f"worktree: {wt.name}",
+            )
+
+    if active_count == 0:
+        ok("no active task worktrees — nothing to check")
+    elif stale_count == 0:
+        ok(f"all {active_count} active task(s) clean")
+    return 0
+
+
 def check_wave_caches() -> int:
     """v0.7: detect stale wave-decomposition caches."""
     section("Wave caches")
@@ -572,6 +763,8 @@ def main():
     check_capability_clis()
     wave_plan_issues = check_wave_plans()
     check_wave_caches()
+    # T20 (v0.8.1) — staleness diagnostic; non-fatal (informational).
+    check_staleness()
 
     contract_ok, contract_errs = check_contract_integrity()
     section("Contract integrity")
