@@ -3062,7 +3062,7 @@ class Gate8VerificationRunner:
                 cumulative diff hash (computed from the task worktree
                 BEFORE cleanup — once removed we can't read it back).
           9a.2: write ``phase=post_merge`` checkpoint.
-          9a.3: progress.md status → ``completed``.
+          9a.3: progress.md status → ``merged``.
           9a.4: cleanup task worktree (remove + branch -D).
           9a.5: cleanup verification worktree.
 
@@ -3122,35 +3122,59 @@ class Gate8VerificationRunner:
             git_hash=self.target_commit_post_merge,
         )
 
-        # 9a.3: progress.md status → completed (T20 owns lint/enum).
-        self._update_task_status("completed")
+        # 9a.3: progress.md status → merged (canonical PASS terminal
+        # status per design §4/§3/§7; T20 owns lint/enum). Note:
+        # Gate8Result.status="completed" is an internal enum returned
+        # to MergeRunner; only progress.md uses the "merged" canonical.
+        self._update_task_status("merged")
 
-        # 9a.4: cleanup task worktree. `check=False`-equivalent — log
-        # but don't crash if cleanup fails; the merge is already in
-        # integration target, the verification PASSED, so a stale
-        # worktree dir is cosmetic, not correctness.
-        _run_argv_with_pgkill(
+        # 9a.4: cleanup task worktree. `check=False`-equivalent — WARN
+        # on failure but don't crash; the merge is already in integration
+        # target, verification PASSED, so a stale worktree dir is
+        # cosmetic, not correctness. Symmetric WARN with 9b.
+        rm_task = _run_argv_with_pgkill(
             ["git", "-C", str(repo_root),
              "worktree", "remove", "--force",
              str(self.ctx.worktree_path)],
             cwd=repo_root,
             timeout_sec=_GIT_HEAD_QUERY_TIMEOUT_SEC,
         )
-        _run_argv_with_pgkill(
+        if rm_task.timed_out or rm_task.spawn_error is not None or rm_task.returncode != 0:
+            print(
+                f"WARN: 9a cleanup task worktree remove failed "
+                f"({self.ctx.worktree_path}): "
+                f"{rm_task.stderr[-500:] or rm_task.spawn_error or 'timeout'}",
+                file=sys.stderr,
+            )
+        rm_branch = _run_argv_with_pgkill(
             ["git", "-C", str(repo_root),
              "branch", "-D", self.ctx.branch],
             cwd=repo_root,
             timeout_sec=_GIT_HEAD_QUERY_TIMEOUT_SEC,
         )
+        if rm_branch.timed_out or rm_branch.spawn_error is not None or rm_branch.returncode != 0:
+            print(
+                f"WARN: 9a cleanup branch -D failed "
+                f"({self.ctx.branch}): "
+                f"{rm_branch.stderr[-500:] or rm_branch.spawn_error or 'timeout'}",
+                file=sys.stderr,
+            )
 
         # 9a.5: cleanup verification worktree.
-        _run_argv_with_pgkill(
+        rm_verify = _run_argv_with_pgkill(
             ["git", "-C", str(repo_root),
              "worktree", "remove", "--force",
              str(self._verification_path())],
             cwd=repo_root,
             timeout_sec=_GIT_HEAD_QUERY_TIMEOUT_SEC,
         )
+        if rm_verify.timed_out or rm_verify.spawn_error is not None or rm_verify.returncode != 0:
+            print(
+                f"WARN: 9a cleanup verification worktree remove failed "
+                f"({self._verification_path()}): "
+                f"{rm_verify.stderr[-500:] or rm_verify.spawn_error or 'timeout'}",
+                file=sys.stderr,
+            )
 
         return Gate8Result(
             status="completed",
@@ -3267,14 +3291,34 @@ class Gate8VerificationRunner:
                 "%Y%m%dT%H%M%S%fZ",
             )
             target = aborted_root / f"{vpath.name}+failed+{ts_suffix}"
-        try:
-            vpath.rename(target)
-        except OSError as e:
+        # Use `git worktree move` so the registry at
+        # `.git/worktrees/<id>/gitdir` follows the directory — operator
+        # post-mortem (`git status`/`git log` inside the preserved dir)
+        # would break with a plain filesystem rename.
+        repo_root = self._repo_root()
+        move = _run_argv_with_pgkill(
+            ["git", "-C", str(repo_root),
+             "worktree", "move", str(vpath), str(target)],
+            cwd=repo_root,
+            timeout_sec=_GIT_HEAD_QUERY_TIMEOUT_SEC,
+        )
+        if move.timed_out or move.spawn_error is not None or move.returncode != 0:
             print(
-                f"WARN: failed to preserve verification worktree to "
-                f"{target} ({type(e).__name__}: {e})",
+                f"WARN: git worktree move failed "
+                f"({vpath} → {target}): "
+                f"{move.stderr[-500:] or move.spawn_error or 'timeout'}",
                 file=sys.stderr,
             )
+            # Defensive fallback: filesystem rename so the dir is still
+            # preserved (registry will mismatch — operator can repair).
+            try:
+                vpath.rename(target)
+            except OSError as e:
+                print(
+                    f"WARN: filesystem rename also failed "
+                    f"({type(e).__name__}: {e})",
+                    file=sys.stderr,
+                )
 
         return Gate8Result(
             status="blocked_post_merge",

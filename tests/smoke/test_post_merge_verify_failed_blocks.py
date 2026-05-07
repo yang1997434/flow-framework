@@ -239,6 +239,37 @@ class TestGate8FailPath(_Gate8Fixture):
         # chooses keep_and_fix_interactive / revert_merge / split / abort).
         self.assertTrue(self.ctx.worktree_path.exists())
 
+    def test_fail_path_preserved_worktree_is_git_usable(self) -> None:
+        """The whole point of preserve is post-mortem (operator runs
+        ``git status``/``git log`` inside the preserved dir). Plain
+        ``Path.rename`` would leave ``.git/worktrees/<id>/gitdir``
+        pointing to the OLD path → broken worktree. ``git worktree
+        move`` keeps the registry in sync."""
+        runner = Gate8VerificationRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="run1", task_id="T0",
+            target_commit_post_merge=self.post_merge_sha,
+        )
+        result = runner.verify(
+            criteria=[_crit("x", command="false")],
+            regression_command="true",
+        )
+        self.assertEqual(result.status, "blocked_post_merge")
+        aborted_root = (
+            self.tmp / ".claude" / "worktrees" / "verify" / "aborted"
+        )
+        preserved = list(aborted_root.glob("*+failed"))
+        self.assertEqual(len(preserved), 1, msg=f"found: {preserved}")
+        # git status inside preserved dir MUST work (registry tracks).
+        proc = subprocess.run(
+            ["git", "-C", str(preserved[0]), "status", "--porcelain"],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(
+            proc.returncode, 0,
+            msg=f"git status broken in preserved worktree: {proc.stderr}",
+        )
+
     def test_regression_smoke_failure_routes_to_9b(self) -> None:
         """Regression smoke command rc!=0 must route to 9b even when
         all per-criterion checks pass. Pins the helper choice — must
