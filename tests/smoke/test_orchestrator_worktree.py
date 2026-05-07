@@ -1089,9 +1089,21 @@ class TestRunPhase2Chain(unittest.TestCase):
         self.assertEqual(v.gate_result.details["block_row"], 7)
 
     def test_run_phase2_halts_at_gate3_when_manifest_violates(self) -> None:
-        """Baseline passes; manifest verifier blocks → halt before gate5/6."""
-        forbidden_facts = TaskFacts(
-            changed_files=["secrets/key.pem"], newly_added_files=[],
+        """Baseline passes; manifest verifier blocks → halt before gate5/6.
+
+        Codex round-1 [P2] update: ``run_phase2`` re-derives facts after
+        gate1, so this test must place a real forbidden file in the
+        worktree (not pass a stub TaskFacts). We write the forbidden
+        file as untracked content; derive_task_facts will surface it
+        via the working-tree porcelain scan.
+        """
+        secrets_dir = self.ctx.worktree_path / "secrets"
+        secrets_dir.mkdir(parents=True)
+        (secrets_dir / "key.pem").write_text("PRIVATE\n")
+        # Initial facts argument is irrelevant after the round-1 fix —
+        # run_phase2 re-derives. Pass an empty stub to make that explicit.
+        empty_facts = TaskFacts(
+            changed_files=[], newly_added_files=[],
             diff_hash="x", target_commit_pre_merge="y",
         )
         gr = GateRunner(
@@ -1099,7 +1111,7 @@ class TestRunPhase2Chain(unittest.TestCase):
             run_id="r1", task_id="T0",
         )
         v = gr.run_phase2(
-            manifest=self.manifest, facts=forbidden_facts,
+            manifest=self.manifest, facts=empty_facts,
             criteria=self.criteria,
             attempt_id="a1", retry_idx=0,
             baseline_command="true",
@@ -1108,6 +1120,46 @@ class TestRunPhase2Chain(unittest.TestCase):
         self.assertEqual(v.status, "blocked")
         self.assertEqual(v.halted_at_gate, "gate3_manifest")
         self.assertEqual(v.gate_result.details["block_row"], 3)
+        # Pin the round-1 [P2] fix: violation reflects the LIVE
+        # post-baseline disk state, not the stale stub.
+        self.assertIn(
+            "secrets/key.pem", v.gate_result.details["violations"]
+        )
+
+    def test_run_phase2_rederive_catches_baseline_side_effects(self) -> None:
+        """Codex round-1 [P2]: a baseline command that itself writes
+        forbidden files into the worktree must be caught by gate 3.
+        Pre-fix code passed the original facts straight through and
+        gate3 missed the violation entirely.
+        """
+        empty_facts = TaskFacts(
+            changed_files=[], newly_added_files=[],
+            diff_hash="x", target_commit_pre_merge="y",
+        )
+        gr = GateRunner(
+            ctx=self.ctx, contract=self.contract, task_dir=self.task_dir,
+            run_id="r1", task_id="T0",
+        )
+        # Baseline command is contract-author-supplied (E-class trusted).
+        # Here we simulate a "baseline that accidentally writes to a
+        # forbidden path" — e.g. a test runner with an enabled cache
+        # plugin that writes outside its configured cachedir.
+        baseline_cmd = (
+            f"mkdir -p {self.ctx.worktree_path}/secrets && "
+            f"echo CACHED > {self.ctx.worktree_path}/secrets/key.pem"
+        )
+        v = gr.run_phase2(
+            manifest=self.manifest, facts=empty_facts,
+            criteria=self.criteria,
+            attempt_id="a1", retry_idx=0,
+            baseline_command=baseline_cmd,
+            smoke_command="true",
+        )
+        self.assertEqual(v.status, "blocked")
+        self.assertEqual(v.halted_at_gate, "gate3_manifest")
+        self.assertIn(
+            "secrets/key.pem", v.gate_result.details["violations"]
+        )
 
 
 if __name__ == "__main__":

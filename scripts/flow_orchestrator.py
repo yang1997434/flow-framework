@@ -17,12 +17,15 @@ import datetime
 import fnmatch
 import hashlib
 import json
+import os
 import re
+import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 # Reuse the wave-planner's parser since the `### Tasks` block format is shared.
 # parse_plan_tasks takes raw markdown text (NOT a path) and returns list[Task].
@@ -886,6 +889,110 @@ def auto_dispatch_task(
 # contract author knows their suite is slower.
 _DEFAULT_GATE_TIMEOUT_SEC = 600
 
+# Codex T12 round-1 [P2]: bare ``subprocess.run(..., shell=True,
+# timeout=...)`` only kills the SHELL on timeout — child processes (test
+# servers, file watchers, ``&``-backgrounded jobs spawned by the test
+# command) keep running, leaking resources and continuing to mutate the
+# worktree after the gate has returned ``inconclusive``. T7's
+# ``_run_cmd`` already solved this with ``Popen(start_new_session=True)``
+# + ``os.killpg`` on the entire process group; we duplicate the pattern
+# here. SIGTERM grace window matches T7's constant.
+_PROCESS_GROUP_KILL_GRACE_SEC = 2.0
+
+
+@dataclass
+class _ShellRunResult:
+    """Compact result type for `_run_shell_with_pgkill` — mirrors the
+    subset of `subprocess.CompletedProcess` we use, plus an explicit
+    timeout flag so callers don't have to interpret exception state.
+    """
+    returncode: Optional[int]
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+    spawn_error: Optional[str] = None
+
+
+def _run_shell_with_pgkill(
+    command: str,
+    *,
+    cwd: Path,
+    timeout_sec: int,
+) -> _ShellRunResult:
+    """Run ``command`` via ``shell=True`` in its OWN process group,
+    capturing stdout/stderr. On timeout, SIGTERM the whole group, drain
+    briefly, then SIGKILL anything still alive — same pattern as T7's
+    ``AcceptanceRunner._run_cmd`` to address codex T12 round-1 [P2].
+
+    Returns a ``_ShellRunResult``; never raises ``TimeoutExpired`` (the
+    flag is on the result instead). ``OSError`` during spawn surfaces in
+    ``spawn_error`` with ``returncode=None``.
+
+    Trust boundary (E-class): caller is responsible for ensuring
+    ``command`` originates from a contract-author-trusted source.
+    ``shell=True`` is intentional — gate test commands are author-
+    composed shell strings (``pytest tests/ && bash extras.sh``-style).
+    """
+    try:
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            # POSIX: own session ⇒ own process group. Lets us killpg the
+            # entire descendant tree on timeout.
+            start_new_session=True,
+        )
+    except OSError as e:
+        return _ShellRunResult(
+            returncode=None, stdout="", stderr="",
+            spawn_error=f"{type(e).__name__}: {e}",
+        )
+
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_sec)
+        return _ShellRunResult(
+            returncode=proc.returncode,
+            stdout=stdout or "",
+            stderr=stderr or "",
+        )
+    except subprocess.TimeoutExpired:
+        # Two-stage kill of the WHOLE group, not just the shell.
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        # Brief grace for graceful shutdown.
+        deadline = time.monotonic() + _PROCESS_GROUP_KILL_GRACE_SEC
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(proc.pid, 0)  # probe — raises when group is gone
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        # Belt-and-suspenders SIGKILL regardless. The criterion already
+        # failed; the tree must be dead before we return.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        # Reap the shell so we don't leave a zombie. Group is dead by now;
+        # short bounded wait.
+        try:
+            stdout, stderr = proc.communicate(
+                timeout=_PROCESS_GROUP_KILL_GRACE_SEC,
+            )
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+        return _ShellRunResult(
+            returncode=None,
+            stdout=stdout or "",
+            stderr=stderr or "",
+            timed_out=True,
+        )
+
 
 @dataclass
 class GateResult:
@@ -985,39 +1092,32 @@ class GateRunner:
         clean, any current failure blocks. Naive equality on returncode
         — full per-test diffing is deferred (see BaselineRecord).
         """
-        try:
-            proc = subprocess.run(
-                test_command,
-                shell=True,
-                cwd=str(self.ctx.worktree_path),
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
+        result = _run_shell_with_pgkill(
+            test_command,
+            cwd=self.ctx.worktree_path,
+            timeout_sec=timeout_sec,
+        )
+        if result.spawn_error is not None:
+            return GateResult(
+                status="inconclusive",
+                details={
+                    "gate": "gate1_baseline",
+                    "reason": "spawn_failed",
+                    "error": result.spawn_error,
+                },
             )
-        except subprocess.TimeoutExpired as e:
+        if result.timed_out:
             return GateResult(
                 status="inconclusive",
                 details={
                     "gate": "gate1_baseline",
                     "reason": "timeout",
                     "timeout_sec": timeout_sec,
-                    "stderr_tail": (e.stderr or b"").decode(
-                        "utf-8", errors="replace"
-                    )[-2000:] if isinstance(e.stderr, (bytes, bytearray))
-                    else (e.stderr or "")[-2000:],
-                },
-            )
-        except OSError as e:
-            return GateResult(
-                status="inconclusive",
-                details={
-                    "gate": "gate1_baseline",
-                    "reason": "spawn_failed",
-                    "error": f"{type(e).__name__}: {e}",
+                    "stderr_tail": result.stderr[-2000:],
                 },
             )
 
-        if proc.returncode == 0:
+        if result.returncode == 0:
             return GateResult(
                 status="pass",
                 details={"pre_existing_fails": []},
@@ -1028,8 +1128,8 @@ class GateRunner:
             status="fail",
             details={
                 "block_row": 7,
-                "stderr_tail": proc.stderr[-2000:],
-                "returncode": proc.returncode,
+                "stderr_tail": result.stderr[-2000:],
+                "returncode": result.returncode,
             },
         )
 
@@ -1196,46 +1296,39 @@ class GateRunner:
 
         Same trust boundary + timeout semantics as gate 1.
         """
-        try:
-            proc = subprocess.run(
-                smoke_command,
-                shell=True,
-                cwd=str(self.ctx.worktree_path),
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
+        result = _run_shell_with_pgkill(
+            smoke_command,
+            cwd=self.ctx.worktree_path,
+            timeout_sec=timeout_sec,
+        )
+        if result.spawn_error is not None:
+            return GateResult(
+                status="inconclusive",
+                details={
+                    "gate": "gate6_regression",
+                    "reason": "spawn_failed",
+                    "error": result.spawn_error,
+                },
             )
-        except subprocess.TimeoutExpired as e:
+        if result.timed_out:
             return GateResult(
                 status="inconclusive",
                 details={
                     "gate": "gate6_regression",
                     "reason": "timeout",
                     "timeout_sec": timeout_sec,
-                    "stderr_tail": (e.stderr or b"").decode(
-                        "utf-8", errors="replace"
-                    )[-2000:] if isinstance(e.stderr, (bytes, bytearray))
-                    else (e.stderr or "")[-2000:],
-                },
-            )
-        except OSError as e:
-            return GateResult(
-                status="inconclusive",
-                details={
-                    "gate": "gate6_regression",
-                    "reason": "spawn_failed",
-                    "error": f"{type(e).__name__}: {e}",
+                    "stderr_tail": result.stderr[-2000:],
                 },
             )
 
-        if proc.returncode == 0:
+        if result.returncode == 0:
             return GateResult(status="pass")
         return GateResult(
             status="fail",
             details={
                 "block_row": 5,
-                "stderr_tail": proc.stderr[-2000:],
-                "returncode": proc.returncode,
+                "stderr_tail": result.stderr[-2000:],
+                "returncode": result.returncode,
             },
         )
 
@@ -1265,6 +1358,14 @@ class GateRunner:
 
         ``inconclusive`` from any gate also halts (it's "could not
         produce a verdict" — operator review owns the resolution).
+
+        Codex round-1 [P2]: re-derive facts AFTER gate 1 baseline. The
+        baseline command runs INSIDE the worktree (Q3.1) and may write
+        files (cache, build artifacts, accidental source mutation). The
+        ``facts`` argument was captured BEFORE baseline ran, so passing
+        it directly to gate 3 would let any baseline-introduced manifest
+        violation slip through. Refresh the snapshot now that gate 1 has
+        confirmed the suite is green.
         """
         r = self.gate1_baseline(
             test_command=baseline_command,
@@ -1277,7 +1378,12 @@ class GateRunner:
                 gate_result=r,
             )
 
-        r = self.gate3_manifest(manifest=manifest, facts=facts)
+        # Re-derive facts so gate 3 sees any disk state the baseline
+        # command produced. T11's `derive_task_facts` already covers
+        # committed + staged + unstaged + untracked layers (G-class).
+        post_baseline_facts = derive_task_facts(self.ctx)
+
+        r = self.gate3_manifest(manifest=manifest, facts=post_baseline_facts)
         if r.status != "pass":
             return Phase2Verdict(
                 status="blocked",
