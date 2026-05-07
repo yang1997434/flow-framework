@@ -4429,6 +4429,20 @@ def _task_already_completed(
     paths in the dispatcher will catch it before this skip is even
     relevant).
 
+    [P2] T19 codex round-2 (fail-closed on journal corruption):
+    if ANY line in decisions.jsonl is malformed (JSONDecodeError) OR
+    decodes to a non-dict (e.g. array literal), return False
+    immediately so the CrashRecoveryDispatcher takes over. T5's
+    ``detect_auto_prepare_state`` raises ``JournalCorruptError`` on
+    malformed lines (flow_state_writer.py JournalCorruptError →
+    ``interrupted_journal_corrupt`` state-2 block); silently skipping
+    malformed lines here would let a journal with a valid
+    task_completed plus a later truncated line bypass that stricter
+    fail-closed safety boundary. We also do NOT early-return on the
+    first task_completed match — full journal scan is required to
+    detect any later malformed line. This trades a tiny bit of CPU
+    for the guarantee that any corruption forces dispatcher routing.
+
     NOTE: ``post_merge_verify_failed`` and ``aborted_*`` are NOT
     "completed" — those land in CrashRecoveryDispatcher's state-3
     path (terminal-but-failed). This helper only matches the explicit
@@ -4444,23 +4458,32 @@ def _task_already_completed(
         # state checks will surface the real issue (e.g.
         # interrupted_journal_corrupt).
         return False
+
+    completed = False
     for line in text.splitlines():
         if not line.strip():
             continue
         try:
             rec = json.loads(line)
         except json.JSONDecodeError:
-            # Malformed line — skip; same posture as
-            # CrashRecoveryDispatcher._scan_decisions_jsonl.
-            continue
+            # [P2 codex round-2] fail-closed on journal corruption:
+            # any malformed line forces the dispatcher to handle this
+            # task. T5's interrupted_journal_corrupt path is the
+            # safety boundary; do NOT silently skip.
+            return False
         if not isinstance(rec, dict):
-            continue
+            # [P2 codex round-2] same fail-closed posture for non-dict
+            # records (e.g. an array literal sneaks in): force
+            # dispatcher routing.
+            return False
         if rec.get("run_id") != run_id or rec.get("task_id") != task_id:
             continue
         ev = rec.get("event")
         if isinstance(ev, str) and ev == EVENT_TASK_COMPLETED:
-            return True
-    return False
+            completed = True
+            # NOTE: do NOT early-return; finish scanning to ensure no
+            # malformed lines lurk later in the journal. See P2 above.
+    return completed
 
 
 def _resolve_or_create_run_id(task_dir: Path) -> str:

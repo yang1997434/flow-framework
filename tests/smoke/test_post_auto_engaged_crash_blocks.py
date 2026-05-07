@@ -770,13 +770,20 @@ class TestAlreadyCompletedSkip(unittest.TestCase):
             self.task_dir, run_id="r1", task_id="T0",
         ))
 
-    def test_helper_skips_malformed_jsonl(self):
-        """[P1] D5 typed-except: a malformed line on disk is forensic
-        litter, not a recovery signal. The helper skips it without
-        propagating json.JSONDecodeError.
+    def test_helper_fail_closes_on_malformed_jsonl(self):
+        """[P2] T19 codex round-2 fail-closed: contract reversal vs
+        round-1's silent-skip. A malformed line means we cannot trust
+        the journal as a completion signal — return False and let the
+        CrashRecoveryDispatcher's stricter ``interrupted_journal_corrupt``
+        path (T5 detect_auto_prepare_state → state-2 block) take over.
+        json.JSONDecodeError is still typed-caught (D5) — it does not
+        propagate; semantics flipped from continue-and-look-further to
+        immediate fail-closed return False.
         """
         from flow_orchestrator import _task_already_completed
-        # Pre-seed with a malformed line.
+        # Pre-seed with a malformed line followed by a valid completion.
+        # OLD round-1 behavior: skipped malformed, found completion → True.
+        # NEW round-2 behavior: malformed → fail-closed → False.
         (self.task_dir / "decisions.jsonl").write_text(
             "{not json\n"
             + json.dumps({
@@ -784,6 +791,80 @@ class TestAlreadyCompletedSkip(unittest.TestCase):
                 "run_id": "r1", "task_id": "T0",
             }) + "\n"
         )
+        self.assertFalse(_task_already_completed(
+            self.task_dir, run_id="r1", task_id="T0",
+        ))
+
+    def test_helper_fail_closes_on_corrupt_trailing_line(self):
+        """[P2] T19 codex round-2: valid auto_engaged + valid
+        task_completed + a TRAILING truncated line (atomic-write crash
+        sim) MUST NOT be classified as completed. Without the full-scan
+        + fail-closed change, round-1's helper returned True on the
+        first task_completed match and never noticed the trailing
+        corruption — bypassing T5's journal-corrupt block.
+        """
+        from flow_orchestrator import _task_already_completed
+        valid_engaged = json.dumps({
+            "event": EVENT_AUTO_ENGAGED, "event_id": "e0", "ts": "t",
+            "slug": "demo", "run_id": "r1", "task_id": "T0",
+            "worktree_id": "w", "worktree_path": "/tmp/wt",
+            "original_base_commit": "a" * 40,
+            "current_base_commit": "a" * 40,
+            "lifecycle_state": "active", "checkpoint_id": None,
+            "contract_path": "contract.json",
+            "contract_hash": "a" * 64,
+            "contract_schema_version": 1,
+        })
+        valid_completed = json.dumps({
+            "event": EVENT_TASK_COMPLETED, "event_id": "e1", "ts": "t",
+            "slug": "demo", "run_id": "r1", "task_id": "T0",
+            "worktree_id": "w", "final_diff_hash": "f" * 64,
+            "target_commit_post_merge": "deadbeef" + "0" * 32,
+        })
+        truncated = '{"event": "task_started", "run_id": "r1"'  # no }
+        (self.task_dir / "decisions.jsonl").write_text(
+            valid_engaged + "\n"
+            + valid_completed + "\n"
+            + truncated + "\n",
+        )
+        self.assertFalse(_task_already_completed(
+            self.task_dir, run_id="r1", task_id="T0",
+        ))
+
+    def test_helper_fail_closes_on_non_dict_record(self):
+        """[P2] T19 codex round-2: a JSON line that decodes but isn't a
+        dict (e.g. an array literal) is treated identically to malformed
+        — fail-closed return False so the dispatcher routes via the
+        journal-corrupt path.
+        """
+        from flow_orchestrator import _task_already_completed
+        valid_completed = json.dumps({
+            "event": EVENT_TASK_COMPLETED, "event_id": "e1", "ts": "t",
+            "slug": "demo", "run_id": "r1", "task_id": "T0",
+            "worktree_id": "w", "final_diff_hash": "f" * 64,
+            "target_commit_post_merge": "deadbeef" + "0" * 32,
+        })
+        non_dict = json.dumps([1, 2, 3])  # valid JSON, not a dict
+        (self.task_dir / "decisions.jsonl").write_text(
+            valid_completed + "\n" + non_dict + "\n",
+        )
+        self.assertFalse(_task_already_completed(
+            self.task_dir, run_id="r1", task_id="T0",
+        ))
+
+    def test_helper_full_scan_clean_journal_still_returns_true(self):
+        """[P2] T19 codex round-2 regression guard: removing the
+        early-return on first task_completed match must not break the
+        clean-journal happy path. Single valid task_completed event,
+        nothing else → still True.
+        """
+        from flow_orchestrator import _task_already_completed
+        append_autonomy_event(self.task_dir, EVENT_TASK_COMPLETED, {
+            "event_id": "e1", "ts": "t",
+            "slug": "demo", "run_id": "r1", "task_id": "T0",
+            "worktree_id": "w", "final_diff_hash": "f" * 64,
+            "target_commit_post_merge": "deadbeef" + "0" * 32,
+        })
         self.assertTrue(_task_already_completed(
             self.task_dir, run_id="r1", task_id="T0",
         ))
