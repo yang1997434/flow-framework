@@ -301,6 +301,77 @@ class TestCreateTaskWorktreeValidation(unittest.TestCase):
                 integration_target="master",
             )
 
+    def test_real_world_dotted_slug_accepted(self) -> None:
+        """T10 spec-review must-fix: the project's own slug shape uses
+        dots (``05-05-autonomous-mode-v0.8``). Allowlist must accept it.
+        """
+        ctx = create_task_worktree(
+            repo_root=self.tmp,
+            slug="05-05-autonomous-mode-v0.8",
+            task_idx=0, integration_target="master",
+        )
+        self.assertTrue(
+            ctx.worktree_id.startswith("05-05-autonomous-mode-v0.8+t0+")
+        )
+
+    def test_slug_with_double_dot_segment_rejected(self) -> None:
+        """Even though ``.`` is in the allowed charset, ``..`` is a
+        path-traversal token and must be denylisted explicitly.
+        """
+        with self.assertRaises(ValueError):
+            create_task_worktree(
+                repo_root=self.tmp,
+                slug="demo..secret",
+                task_idx=0, integration_target="master",
+            )
+
+
+class TestAutoDispatchTaskValidation(unittest.TestCase):
+    """T10 spec-review should-fix #1: `auto_dispatch_task` must reject
+    empty/whitespace ``run_id`` and ``contract_hash`` (F-class fail-open
+    closure — `append_autonomy_event` only validates key presence, so
+    empty strings would pass and journal a corrupt audit record).
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        _init_repo(self.tmp)
+        (self.tmp / ".flow" / "tasks" / "demo").mkdir(parents=True)
+        self.contract = Contract(
+            contract_schema_version=CONTRACT_SCHEMA_VERSION,
+            autonomy_mode="auto",
+            created_at="2026-05-06T00:00:00Z",
+        )
+
+    def _call(self, **overrides):
+        kwargs = dict(
+            slug="demo", task_idx=0, repo_root=self.tmp,
+            dispatch_fn=lambda _ctx: None,
+            contract=self.contract,
+            run_id="run-abc",
+            contract_path=self.tmp / "contract.json",
+            contract_hash="deadbeef" * 8,
+        )
+        kwargs.update(overrides)
+        return auto_dispatch_task(**kwargs)
+
+    def test_empty_run_id_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self._call(run_id="")
+
+    def test_whitespace_run_id_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self._call(run_id="   ")
+
+    def test_empty_contract_hash_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self._call(contract_hash="")
+
+    def test_non_path_contract_path_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            self._call(contract_path="contract.json")  # type: ignore[arg-type]
+
 
 if __name__ == "__main__":
     unittest.main()

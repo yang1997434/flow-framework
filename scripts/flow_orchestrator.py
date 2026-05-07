@@ -281,7 +281,13 @@ WORKTREE_ROOT = Path(".claude/worktrees")  # relative to repo root
 # refname like `master;rm -rf /` would be REJECTED by git, but we'd rather
 # fail-loud at the orchestrator boundary with a clear error than rely on
 # git's own validation surfacing through CalledProcessError).
-_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+# Slug allowlist: lowercase alphanumeric + `_-.` (the dot is needed for
+# real project slugs like ``05-05-autonomous-mode-v0.8`` — without it the
+# allowlist would reject this very project's own slug). The ``..`` denylist
+# is enforced separately to block path-traversal even when individual
+# characters are allowed.
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
+_SLUG_DENYLIST = ("..",)
 # Branch / refname allowlist (looser than slug — must allow `/` for
 # `release/v0.8.1` and the like). Disallows shell metachars + `..` (git
 # refname rule) + leading `-` (would be parsed as a flag).
@@ -368,6 +374,14 @@ def create_task_worktree(
         raise ValueError(
             f"slug must match {_SLUG_RE.pattern!r}; got {slug!r}"
         )
+    # Path-traversal denylist (defense-in-depth — the regex already blocks
+    # `/`, but double-dot path segments need an explicit guard since `.` is
+    # in the allowed charset).
+    for forbidden in _SLUG_DENYLIST:
+        if forbidden in slug:
+            raise ValueError(
+                f"slug contains forbidden sequence {forbidden!r}; got {slug!r}"
+            )
     if not isinstance(integration_target, str) or not _REF_RE.match(integration_target):
         raise ValueError(
             f"integration_target must match {_REF_RE.pattern!r}; "
@@ -467,10 +481,10 @@ def derive_task_facts(ctx: WorktreeContext) -> TaskFacts:
 def auto_dispatch_task(
     *, slug: str, task_idx: int, repo_root: Path,
     dispatch_fn,
-    contract: Optional[Contract] = None,
-    run_id: str = "",
-    contract_path: Optional[Path] = None,
-    contract_hash: str = "",
+    contract: Contract,
+    run_id: str,
+    contract_path: Path,
+    contract_hash: str,
     integration_target: str = "master",
 ) -> TaskFacts:
     """T10 orchestration shell — minimal scaffolding for one auto task.
@@ -503,7 +517,28 @@ def auto_dispatch_task(
     NOT create it here because by the time auto_dispatch_task runs the
     flow harness has already provisioned the slug directory (Phase 1/2
     ordering).
+
+    Non-empty validation (F-class fail-closed): ``run_id`` and
+    ``contract_hash`` are security-critical fields journaled into
+    ``decisions.jsonl`` for forensic recovery. Empty strings would pass
+    the writer's key-presence check (which validates schema shape, not
+    content) and produce a corrupt audit record. We reject them here so
+    the orchestrator boundary fails loud.
     """
+    for field_name, field_value in (
+        ("run_id", run_id),
+        ("contract_hash", contract_hash),
+    ):
+        if not isinstance(field_value, str) or not field_value.strip():
+            raise ValueError(
+                f"auto_dispatch_task: {field_name} must be a non-empty "
+                f"string; got {field_value!r}"
+            )
+    if not isinstance(contract_path, Path) or not str(contract_path).strip():
+        raise ValueError(
+            f"auto_dispatch_task: contract_path must be a non-empty "
+            f"Path; got {contract_path!r}"
+        )
     task_dir = repo_root / ".flow" / "tasks" / slug
     ctx = create_task_worktree(
         repo_root=repo_root,
@@ -529,11 +564,9 @@ def auto_dispatch_task(
             "current_base_commit": ctx.current_base_commit,
             "lifecycle_state": ctx.lifecycle_state,
             "checkpoint_id": None,
-            "contract_path": str(contract_path) if contract_path else "",
+            "contract_path": str(contract_path),
             "contract_hash": contract_hash,
-            "contract_schema_version": (
-                contract.contract_schema_version if contract else CONTRACT_SCHEMA_VERSION
-            ),
+            "contract_schema_version": contract.contract_schema_version,
         },
     )
     # Subagent boundary — opaque. Return value INTENTIONALLY discarded
