@@ -1371,6 +1371,15 @@ class GateRunner:
         """Count appearances of ``issue_id`` in this task's
         review-issues.jsonl. Missing file → 0; malformed lines skipped
         (T6 writer is the canonical producer; manual edits are best-effort).
+
+        Codex round-1 [P2] fix-3 (G-class disk-state): the JSONL is
+        scoped to the worktree task dir, but a worktree slug can host
+        SEVERAL tasks (T11, T12, ...) that share the same dir layout.
+        If a previous task logged the same canonical id, this task's
+        count starts non-zero — could hit CHURN_THRESHOLD without 3
+        actual codex rounds for THIS task. Filter on ``rec["task"] ==
+        self.task_id`` so the count is per-task, matching the §3
+        "after 3 rounds [for this task], escalate" semantics.
         """
         path = self.task_dir / "review-issues.jsonl"
         if not path.is_file():
@@ -1381,7 +1390,10 @@ class GateRunner:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if rec.get("id") == issue_id:
+            if (
+                rec.get("id") == issue_id
+                and rec.get("task") == self.task_id
+            ):
                 count += 1
         return count
 
@@ -1420,58 +1432,64 @@ class GateRunner:
         # E-class trust boundary: codex_command is INTERNAL — never build
         # this string from external / codex-emitted / user-controlled data.
         #
-        # Pitfall I (reuse prior helper): T7/T12 use ``_run_shell_with_
-        # pgkill`` for gate-test commands because those are
-        # contract-author-supplied shell strings that can fork test
-        # servers / watchers / & background jobs. ``codex_command`` is
-        # different — it's a fixed CLI invocation owned by gate 4
-        # itself, with no expected child-process tree. Fix-pass P2-2
-        # adds an explicit subprocess timeout (no process-group kill —
-        # codex CLI is a single binary, not a shell-orchestrated tree).
+        # Pitfall I (reuse prior helper): codex round-1 [P1] vindicated
+        # the recurring T7/T12 pattern. Original T13 used
+        # ``subprocess.run(shell=True, timeout=...)`` with the
+        # justification that "codex CLI is a single binary, no expected
+        # child-process tree". WRONG — with ``shell=True`` the SHELL is
+        # the parent and Python's timeout-kill only signals the shell.
+        # Children (codex's own subprocesses, the test stubs' ``sleep``,
+        # any fork the codex CLI does) become orphans. Now routed
+        # through the same ``_run_shell_with_pgkill`` helper that gate 1
+        # / gate 6 use so the WHOLE process group dies on timeout. The
+        # helper's ``_ShellRunResult`` is shaped to match this gate's
+        # branching needs — see field handling below.
         if codex_timeout_sec is None:
             codex_timeout_sec = _GATE4_CODEX_TIMEOUT_SEC
-        try:
-            proc = subprocess.run(
-                codex_command, shell=True,
-                cwd=str(self.ctx.worktree_path),
-                capture_output=True, text=True,
-                timeout=codex_timeout_sec,
+        result = _run_shell_with_pgkill(
+            codex_command,
+            cwd=self.ctx.worktree_path,
+            timeout_sec=codex_timeout_sec,
+        )
+        if result.spawn_error is not None:
+            # Spawn-time OSError (e.g. fork failure) — fail-closed
+            # inconclusive. Codex round-1 cited this as a recurring
+            # I-class amnesia: gate 1 / gate 6 already do this.
+            return GateResult(
+                status="inconclusive",
+                details={
+                    "gate": "gate4_codex_review",
+                    "reason": "spawn_failed",
+                    "error": result.spawn_error,
+                },
             )
-        except subprocess.TimeoutExpired as e:
+        if result.timed_out:
             # D5 catch-all: a hung codex CLI must NOT hang Phase 2.
-            # ``e.stderr`` may be bytes (binary mode) or str (text mode);
-            # H-class — handle both shapes explicitly rather than
-            # assuming one.
-            stderr_payload = e.stderr or ""
-            if isinstance(stderr_payload, (bytes, bytearray)):
-                stderr_tail = stderr_payload.decode(
-                    "utf-8", errors="replace",
-                )[-1000:]
-            else:
-                stderr_tail = stderr_payload[-1000:]
+            # ``_run_shell_with_pgkill`` already SIGTERM/SIGKILLed the
+            # entire process group; we just route the verdict.
             return GateResult(
                 status="inconclusive",
                 details={
                     "gate": "gate4_codex_review",
                     "reason": "codex_timeout",
                     "timeout_sec": codex_timeout_sec,
-                    "stderr_tail": stderr_tail,
+                    "stderr_tail": result.stderr[-1000:],
                 },
             )
 
-        if proc.returncode != 0:
+        if result.returncode != 0:
             return GateResult(
                 status="inconclusive",
                 details={
                     "gate": "gate4_codex_review",
                     "reason": "codex_cli_failed",
                     "error": "codex CLI failed",
-                    "returncode": proc.returncode,
-                    "stderr_tail": proc.stderr[-1000:],
+                    "returncode": result.returncode,
+                    "stderr_tail": result.stderr[-1000:],
                 },
             )
         try:
-            output = json.loads(proc.stdout)
+            output = json.loads(result.stdout)
         except json.JSONDecodeError:
             return GateResult(
                 status="inconclusive",
@@ -1479,7 +1497,7 @@ class GateRunner:
                     "gate": "gate4_codex_review",
                     "reason": "codex_output_not_json",
                     "error": "codex output not JSON",
-                    "stdout_tail": proc.stdout[-1000:],
+                    "stdout_tail": result.stdout[-1000:],
                 },
             )
         if not isinstance(output, dict):
@@ -1490,7 +1508,7 @@ class GateRunner:
                 details={
                     "gate": "gate4_codex_review",
                     "reason": "codex_output_not_object",
-                    "stdout_tail": proc.stdout[-1000:],
+                    "stdout_tail": result.stdout[-1000:],
                 },
             )
 
@@ -1508,7 +1526,7 @@ class GateRunner:
                     "gate": "gate4_codex_review",
                     "reason": "unknown_verdict",
                     "verdict": verdict,
-                    "stdout_tail": proc.stdout[-1000:],
+                    "stdout_tail": result.stdout[-1000:],
                 },
             )
 
@@ -1526,7 +1544,7 @@ class GateRunner:
                 details={
                     "gate": "gate4_codex_review",
                     "reason": "issues_not_list",
-                    "stdout_tail": proc.stdout[-1000:],
+                    "stdout_tail": result.stdout[-1000:],
                 },
             )
 
@@ -1542,14 +1560,14 @@ class GateRunner:
         # inconclusive WITHOUT writing.
         issue_ids: list[str] = []
         staged: list[tuple[str, str, str]] = []  # (issue_id, severity, msg)
-        for issue in issues:
+        for idx, issue in enumerate(issues):
             if not isinstance(issue, dict):
                 return GateResult(
                     status="inconclusive",
                     details={
                         "gate": "gate4_codex_review",
                         "reason": "issue_not_object",
-                        "stdout_tail": proc.stdout[-1000:],
+                        "stdout_tail": result.stdout[-1000:],
                     },
                 )
             # F fail-closed: every required key MUST be present. We do
@@ -1564,33 +1582,95 @@ class GateRunner:
                         "gate": "gate4_codex_review",
                         "reason": "issue_missing_required_field",
                         "missing": missing,
-                        "stdout_tail": proc.stdout[-1000:],
+                        "stdout_tail": result.stdout[-1000:],
                     },
                 )
+            # Codex round-1 [P1] fix-2 (D5/F deeper): presence-check is
+            # not enough. JSON ``null`` / int / list survives ``key in
+            # dict`` but breaks the canonical id pipeline silently:
+            #   - ``message=None`` → AttributeError on later
+            #     ``.lower()`` calls in S7 normalization → uncaught
+            #     exception (NOT fail-closed inconclusive).
+            #   - ``file=42`` (or any non-string) → str()-ified into
+            #     the SHA hash with garbage → wrong canonical id →
+            #     churn detection silently unreliable.
+            # Both modes route to inconclusive instead.
+            for k in self._REQUIRED_ISSUE_KEYS:
+                if not isinstance(issue[k], str):
+                    return GateResult(
+                        status="inconclusive",
+                        details={
+                            "gate": "gate4_codex_review",
+                            "reason": "malformed_issue_non_string_field",
+                            "field": k,
+                            "type": type(issue[k]).__name__,
+                            "idx": idx,
+                            "stdout_tail": result.stdout[-1000:],
+                        },
+                    )
             issue_id = canonical_issue_id(
                 issue["file"], issue["line_range"],
                 issue["class"], issue["message"],
             )
             issue_ids.append(issue_id)
-            # Severity is optional with a sane default (T6 enum allows
-            # "med"); reviewer is fixed to "codex" since this gate IS
-            # the codex review.
-            severity = issue.get("severity", "med")
-            if severity not in ("critical", "high", "med", "low", "info"):
+            # Severity is optional. When PRESENT but non-string (e.g.
+            # ``"severity": 5``) → fail-closed inconclusive (codex
+            # round-1 fix-2 — same D5/F class as the required-key
+            # type check above; non-string severity must NOT silently
+            # demote to "med" because that masks a malformed payload).
+            # When PRESENT-and-string-but-not-in-enum → demote to
+            # "med" (T6 enum default; preserves prior behavior for
+            # forward-compat unknown-but-string severities).
+            if "severity" in issue:
+                if not isinstance(issue["severity"], str):
+                    return GateResult(
+                        status="inconclusive",
+                        details={
+                            "gate": "gate4_codex_review",
+                            "reason": "malformed_issue_non_string_field",
+                            "field": "severity",
+                            "type": type(issue["severity"]).__name__,
+                            "idx": idx,
+                            "stdout_tail": result.stdout[-1000:],
+                        },
+                    )
+                severity = issue["severity"]
+                if severity not in ("critical", "high", "med", "low", "info"):
+                    severity = "med"
+            else:
                 severity = "med"
             staged.append((issue_id, severity, issue["message"]))
 
-        # Pass 2: every issue validated → persist. We freeze the
-        # timestamp once for the whole batch so all rows from a single
-        # codex round share the same ts (audit-log clarity; no
-        # microsecond drift between adjacent rows). Any per-row
-        # I/O failure here legitimately leaves a partial write on disk
-        # — that's a disk-state failure (G-class), not a parse-time
+        # Codex round-1 [P2] fix-4: per-round dedupe. If a single
+        # codex response contains N entries that normalize to the
+        # same canonical id (e.g. wording variants on the same line),
+        # we MUST write only one row — otherwise round 1 alone
+        # crosses CHURN_THRESHOLD=3 and triggers churn from a single
+        # response. Cross-round churn is the documented behavior
+        # (§3 line 141: "after 3 rounds, escalate"), per-round
+        # duplication is not.
+        seen_ids: set[str] = set()
+        unique_staged: list[tuple[str, str, str]] = []
+        unique_issue_ids: list[str] = []
+        for tup in staged:
+            iid = tup[0]
+            if iid in seen_ids:
+                continue
+            seen_ids.add(iid)
+            unique_staged.append(tup)
+            unique_issue_ids.append(iid)
+
+        # Pass 2: every issue validated → persist (deduped). We freeze
+        # the timestamp once for the whole batch so all rows from a
+        # single codex round share the same ts (audit-log clarity; no
+        # microsecond drift between adjacent rows). Any per-row I/O
+        # failure here legitimately leaves a partial write on disk —
+        # that's a disk-state failure (G-class), not a parse-time
         # poisoning, and is surfaced through the normal exception path.
         ts = datetime.datetime.now(datetime.UTC).strftime(
             "%Y-%m-%dT%H:%M:%SZ",
         )
-        for issue_id, severity, message in staged:
+        for issue_id, severity, message in unique_staged:
             append_review_issue(self.task_dir, ReviewIssueRecord(
                 id=issue_id,
                 ts=ts,
@@ -1603,11 +1683,14 @@ class GateRunner:
 
         # Churn detection — issue ids that have appeared
         # CHURN_THRESHOLD+ times across this task's review history.
-        # Counts include the rows we JUST appended, so the threshold is
-        # the inclusive Nth round (matches the §3 line 141 spec
-        # "after 3 rounds, escalate").
+        # Counts include the rows we JUST appended (deduped to one
+        # per round), so the threshold is the inclusive Nth round
+        # (matches the §3 line 141 spec "after 3 rounds, escalate").
+        # ``issue_ids`` carries every original (pre-dedupe) id so the
+        # caller still sees the full count of issues codex reported,
+        # but churn fires only on cross-round repetition.
         churn_ids = [
-            iid for iid in issue_ids
+            iid for iid in unique_issue_ids
             if self._count_issue_id_in_history(iid) >= self.CHURN_THRESHOLD
         ]
         existing_details: dict = {

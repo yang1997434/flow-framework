@@ -10,10 +10,12 @@ Plan §10 cases:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -1425,6 +1427,199 @@ class TestGate4CodexReview(unittest.TestCase):
         self.assertEqual(r.status, "inconclusive")
         self.assertEqual(r.details["reason"], "codex_timeout")
         self.assertEqual(r.details["timeout_sec"], 1)
+
+    # ------------------------------------------------------------------
+    # Codex round-1 fix-pass tests (P1-1 pgkill, P1-2 non-string fail-
+    # closed, P2-3 task-scoped churn, P2-4 per-round dedupe).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pgrep_sleep_children() -> set[int]:
+        """Return the PIDs of every ``sleep`` process whose ppid chain
+        includes the current Python process. Pure ``/proc`` scan — no
+        ``pgrep`` shell-out (we are testing process-group cleanup; we
+        must not use a helper that itself spawns its own children).
+        """
+        my_pid = os.getpid()
+        # Walk /proc once, build pid → ppid + comm map.
+        pid_info: dict[int, tuple[int, str]] = {}
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                with open(f"/proc/{pid}/stat", "r") as f:
+                    line = f.read()
+                # /proc/<pid>/stat: pid (comm) state ppid ...
+                # ``comm`` may contain spaces or parens — locate the
+                # rightmost ``)`` to find its end deterministically.
+                rparen = line.rindex(")")
+                comm = line[line.index("(") + 1:rparen]
+                rest = line[rparen + 2:].split()
+                ppid = int(rest[1])
+                pid_info[pid] = (ppid, comm)
+            except (FileNotFoundError, ProcessLookupError, ValueError,
+                    OSError):
+                continue
+        # Find every PID whose ancestor chain includes my_pid.
+        descendants: set[int] = set()
+        for pid, (ppid, comm) in pid_info.items():
+            cur = ppid
+            seen = {pid}
+            while cur and cur != 1 and cur not in seen:
+                if cur == my_pid:
+                    descendants.add(pid)
+                    break
+                nxt = pid_info.get(cur)
+                if nxt is None:
+                    break
+                seen.add(cur)
+                cur = nxt[0]
+        return {
+            pid for pid in descendants
+            if pid_info.get(pid, (0, ""))[1] == "sleep"
+        }
+
+    def test_gate4_timeout_kills_child_process_group(self) -> None:
+        """Codex round-1 [P1] fix-1: timeout MUST SIGKILL the entire
+        process group, not just the shell. With ``shell=True``, the
+        old ``subprocess.run(timeout=...)`` only signaled the shell —
+        the child ``sleep 30`` survived as an orphan. The fix routes
+        gate 4 through ``_run_shell_with_pgkill`` (same helper gate 1
+        and gate 6 use), which calls ``killpg(SIGTERM)`` then
+        ``killpg(SIGKILL)`` on the whole session.
+
+        This test runs ``sleep 30`` with ``timeout=1`` and asserts no
+        ``sleep`` PID descended from this Python process survives the
+        gate's return.
+        """
+        gr = self._make_runner()
+        pre = self._pgrep_sleep_children()
+        r = gr.gate4_codex_review(
+            codex_command="sleep 30",
+            codex_timeout_sec=1,
+        )
+        self.assertEqual(r.status, "inconclusive")
+        self.assertEqual(r.details["reason"], "codex_timeout")
+        # Give the OS up to 2s to reap. The helper SIGKILLs by then.
+        deadline = time.time() + 2
+        leaked: set[int] = set()
+        while time.time() < deadline:
+            post = self._pgrep_sleep_children()
+            leaked = post - pre
+            if not leaked:
+                break
+            time.sleep(0.1)
+        self.assertFalse(
+            leaked,
+            f"sleep child leaked after timeout (pgkill regression): "
+            f"{leaked}",
+        )
+
+    def test_gate4_non_string_message_fail_closed(self) -> None:
+        """Codex round-1 [P1] fix-2: ``"message": null`` must route
+        to ``inconclusive`` (D5/F deeper). Pre-fix, presence-check
+        passed but ``.lower()`` later in the canonical-id pipeline
+        threw an uncaught AttributeError — NOT fail-closed.
+        """
+        gr = self._make_runner()
+        # Build the JSON via json.dumps so ``null`` makes it through
+        # the shell echo → JSON parse pipeline as a Python None.
+        stub = json.dumps({
+            "verdict": "RED",
+            "issues": [{
+                "file": "x.py", "line_range": "L1",
+                "class": "c", "message": None,
+                "severity": "high",
+            }],
+        })
+        r = gr.gate4_codex_review(codex_command=f"echo '{stub}'")
+        self.assertEqual(r.status, "inconclusive")
+        self.assertEqual(
+            r.details["reason"], "malformed_issue_non_string_field",
+        )
+        self.assertEqual(r.details["field"], "message")
+        # P1-1 invariant — no rows persist on validation failure.
+        issues_path = gr.task_dir / "review-issues.jsonl"
+        self.assertFalse(issues_path.is_file())
+
+    def test_gate4_non_string_file_fail_closed(self) -> None:
+        """Codex round-1 [P1] fix-2: ``"file": 42`` would silently
+        ``str()``-ify into the SHA hash, producing a wrong canonical
+        id and unreliable churn detection. Now fail-closes."""
+        gr = self._make_runner()
+        stub = json.dumps({
+            "verdict": "RED",
+            "issues": [{
+                "file": 42, "line_range": "L1",
+                "class": "c", "message": "m",
+                "severity": "high",
+            }],
+        })
+        r = gr.gate4_codex_review(codex_command=f"echo '{stub}'")
+        self.assertEqual(r.status, "inconclusive")
+        self.assertEqual(
+            r.details["reason"], "malformed_issue_non_string_field",
+        )
+        self.assertEqual(r.details["field"], "file")
+        self.assertEqual(r.details["type"], "int")
+
+    def test_count_issue_id_history_excludes_other_tasks(self) -> None:
+        """Codex round-1 [P2] fix-3: ``review-issues.jsonl`` is
+        slug-task-dir scoped, but a slug can host multiple tasks.
+        Pre-fix, count was just ``rec["id"] == issue_id`` —
+        previous-task entries inflated the current task's churn
+        count, potentially escalating WITHOUT 3 codex rounds for
+        THIS task. Now filter on ``rec["task"] == self.task_id``.
+        """
+        gr = self._make_runner()
+        other_id = canonical_issue_id("z.py", "L9", "c", "m")
+        # Pre-seed 5 entries from a DIFFERENT task with same canonical id.
+        for _ in range(5):
+            append_review_issue(gr.task_dir, ReviewIssueRecord(
+                id=other_id,
+                ts="2026-05-07T00:00:00Z",
+                task="T_OTHER",  # ← different task id
+                severity="high",
+                reviewer="codex",
+                description="m",
+                disposition="open",
+            ))
+        # From THIS task's perspective the count must be 0 (none of
+        # the entries are scoped to ``self.task_id``).
+        self.assertEqual(gr._count_issue_id_in_history(other_id), 0)
+
+    def test_gate4_dedupes_duplicate_issues_in_one_round(self) -> None:
+        """Codex round-1 [P2] fix-4: 3 duplicate-id issues in one
+        codex response → 1 row written, churn does NOT fire on round
+        1 alone. Cross-round churn is the documented behavior;
+        single-response duplicates are NOT.
+        """
+        gr = self._make_runner()
+        dup_issue = {
+            "file": "x.py", "line_range": "L1",
+            "class": "c", "message": "m", "severity": "high",
+        }
+        stub = json.dumps({
+            "verdict": "RED",
+            "issues": [dup_issue, dup_issue, dup_issue],
+        })
+        r = gr.gate4_codex_review(codex_command=f"echo '{stub}'")
+        self.assertEqual(r.status, "fail")
+        self.assertFalse(
+            r.escalate,
+            "churn must NOT fire from dupes within 1 round",
+        )
+        self.assertNotIn("churn", r.details)
+        issues_path = gr.task_dir / "review-issues.jsonl"
+        rows = [
+            json.loads(line)
+            for line in issues_path.read_text().splitlines()
+        ]
+        self.assertEqual(
+            len(rows), 1,
+            "duplicates within a single round must collapse to 1 row",
+        )
 
 
 class TestRunPhase2InsertsGate4(unittest.TestCase):
