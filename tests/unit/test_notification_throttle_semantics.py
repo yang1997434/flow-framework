@@ -11,17 +11,21 @@ Coverage (per plan §T16):
 - T16 fix-pass: lock-timeout fail-open (per docstring contract)
 - T16 fix-pass: OSC 9 body sanitize (control-char injection / truncation /
   legal-pass-through)
+- T16 codex round-1: naive ISO timestamp fail-open + recovery; RMW IO
+  error fail-open; frontmatter_extra NotImplementedError; '::' rejection
 """
 from __future__ import annotations
 
 import fcntl
 import io
+import json
 import sys
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -513,6 +517,307 @@ class TestSanitizeHelperUnit(unittest.TestCase):
         # Strip happens BEFORE truncation: 250 control chars → 0,
         # then no truncation needed.
         self.assertEqual(_sanitize_osc_text("\x07" * 250), "")
+
+
+class TestCodexRound1NaiveTimestamp(unittest.TestCase):
+    """T16 codex round-1 P2.1: naive ISO timestamp in state file MUST NOT
+    crash _allowed_by_throttle with TypeError ("can't subtract offset-
+    naive and offset-aware datetimes"). Pre-fix: TypeError escaped the
+    `except ValueError` clause and propagated past `_locked_throttle_rmw`
+    → entire `_maybe_fire_tier2` aborted → OSC 9 silently suppressed
+    (fail-CLOSED, contradicting docstring).
+
+    Post-fix:
+    - TypeError caught alongside ValueError (timestamp parse path)
+    - naive datetime coerced to UTC (one-shot recovery — gets rewritten
+      in canonical aware "...Z" format on the same call)
+    - within-window naive timestamps STILL throttle (after coercion)
+    - outside-window or malformed naive timestamps fail-open + rewrite
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp))
+
+    def _notifier(self, throttle_min=5):
+        n = Notifier(
+            contract=Contract(
+                contract_schema_version=1,
+                autonomy_mode="auto",
+                created_at="2026-05-06T00:00:00Z",
+                notification={
+                    "command": None,
+                    "throttle_min": throttle_min,
+                    "tier2_enabled": True,
+                },
+            ),
+            slug="d",
+            task_dir=Path(self.tmp),
+            term_program="kitty",
+        )
+        n._stderr = io.StringIO()
+        return n
+
+    def test_throttle_naive_timestamp_in_state_file_fails_open(self):
+        """Repro: write a naive ISO timestamp (no tzinfo, no 'Z') as
+        state file content. Pre-fix: fire_block raises TypeError.
+        Post-fix: OSC 9 emitted (fail-open / coerce-to-UTC) AND state
+        file rewritten in canonical aware format."""
+        # Naive timestamp ≥ throttle window in the past so coercion
+        # results in fail-open (window expired) — exercises the TypeError
+        # → fall-through-to-rewrite branch.
+        state_path = Path(self.tmp) / THROTTLE_FILENAME
+        state_path.write_text(
+            json.dumps({"T1::i1": "1999-01-01T00:00:00"}),
+            encoding="utf-8",
+        )
+        n = self._notifier(throttle_min=5)
+        # Should NOT raise.
+        n.fire_block(
+            block_type="x", phase=2, task_id="T1", issue_id="i1",
+            why_blocked="x", required_choice=["abort"],
+            safe_resume_command="flow resume d",
+        )
+        # OSC 9 emitted despite naive ts in state file.
+        self.assertIn("\x1b]9;", n._stderr.getvalue())
+        # State file rewritten in canonical aware ("...Z") format.
+        rewritten = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertTrue(rewritten["T1::i1"].endswith("Z"))
+
+    def test_throttle_naive_timestamp_within_window_still_throttles(self):
+        """Coerce-to-UTC contract: naive ts representing recent emission
+        MUST still throttle (not blanket fail-open) — otherwise external
+        tools writing naive timestamps would defeat the throttle entirely.
+        We assume legacy naive == UTC."""
+        # Inject a naive timestamp 30s in the past (UTC) — well within a
+        # 5-minute window. After coerce-to-UTC, throttle should suppress.
+        import datetime as _dt
+        recent_naive = (
+            _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+            - _dt.timedelta(seconds=30)
+        ).strftime("%Y-%m-%dT%H:%M:%S")  # no 'Z', no tzinfo
+        state_path = Path(self.tmp) / THROTTLE_FILENAME
+        state_path.write_text(
+            json.dumps({"T1::i1": recent_naive}), encoding="utf-8",
+        )
+        n = self._notifier(throttle_min=5)
+        n.fire_block(
+            block_type="x", phase=2, task_id="T1", issue_id="i1",
+            why_blocked="x", required_choice=["abort"],
+            safe_resume_command="flow resume d",
+        )
+        # Throttled: naive ts coerced to UTC → still in 5-min window → no OSC 9.
+        self.assertNotIn("\x1b]9;", n._stderr.getvalue())
+
+    def test_throttle_io_error_in_state_file_fails_open(self):
+        """Outer fail-open contract: if _locked_throttle_rmw raises
+        OSError mid-RMW (FS gone, permission yanked, etc.),
+        _allowed_by_throttle MUST return True — operator gets the
+        emission. Pre-fix: OSError escaped to caller → entire
+        fire_block path aborted → OSC 9 silenced."""
+        n = self._notifier(throttle_min=5)
+        # Patch the module-level _locked_throttle_rmw to raise OSError.
+        import flow_notification as fn_mod
+        with mock.patch.object(
+            fn_mod, "_locked_throttle_rmw",
+            side_effect=OSError("simulated FS error"),
+        ):
+            n.fire_block(
+                block_type="x", phase=2, task_id="T1", issue_id="i1",
+                why_blocked="x", required_choice=["abort"],
+                safe_resume_command="flow resume d",
+            )
+        # OSC 9 emitted despite RMW error.
+        self.assertIn("\x1b]9;", n._stderr.getvalue())
+
+    def test_throttle_recovers_after_naive_to_aware_format(self):
+        """End-to-end recovery: 1st call sees naive ts → fail-open +
+        rewrite in aware format. 2nd call sees aware ts → normal
+        throttle behavior (suppress within window)."""
+        # Step 1: pre-seed with naive ts representing 1h ago (outside
+        # 5-min window even after coerce) — exercise the rewrite path.
+        import datetime as _dt
+        old_naive = (
+            _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
+            - _dt.timedelta(hours=1)
+        ).strftime("%Y-%m-%dT%H:%M:%S")
+        state_path = Path(self.tmp) / THROTTLE_FILENAME
+        state_path.write_text(
+            json.dumps({"T1::i1": old_naive}), encoding="utf-8",
+        )
+        n = self._notifier(throttle_min=5)
+        # First fire: naive ts old → window expired → fail-open + rewrite.
+        n.fire_block(
+            block_type="x", phase=2, task_id="T1", issue_id="i1",
+            why_blocked="x", required_choice=["abort"],
+            safe_resume_command="flow resume d",
+        )
+        self.assertEqual(n._stderr.getvalue().count("\x1b]9;"), 1)
+        # Verify rewritten in aware format.
+        rewritten = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertTrue(rewritten["T1::i1"].endswith("Z"))
+        # Second fire immediately after: now aware ts in state, throttle
+        # suppresses normally.
+        n.fire_block(
+            block_type="x", phase=2, task_id="T1", issue_id="i1",
+            why_blocked="x", required_choice=["abort"],
+            safe_resume_command="flow resume d",
+        )
+        # Still only 1 OSC 9 — second call throttled normally.
+        self.assertEqual(n._stderr.getvalue().count("\x1b]9;"), 1)
+
+
+class TestCodexRound1FrontmatterExtra(unittest.TestCase):
+    """T16 codex round-1 P2.2: fire_block must not silently drop
+    frontmatter_extra. Production caller (flow_orchestrator.py:824)
+    passes ``{"block_row": verdict.block_row}`` directly to write_blocked
+    today; if a future migration routes through Notifier, block_row would
+    vanish from blocked.md without this guard. NotImplementedError forces
+    T19 wire-up to handle pass-through."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp))
+
+    def _notifier(self):
+        n = Notifier(
+            contract=Contract(
+                contract_schema_version=1,
+                autonomy_mode="auto",
+                created_at="2026-05-06T00:00:00Z",
+                notification={
+                    "command": None,
+                    "throttle_min": 0,
+                    "tier2_enabled": True,
+                },
+            ),
+            slug="d",
+            task_dir=Path(self.tmp),
+            term_program="kitty",
+        )
+        n._stderr = io.StringIO()
+        return n
+
+    def test_frontmatter_extra_raises_not_implemented(self):
+        n = self._notifier()
+        with self.assertRaises(NotImplementedError) as ctx:
+            n.fire_block(
+                block_type="x", phase=2, task_id="T1", issue_id="i1",
+                why_blocked="x", required_choice=["abort"],
+                safe_resume_command="flow resume d",
+                frontmatter_extra={"block_row": 5},
+            )
+        # Error message names the future-wire path so implementer of T19
+        # finds the right context fast.
+        self.assertIn("T19", str(ctx.exception))
+        self.assertIn("write_blocked", str(ctx.exception))
+
+    def test_frontmatter_extra_none_is_allowed(self):
+        """Default None / empty dict must NOT trigger NotImplementedError
+        — only non-empty dicts (which would be silently dropped) raise."""
+        n = self._notifier()
+        # No frontmatter_extra at all (default None).
+        path = n.fire_block(
+            block_type="x", phase=2, task_id="T1", issue_id="i1",
+            why_blocked="x", required_choice=["abort"],
+            safe_resume_command="flow resume d",
+        )
+        self.assertTrue(path.exists())
+        # Empty dict: equivalent to None.
+        n2 = self._notifier()
+        path2 = n2.fire_block(
+            block_type="x", phase=2, task_id="T1", issue_id="i1",
+            why_blocked="x", required_choice=["abort"],
+            safe_resume_command="flow resume d",
+            frontmatter_extra={},
+        )
+        self.assertTrue(path2.exists())
+
+
+class TestCodexRound1KeyDelimiterReject(unittest.TestCase):
+    """T16 codex round-1 P3: '::' inside task_id or issue_id MUST raise
+    ValueError before throttle key composition. Otherwise:
+        task_id="a", issue_id="b::c"   → key "a::b::c"
+        task_id="a::b", issue_id="c"   → key "a::b::c"
+    → cross-issue/task throttle suppression. Up-front reject prevents
+    the ambiguous-join collision class entirely."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp))
+
+    def _notifier(self):
+        n = Notifier(
+            contract=Contract(
+                contract_schema_version=1,
+                autonomy_mode="auto",
+                created_at="2026-05-06T00:00:00Z",
+                notification={
+                    "command": None,
+                    "throttle_min": 5,  # throttle on — exercises key path
+                    "tier2_enabled": True,
+                },
+            ),
+            slug="d",
+            task_dir=Path(self.tmp),
+            term_program="kitty",
+        )
+        n._stderr = io.StringIO()
+        return n
+
+    def test_throttle_key_delimiter_in_task_id_rejected(self):
+        n = self._notifier()
+        with self.assertRaises(ValueError) as ctx:
+            n.fire_block(
+                block_type="x", phase=2,
+                task_id="a::b",  # contains delimiter
+                issue_id="i1",
+                why_blocked="x", required_choice=["abort"],
+                safe_resume_command="flow resume d",
+            )
+        self.assertIn("::", str(ctx.exception))
+
+    def test_throttle_key_delimiter_in_issue_id_rejected(self):
+        n = self._notifier()
+        with self.assertRaises(ValueError) as ctx:
+            n.fire_block(
+                block_type="x", phase=2,
+                task_id="T1",
+                issue_id="b::c",  # contains delimiter
+                why_blocked="x", required_choice=["abort"],
+                safe_resume_command="flow resume d",
+            )
+        self.assertIn("::", str(ctx.exception))
+
+    def test_throttle_key_delimiter_throttle_zero_does_not_reject(self):
+        """When throttle_min=0, key composition path is short-circuited
+        BEFORE the '::' check. Confirm we don't accidentally reject in
+        that path (would be a behavior-regression for existing callers
+        with throttle disabled)."""
+        n = Notifier(
+            contract=Contract(
+                contract_schema_version=1,
+                autonomy_mode="auto",
+                created_at="2026-05-06T00:00:00Z",
+                notification={
+                    "command": None,
+                    "throttle_min": 0,
+                    "tier2_enabled": True,
+                },
+            ),
+            slug="d",
+            task_dir=Path(self.tmp),
+            term_program="kitty",
+        )
+        n._stderr = io.StringIO()
+        # Should NOT raise — throttle disabled, key never composed.
+        n.fire_block(
+            block_type="x", phase=2,
+            task_id="a::b", issue_id="c::d",
+            why_blocked="x", required_choice=["abort"],
+            safe_resume_command="flow resume d",
+        )
+        self.assertIn("\x1b]9;", n._stderr.getvalue())
 
 
 if __name__ == "__main__":

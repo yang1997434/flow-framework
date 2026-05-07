@@ -35,10 +35,13 @@ Pitfall defenses (per .flow/pitfalls/claude-review-blindspots.md):
     enforced on task_id and issue_id BEFORE composing throttle key.
   - F-class (identity check fail-open): we don't perform identity checks;
     notification side effects do not depend on hash equivalence.
-  - D5 (typed except gaps): `_read_throttle_state` catches only
-    json.JSONDecodeError (file corruption is the documented failure mode);
-    parse of a single timestamp uses ValueError which is documented behavior
-    of `datetime.fromisoformat`. Other exceptions propagate.
+  - D5 (typed except gaps): timestamp parse catches BOTH ValueError
+    (malformed ISO string per `datetime.fromisoformat` contract) AND
+    TypeError (naive datetime arithmetic when state file holds a
+    timestamp without tzinfo — naive datetime → coerced to UTC then
+    rewritten in canonical aware form). Outer RMW wrapper catches
+    OSError + json.JSONDecodeError per fail-open contract. Other
+    exceptions propagate (no catch-all `except Exception`).
 """
 from __future__ import annotations
 
@@ -223,7 +226,7 @@ class Notifier:
         why_blocked: str,
         required_choice: list[str],
         safe_resume_command: str,
-        frontmatter_extra: Optional[dict] = None,  # noqa: ARG002 (reserved)
+        frontmatter_extra: Optional[dict] = None,
     ) -> Path:
         """Tier 1 (always) + Tier 2 (throttled) + Tier 3 (schema-only).
 
@@ -231,6 +234,17 @@ class Notifier:
         TypeError if task_id / issue_id are non-string (L-class defense).
         Errors from write_blocked (e.g., I/O failures) propagate — Tier 1
         is a safety surface, fail-closed.
+
+        ``frontmatter_extra`` is a reserved parameter for future T19
+        wire-up: callers like flow_orchestrator.py pass extras such as
+        ``{"block_row": verdict.block_row}`` directly to ``write_blocked``
+        today. Once Notifier owns the dispatch path, this field will pass
+        through to ``write_blocked``. Until then, **passing a non-empty
+        dict raises NotImplementedError** rather than silently dropping
+        operator-critical fields (e.g. ``block_row`` would vanish from
+        blocked.md if dropped). Loud failure forces T19 implementer to
+        wire it through. Empty dict / None is allowed (no extras → no
+        ambiguity).
         """
         # L-class: enforce string identity BEFORE composing throttle key.
         # `isinstance` is the gate; non-string raises rather than silently
@@ -242,6 +256,19 @@ class Notifier:
         if not isinstance(issue_id, str):
             raise TypeError(
                 f"issue_id must be str, got {type(issue_id).__name__}"
+            )
+
+        # P2.2 (codex round-1): loud footgun — accepting frontmatter_extra
+        # but not threading it to write_blocked silently drops fields like
+        # block_row that production callers pass today via direct
+        # write_blocked invocation. Force T19 wire-up to handle this.
+        if frontmatter_extra:
+            raise NotImplementedError(
+                "Notifier.fire_block: frontmatter_extra is reserved for "
+                "future wiring through write_blocked; pass-through not yet "
+                "implemented (see T19 follow-up). Caller must use "
+                "write_blocked directly until then if extra frontmatter "
+                "is required."
             )
 
         # Tier 1: ALWAYS write blocked.md. Errors propagate.
@@ -405,6 +432,18 @@ class Notifier:
         if throttle_min <= 0:
             return True
 
+        # P3 (codex round-1): reject '::' inside task_id / issue_id BEFORE
+        # composing the throttle key. Otherwise ``"a" + "b::c"`` collides
+        # with ``"a::b" + "c"`` → cross-issue/task throttle suppression.
+        # Up-front reject is cheap and forces callers to use unambiguous
+        # identifiers (task_id / issue_id should not contain reserved
+        # delimiters anyway).
+        if "::" in task_id or "::" in issue_id:
+            raise ValueError(
+                "task_id / issue_id must not contain '::' "
+                "(reserved as throttle-state key delimiter)"
+            )
+
         key = f"{task_id}::{issue_id}"
         now = _utcnow()
         path = self.task_dir / THROTTLE_FILENAME
@@ -423,15 +462,30 @@ class Notifier:
             last_iso = state.get(key)
             if isinstance(last_iso, str):
                 # Tolerate trailing 'Z' (parser writes that form below).
+                # P2.1 (codex round-1): catch BOTH ValueError (malformed
+                # ISO string) AND TypeError. TypeError arises when:
+                #   - state file holds a naive ISO timestamp (no tzinfo)
+                #     and `now - last` raises "can't subtract offset-naive
+                #     and offset-aware datetimes"
+                # Mitigation: coerce naive → UTC (assume legacy state
+                # written without tzinfo represents UTC) so that we still
+                # honor the throttle window when state is recoverable;
+                # only fall through to fail-open + rewrite when truly
+                # unparseable.
                 try:
                     last = datetime.datetime.fromisoformat(
                         last_iso.replace("Z", "+00:00")
                     )
+                    if last.tzinfo is None:
+                        # Naive datetime — coerce to UTC. The next write
+                        # below rewrites the state in canonical aware
+                        # format ("...Z"), so this is one-shot recovery.
+                        last = last.replace(tzinfo=datetime.timezone.utc)
                     age_sec = (now - last).total_seconds()
                     if age_sec < throttle_min * 60:
                         decision["allowed"] = False
                         return state, False  # no write — within window
-                except ValueError:
+                except (ValueError, TypeError):
                     # Corrupt timestamp — fail-open (re-fire). Documented
                     # in module docstring: throttle is ergonomic, not a
                     # safety boundary.
@@ -452,5 +506,20 @@ class Notifier:
         #   2. transform decided "no write" (within window) — decision was
         #      explicitly flipped to False inside the closure.
         # Either way the answer is decision["allowed"].
-        _locked_throttle_rmw(path, _transform)
+        #
+        # P2.1 outer fail-open (codex round-1): even with the typed except
+        # inside _transform, the RMW helper itself can raise OSError (FS
+        # gone away mid-call) or json.JSONDecodeError (corrupt state that
+        # somehow slipped past the inner sanitizer — defense in depth).
+        # Per module docstring, ALL throttle-state IO failures degrade to
+        # "operator gets the emission". We deliberately do NOT use
+        # `except Exception` — that's the D5 anti-pattern (catch-all
+        # swallows real bugs); we enumerate the documented IO failure
+        # modes.
+        try:
+            _locked_throttle_rmw(path, _transform)
+        except (OSError, json.JSONDecodeError):
+            # IO / corruption mid-RMW → fail-open per docstring. Caller
+            # gets the emission; next call re-attempts the lock.
+            return True
         return decision["allowed"]
