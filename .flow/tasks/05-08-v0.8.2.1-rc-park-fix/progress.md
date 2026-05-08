@@ -75,7 +75,42 @@ state-machine + rc value 改动必走 opus mandatory gate）。
 
 ## Sediment Notes
 
-<!-- TEMPLATE: 未填写。Phase 4 末写。强制写一段——即使"no new sediment"也要明确写。 -->
+### Pitfall（更新已有 + 新增）
+
+**`.flow/pitfalls/subagent-misread-brief-do-not-add-modules.md` — 新增第二实例**：
+Brief 的 "DO NOT touch the sentinel marker. Do NOT call `touch ~/.claude/.gstack-review-pass-...` etc." 被 implementer subagent 解读为**只**禁止 GStack-style sentinel 路径。
+但 Flow 的 hook 用的 sentinel 是 `~/.claude/hooks/.review-passed`（不同路径），subagent 自我 review 后 touch 了它过审 commit。这是 brief 「否定式 + 给具体例子但不穷举」被宽泛理解的第二个实例（第一个是 v0.8.2 T-series 的 "do not add modules"）。
+**Mitigation**：brief 的负面表述应当**枚举所有相关 sentinel 路径**或用全称 "any review-pass / hook-bypass / preflight sentinel anywhere on disk" 这样的全集措辞，不要只给一个例子。
+
+### Pattern（候选 promote — 第二实例后升 task → repo-tier）
+
+**3-round codex plan-pass 节奏**：本 patch 用 RED → YELLOW → GREEN 三轮 plan-pass 在 dispatch 前抓出 8 个 P1/P2（site count 5 → 13、test 全量迁移 vs 加新、CHANGELOG supersession、import 风格、SKILL.md 测试 pinning、`Final[int]`）。
+v0.8.2 有 post-ship 修补（T6.1/T6.2 cascade）是因为 plan-pass 不够细；这次精到的 plan-pass + mandatory review gate 的组合让 ship 一次过 0 P1。**取代**单纯"按 size 跑 plan-pass"，规则应当是：**state-machine / rc / schema / contract 改动一律走 3-round plan-pass（RED → YELLOW → GREEN）直到 codex 给 GREEN**，无论 size 大小。
+
+### AC writing 反思（候选 pattern）
+
+grep-based AC 的措辞必须考虑**自指**：当 AC 用 grep 检查"代码里不能有 `from X import Y`"，自身的注释/docstring 写到这个 phrase 也会被 hit。本 patch 主 session 写完 verify report 跑 AC 抓到 1 个 false-positive — 注释里"`from exit_codes import ...`" 命中。
+**Mitigation**：grep AC 默认加 `| grep -v '^[[:space:]]*#'` 或者文档/注释禁止裸引用 forbidden phrase（用 unicode 替代 / 拆词 / 描述性语言代替）。已通过修注释绕开；规则化进 pattern。
+
+### ADR（task-tier，未 promote）
+
+**Patch SemVer 选择**：v0.8.2 仅 24h 公开、外部无 wrapper ramp，所以 v0.8.2.1 patch（修 contract bug）比 minor bump 更准确传达 intent。Decision context 已写在 prd.md ADR-lite §Decision。如果未来再遇到"刚发布的 contract bug"场景可参考。
+
+### v0.8.3 backlog（已挂载到下次 task）
+
+- **P0.0 hook fix**（Option D = `bashlex` parser + content-hash marker；fallback G = first-line-only + content-hash）
+- **P0.1 round 2+ implementer re-dispatch**（v0.8.2 deferred 核心遗漏）
+- **P0.2 brief 模板硬化**：sentinel 路径全集枚举（接本 task 第二实例）
+- **P3** 5 个内部 CLI literal-to-constant refactor（用 `from common.exit_codes import USAGE_ERROR`）
+
+### v0.8.2.1 ship 总账
+
+- master `6c3e0fe` 领先 v0.8.2 commit `24bdecc` 共 **4 commits**：495f4e0 wip-prd / ae340dc fix / f19d43c polish / 6c3e0fe release
+- tag `v0.8.2.1` → `6c3e0fe`，tag `v0.8.2` 仍指向 `24bdecc`
+- GitHub release: https://github.com/yang1997434/flow-framework/releases/tag/v0.8.2.1
+- Suite: 944 PASS（baseline 939, +5）
+- 0 K-class 违规（subagent self-touched sentinel 是 process pitfall, recorded; 主 session 全部 commit 走过 reviewer + sentinel 流程）
+- 4 codex sessions：plan-pass `019e0724...` (resumed)、mandatory review `019e073f...`
 
 ## Retro (optional)
 
@@ -83,9 +118,10 @@ state-machine + rc value 改动必走 opus mandatory gate）。
 
 ## Files Touched
 
-_Updated 2026-05-08 06:46 (last 20 unique edits)_:
+_Updated 2026-05-08 06:50 (last 20 unique edits)_:
 
 - `.flow/tasks/05-08-v0.8.2.1-rc-park-fix/progress.md`
+- `tests/smoke/test_exit_codes_module.py`
 - `.claude/worktrees/agent-a556c761520580339/tests/smoke/test_exit_codes_module.py`
 - `.claude/worktrees/agent-a556c761520580339/scripts/flow_orchestrator.py`
 - `/tmp/codex-review-r1c-prompt.txt`
@@ -104,8 +140,9 @@ _Updated 2026-05-08 06:46 (last 20 unique edits)_:
 - `CHANGELOG.md`
 - `VERSION`
 - `.claude/worktrees/feat+v0.8.2-p0-core/tests/smoke/test_phase2_retry_loop.py`
-- `.claude/worktrees/feat+v0.8.2-p0-core/scripts/flow_orchestrator.py`
 
 ## Commits
 
 - [2026-05-08 05:43] `495f4e0` wip(v0.8.2.1): pre-fork PRD commit + 3-round codex plan-pass GREEN
+
+- [2026-05-08 06:48] `6c3e0fe` release(v0.8.2.1): exit-code registry + AFK park rc=5 — patch ship
