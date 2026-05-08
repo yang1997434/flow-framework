@@ -9,19 +9,53 @@ Turn prd.md into code. Dispatch sub-agents per task type + change size.
 
 > **Safety**: before any destructive operation in this phase (`rm -rf`, `git reset --hard`, `DROP TABLE`, force-push, `kubectl delete`, migrations), invoke `{{capability:safety_guardrails}}`. See orchestrator §Cross-cutting capabilities.
 
-## v0.8.0 autonomy guard
+## Auto mode (v0.8.1+)
 
 Before doing anything else: if `progress.md` frontmatter sets
-`autonomy_mode: auto`, run
+`autonomy_mode: auto`, invoke
 
 ```bash
-python3 scripts/flow.py orchestrator --auto-execute <slug>
+flow orchestrator --auto-execute <slug>
 ```
 
-This will exit with code 2 and a "v0.8.0 does not support autonomous dispatch"
-message. That is by design. Acknowledge to the user, then fall through to
-the existing interactive Phase 2 flow (treat the contract as a planning
-artifact only). v0.8.1+ removes this guard.
+The orchestrator owns (v0.8.1 dispatch foundation):
+
+- **Worktree-per-task dispatch** (`<slug>+t<n>+<shortsha>` naming, dual-base
+  recording).
+- **8-gate runner**: 1 baseline / 2 subagent execution / 3 manifest verify /
+  4 codex review / 5 acceptance criteria / 6 regression smoke /
+  7 local merge / 8 post-merge verify in ephemeral verification worktree.
+  **Gates run ONCE per dispatch in v0.8.1** — no retry loop (deferred to
+  v0.8.2).
+- **Tier 1 + Tier 2 notification** (`blocked.md` + OSC 9 + BEL with throttle).
+- **Crash recovery** (5-state classifier: pre-lock / lock+dead-pid /
+  auto_engaged crash / mid-merge / verification-orphan).
+- **Nested-autonomy mechanical guard** (`FLOW_AUTONOMY_PARENT_PID` env var).
+
+**NOT in v0.8.1** (deferred to v0.8.2): AFK timeout, budget enforcement
+(5 counters with paused clock), Phase 2 retry loop, in-loop staleness
+gate. v0.8.1 fails fast on first gate non-pass via Notifier. Run
+`flow doctor <slug>` BEFORE invoking `--auto-execute` to check
+staleness (the in-loop gate ships in v0.8.2).
+
+**Subagent contract** (PRD §1.2): execute the per-task prompt; return
+narrative summary ONLY. Orchestrator derives facts from worktree
+`git diff` and test logs — subagent self-report fields are ignored.
+DO NOT attempt manual worktree management or merge from inside this
+SKILL — the orchestrator has the authority.
+
+**Hard rule (§7)**: once `auto_engaged` event has been written, any
+subsequent path to interactive mode MUST go through
+`block + user choice`. NEVER silently switch — this includes crash
+recovery on next-startup. If `flow orchestrator --auto-execute <slug>`
+exits non-zero, follow `blocked.md` instructions for the user choice.
+
+Exit codes:
+
+- `0` = clean completion, OR contract missing → interactive fallback
+  (legal pre-lock — user never opted in this attempt).
+- `3` = block raised (`blocked.md` written; user resume needed).
+- `4` = `aborted_nested` (nested-autonomy attempt detected).
 
 ## Step 1 — Determine dispatch strategy
 

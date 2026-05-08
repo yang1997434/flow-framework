@@ -18,6 +18,27 @@ Before any other Phase 3 action, invoke `{{capability:verify_completion}}`. This
 
 This is non-skippable. The capability has no `skip_if_not_available` flag because superpowers is a baseline plugin.
 
+### Step 0.5 — Verify gate (v0.8.1+)
+
+If `contract.json` defines `acceptance_criteria`, invoke
+
+```bash
+flow acceptance --run <slug>
+```
+
+This dispatches to `flow_acceptance.AcceptanceRunner` with `phase=3`.
+Phase 3 retry rules apply (R2: behavior / e2e / regression NEVER local —
+always escalate to `blocked_escalate` per design §1 row 6).
+
+The CLI exits `0` when every criterion evaluates to `PASS`, and `1` on
+the first non-PASS criterion (with a `FAIL: criterion <idx> ...`
+diagnostic on stderr). Treat exit 1 as a Phase 3 blocker — investigate
+and fix before proceeding.
+
+The legacy test + codex-only gate below runs ONLY when
+`acceptance_criteria` is empty (backward compat for v0.6 / v0.7 plans
+without v0.8.1 contracts).
+
 ### Step 1: Quality gate (gstack-dependent)
 
 If gstack is installed, invoke `{{capability:quality_health}}` for a composite 0-10 quality score (typecheck + lint + tests + dead code). Treat scores < 7 as a Phase 3 blocker — investigate and fix before proceeding to review.

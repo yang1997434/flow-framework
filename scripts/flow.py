@@ -17,8 +17,10 @@ Usage:
   flow waves <subcmd>    -- preview/inspect wave decomposition
                             (--preview / --show / --invalidate <slug>)
   flow contract <subcmd>  -- contract.json validate/init (--validate <slug> / --init <slug>)
-  flow orchestrator <subcmd> -- dry-run preview / auto-execute (disabled in v0.8.0)
+  flow orchestrator <subcmd> -- dry-run preview / auto-execute
                                (--dry-run <slug> / --auto-execute <slug>)
+  flow acceptance <subcmd> -- v0.8.1+ Phase 3 verify gate
+                              (--run <slug> [--phase {2,3}])
   flow version           -- show version
 """
 from __future__ import annotations
@@ -69,6 +71,7 @@ def main():
         "waves": "flow_waves.py",
         "contract": "flow_contract.py",   # NEW
         "orchestrator": "flow_orchestrator.py",  # NEW v0.8.0
+        "acceptance": "flow_acceptance_cli.py",  # NEW v0.8.1 (T22)
     }
 
     if cmd in ("version", "--version", "-v"):

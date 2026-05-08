@@ -207,13 +207,18 @@
     "_v0_8_phase2_additions": "Phase 2 capabilities added in v0.8.0 (autonomy orchestrator)",
     "autonomy_orchestrator": {
       "default": "flow:flow-phase2-execute",
-      "description": "Phase 2 — autonomous orchestrator (v0.8.0 stub: dry-run only; v0.8.1 extends with worktree-per-task dispatch + safety stack)",
-      "skip_if_not_available": true
+      "description": "Phase 2 — autonomous orchestrator (v0.8.1 promoted: worktree-per-task dispatch + 8-gate runner + Notifier + crash recovery)",
+      "skip_if_not_available": false,
+      "v0_8_1_promoted": true,
+      "backed_by": "scripts/flow_orchestrator.py:auto_dispatch_task",
+      "dispatch_cmd": "flow:flow-phase2-execute --slug {slug} --task {task_id} --worktree {worktree}"
     },
     "acceptance_verify": {
       "default": "flow:flow-phase3-finish",
-      "description": "Phase 3 — acceptance_criteria runner gate (v0.8.0 stub: not yet wired; v0.8.1 extends with all 5 criterion-type executors)",
-      "skip_if_not_available": true
+      "description": "Phase 3 — acceptance_criteria runner gate (v0.8.1 promoted: all 5 criterion-type executors + Phase 3 retry routing)",
+      "skip_if_not_available": false,
+      "v0_8_1_promoted": true,
+      "backed_by": "scripts/flow_acceptance.py:AcceptanceRunner"
     }
   },
 
