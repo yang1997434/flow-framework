@@ -222,3 +222,5 @@ _Updated 2026-05-08 04:21 (last 20 unique edits)_:
 - [2026-05-08 01:06] `b4a99f4` chore: promote 18-class blindspot framework to vault
 
 - [2026-05-08 04:00] `65afc5d` docs(v0.8.3-prep): hook block-after-PASS root cause investigated
+
+- [2026-05-08 05:01] `d493e9c` docs(v0.8.2-retro): expand hook pitfall (codex round-4) + audit log
