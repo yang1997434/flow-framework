@@ -15,13 +15,19 @@ fill may diverge by ±20% due to JSON metadata, tool payload escaping, etc.
 Limit resolution priority chain (see `_resolve_limit`):
   1. ``FLOW_CONTEXT_LIMIT`` env var (explicit override, positive int tokens)
   2a. ``~/.claude/settings.json::env::ANTHROPIC_DEFAULT_<BASE>_MODEL``
-      ending ``[1m]`` (BASE inferred from detected model: opus / sonnet /
-      haiku) -> 1_000_000 (model-specific alias match)
+      (BASE inferred from detected model: opus / sonnet / haiku):
+        - alias ends ``[1m]`` -> 1_000_000 (upgrade)
+        - alias is a string without ``[1m]`` -> the user has explicitly
+          selected the 200k base; short-circuit to ``MODEL_LIMITS`` (i.e.
+          skip 2b entirely). This respects an explicit non-1M choice.
+        - alias is absent (None) or non-string -> fall through to 2b.
   2b. *Plan-level heuristic*: any ``ANTHROPIC_DEFAULT_*_MODEL`` entry in
       settings.json ending ``[1m]`` -> 1_000_000 for the current model.
       1M context is a plan/pricing-level Anthropic add-on (not per-
       model), so any [1m] alias is a strong signal the user's plan
       grants 1M to all models — even ones the user hasn't aliased.
+      **Only applies when the matching base alias is absent, not merely
+      when it exists without a ``[1m]`` suffix** (round-2 [P2] guard).
   3. ``MODEL_LIMITS`` table lookup
   4. ``DEFAULT_LIMIT`` (200_000)
 
@@ -150,24 +156,52 @@ def _resolve_limit(model: Optional[str]) -> int:
             if value > 0:
                 return value
 
-    # Rung 2a: settings.json env-alias [1m] suffix on the matching base.
+    # Rung 2a: settings.json env-alias on the matching base.
+    #
+    # Three sub-cases on the matching base alias:
+    #   (i)   alias is a string ending ``[1m]``         -> 1M (upgrade)
+    #   (ii)  alias is a string but does NOT end ``[1m]``
+    #         -> user has *explicitly* selected the 200k base; respect that
+    #            choice and short-circuit straight to the table value.
+    #            DO NOT fall through to rung 2b — round-2 [P2] guard.
+    #   (iii) alias is absent entirely (None) — i.e. the user has not
+    #         aliased this base at all -> fall through to rung 2b plan-
+    #         level heuristic, which can still infer 1M from a sibling
+    #         base alias.
+    # Non-string alias values (lists, ints, etc.) are treated like (iii):
+    # we cannot trust them to express user intent in either direction, so
+    # we let rung 2b decide.
     if model:
         env_key = _env_key_for_model(model)
         if env_key is not None:
             alias = _read_settings_env_var(env_key)
-            # Type guard (L-class): only act on string values that we can
-            # safely call .endswith() on.
-            if isinstance(alias, str) and alias.endswith("[1m]"):
-                # Only upgrade — never downgrade. If the table somehow lists
-                # a higher limit for this exact id, prefer that.
-                table_limit = MODEL_LIMITS.get(model, 0)
-                return max(ONE_MILLION_LIMIT, table_limit)
+            # L-class type guard: only string aliases carry user intent.
+            if isinstance(alias, str):
+                if alias.endswith("[1m]"):
+                    # Case (i): only upgrade — never downgrade. If the
+                    # table somehow lists a higher limit for this exact
+                    # id, prefer that.
+                    table_limit = MODEL_LIMITS.get(model, 0)
+                    return max(ONE_MILLION_LIMIT, table_limit)
+                # Case (ii): explicit non-1M choice. Respect it and skip
+                # rung 2b plan-level scan entirely. Codex round-2 [P2]:
+                # without this short-circuit, an unrelated sibling alias
+                # (e.g. ``ANTHROPIC_DEFAULT_SONNET_MODEL=...[1m]``) would
+                # silently upgrade this model from 200k -> 1M and
+                # contradict the user's explicit selection.
+                return MODEL_LIMITS.get(model, DEFAULT_LIMIT)
+            # else (non-string / None): fall through to rung 2b.
 
     # Rung 2b: plan-level heuristic. 1M context is an Anthropic plan-level
     # add-on, not a per-model setting. If the user has aliased *any* base
     # model with a [1m] suffix, infer the plan covers 1M for all models —
-    # so the current model (which 2a missed because it has no matching
-    # alias) is also 1M-enabled.
+    # so the current model (which 2a missed because the matching base
+    # alias is absent) is also 1M-enabled.
+    #
+    # Round-2 [P2] guard: this rung only applies when the matching alias
+    # is *absent*, not merely when it exists without a ``[1m]`` suffix.
+    # The case (ii) short-circuit above ensures we only reach here when
+    # case (iii) — alias absent — holds.
     if model and _any_settings_alias_signals_1m():
         table_limit = MODEL_LIMITS.get(model, 0)
         return max(ONE_MILLION_LIMIT, table_limit)

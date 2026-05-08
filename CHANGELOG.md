@@ -33,9 +33,14 @@ hardened 8-gate safety stack:
   percent inflation on 1M-mode sessions whose transcripts record bare
   `claude-opus-4-7`, including the common case where the user only
   aliased one base (e.g. sonnet) but runs others under the same plan.
-  22 unit cases in `tests/unit/test_context_estimator_1m_resolution.py`.
+  - Round-2 [P2] guard: rung 2b only applies when the matching alias
+    is *absent*, not merely when it exists without a `[1m]` suffix —
+    so an explicit non-1M alias (e.g.
+    `ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7`) is no longer
+    silently upgraded by an unrelated sibling alias.
+  24 unit cases in `tests/unit/test_context_estimator_1m_resolution.py`.
 
-**Validation**: full suite 820 cases passing (717 smoke + 103 unit);
+**Validation**: full suite 822 cases passing (717 smoke + 105 unit);
 `flow doctor` clean; `flow_selftest.py` ALL CHECKS PASSED; 3 contract
 fixtures (`docs/fixtures/v081-{minimal,typical,advanced}.json`)
 validate; v0.8.0 forward-compat smoke green.

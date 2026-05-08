@@ -340,6 +340,67 @@ class TestResolveLimitPriorityChain(_SettingsHomeMixin, unittest.TestCase):
                 MODEL_LIMITS["claude-opus-4-7"],
             )
 
+    # ---- Round-2 [P2]: explicit non-1M alias must short-circuit 2b -------
+    # Codex round-2 finding: round-1's plan-level heuristic (rung 2b)
+    # fired whenever rung 2a didn't return 1M, including the case where
+    # the user explicitly set the matching base alias to a non-1M value
+    # (e.g. ``ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7``, no ``[1m]``).
+    # In that case a sibling alias with [1m] could silently upgrade the
+    # explicitly-200k model to 1M, contradicting the user's selection
+    # and underreporting context fill by 5x.
+    #
+    # Fix: rung 2b only fires when the matching alias is *absent* (None /
+    # non-string), not merely "exists but no [1m]". Cases below pin both
+    # halves of that distinction.
+    def test_explicit_non_1m_alias_blocks_plan_level_upgrade(self):
+        """[P2] reproduce: explicit non-1M opus alias + sibling [1m] -> 200k.
+
+        Production case: ``ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7``
+        (bare, explicit 200k) coexists with
+        ``ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6[1m]``. Pre-fix
+        rung 2b would scan the env block, find the sonnet [1m] alias,
+        and upgrade the opus transcript to 1M — contradicting the
+        explicit OPUS choice. Post-fix: rung 2a case (ii) short-circuits
+        to the table value (200k) and rung 2b never runs.
+        """
+        self._make_home(settings_payload={
+            "env": {
+                # Explicit non-1M choice for OPUS
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-7",
+                # Sibling [1m] alias that pre-fix would have caused
+                # spurious plan-level upgrade
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6[1m]",
+            }
+        })
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FLOW_CONTEXT_LIMIT", None)
+            self.assertEqual(
+                _resolve_limit("claude-opus-4-7"),
+                MODEL_LIMITS["claude-opus-4-7"],  # 200_000
+            )
+            # Sanity: sonnet itself still resolves to 1M via rung 2a
+            self.assertEqual(_resolve_limit("claude-sonnet-4-6"), 1_000_000)
+
+    def test_absent_alias_still_triggers_plan_level_upgrade(self):
+        """Sanity: round-1 behavior preserved when matching alias absent.
+
+        Distinct from ``test_plan_level_heuristic_sonnet_alias_upgrades_opus``
+        only in framing: that test was the round-1 [P1] reproduce; this
+        one re-asserts the same invariant from the round-2 perspective —
+        rung 2b *must* still upgrade when the matching base alias is
+        truly absent (not merely "exists but no [1m]"), so the round-2
+        guard didn't accidentally lobotomise the plan-level heuristic.
+        """
+        self._make_home(settings_payload={
+            "env": {
+                # OPUS alias deliberately absent
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6[1m]",
+            }
+        })
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FLOW_CONTEXT_LIMIT", None)
+            self.assertEqual(_resolve_limit("claude-opus-4-7"), 1_000_000)
+
 
 class TestEstimatePctIntegration(_SettingsHomeMixin, unittest.TestCase):
     """End-to-end: real transcript fixture + env alias -> sane pct."""
