@@ -27,6 +27,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from common import budget_counter as bc  # noqa: E402  type: ignore
 from common.afk_monitor import AfkMonitor  # noqa: E402  type: ignore
+from common.exit_codes import PARKED_RECOVERABLE  # noqa: E402  type: ignore
 from common.snapshot import HardStopSnapshot  # noqa: E402  type: ignore
 from flow_orchestrator import (  # noqa: E402  type: ignore
     Contract,
@@ -736,16 +737,18 @@ class TestT61LastHaltedGateInSnapshot(unittest.TestCase):
 
 
 # ----------------------------------------------------------------------
-# T6.2 P1.1 — afk_idle_park returns rc=2 (distinct from rc=0 pass and
-# rc=3 terminal-with-snapshot). _cmd_auto_execute must NOT proceed to
-# gate-7 merge when Phase 2 parked. Park-becomes-merge would silently
-# merge partial work — semantic regression of T6.1.
+# T8.2.1 P1.1 (was T6.2 in v0.8.2 with rc=2; v0.8.2.1 corrected to
+# rc=5 = PARKED_RECOVERABLE) — afk_idle_park returns rc=5 (distinct
+# from rc=0 pass and rc=3 terminal-with-snapshot). _cmd_auto_execute
+# must NOT proceed to gate-7 merge when Phase 2 parked. Park-becomes-
+# merge would silently merge partial work — semantic regression of T6.1.
 # ----------------------------------------------------------------------
 
-class TestT62Phase2DispatchParkReturnsRc2(unittest.TestCase):
-    """T6.2 P1.1: rc mapping in `_phase2_dispatch`:
+class TestT821Phase2DispatchParkReturnsRc5(unittest.TestCase):
+    """T8.2.1 P1.1 (legacy v0.8.2 T6.2; corrected to rc=5 in v0.8.2.1):
+    rc mapping in `_phase2_dispatch`:
         pass            -> 0
-        afk_idle_park   -> 2  (RECOVERABLE; no snapshot, no notifier)
+        afk_idle_park   -> 5  (RECOVERABLE; no snapshot, no notifier)
         terminal-w-snap -> 3  (snapshot persisted + notifier fired)
     """
 
@@ -763,9 +766,10 @@ class TestT62Phase2DispatchParkReturnsRc2(unittest.TestCase):
             },
         )
 
-    def test_phase2_dispatch_park_returns_rc2_no_merge(self):
-        """wait-mode AFK timeout in `_phase2_dispatch` -> rc=2.
-        No hard-stop.json on disk. Notifier MUST NOT have been fired."""
+    def test_phase2_dispatch_park_returns_rc5_no_merge(self):
+        """wait-mode AFK timeout in `_phase2_dispatch` -> rc=5
+        (PARKED_RECOVERABLE). No hard-stop.json on disk. Notifier MUST
+        NOT have been fired."""
         with tempfile.TemporaryDirectory() as td:
             task_dir = Path(td)
             (task_dir / "progress.md").write_text(
@@ -841,10 +845,10 @@ class TestT62Phase2DispatchParkReturnsRc2(unittest.TestCase):
             finally:
                 fo._resolve_afk_monitor = orig_resolve_afk  # type: ignore
 
-            # rc=2 = parked (distinct from 0/pass and 3/terminal).
+            # rc=5 = parked (distinct from 0/pass and 3/terminal).
             self.assertEqual(
-                rc, 2,
-                f"wait-mode park must return rc=2, got {rc}",
+                rc, PARKED_RECOVERABLE,
+                f"wait-mode park must return rc=5 (PARKED_RECOVERABLE), got {rc}",
             )
             # No hard-stop.json on disk (park is recoverable).
             self.assertFalse(
@@ -856,15 +860,16 @@ class TestT62Phase2DispatchParkReturnsRc2(unittest.TestCase):
                              "park must NOT fire block notifier")
 
 
-class TestT62CmdAutoExecuteHonorsParkRc2(unittest.TestCase):
-    """T6.2 P1.1: `_cmd_auto_execute` MUST treat rc=2 from
-    `_phase2_dispatch` as 'parked, do NOT proceed to merge'. Merge gate
-    must NOT be invoked."""
+class TestT821CmdAutoExecuteHonorsParkRc5(unittest.TestCase):
+    """T8.2.1 P1.1 (legacy v0.8.2 T6.2 with rc=2; corrected to rc=5
+    in v0.8.2.1): `_cmd_auto_execute` MUST treat rc=5
+    (PARKED_RECOVERABLE) from `_phase2_dispatch` as 'parked, do NOT
+    proceed to merge'. Merge gate must NOT be invoked."""
 
-    def test_cmd_auto_execute_does_not_merge_on_park_rc2(self):
+    def test_cmd_auto_execute_does_not_merge_on_park_rc5(self):
         """Drive _cmd_auto_execute with monkeypatched _phase2_dispatch
-        returning rc=2; assert MergeRunner.merge_task is NEVER called
-        (gate 7 short-circuited on park)."""
+        returning rc=5 (PARKED_RECOVERABLE); assert MergeRunner.merge_task
+        is NEVER called (gate 7 short-circuited on park)."""
         import flow_orchestrator as fo
 
         # Spies for the key call sites past the rc check.
@@ -872,11 +877,11 @@ class TestT62CmdAutoExecuteHonorsParkRc2(unittest.TestCase):
         gate8_calls: list = []
         return_codes: list = []
 
-        # Monkeypatch _phase2_dispatch to return rc=2 (parked).
+        # Monkeypatch _phase2_dispatch to return rc=5 (parked).
         orig_phase2 = fo._phase2_dispatch
 
         def _fake_phase2(**_kw):
-            return 2
+            return PARKED_RECOVERABLE
 
         # Monkeypatch MergeRunner so any accidental merge attempt is
         # captured as a test failure (D-class regression detector).
@@ -888,7 +893,7 @@ class TestT62CmdAutoExecuteHonorsParkRc2(unittest.TestCase):
                 merge_calls.append((a, kw))
                 raise AssertionError(
                     "MergeRunner.merge_task called despite Phase 2 "
-                    "park (rc=2)"
+                    "park (rc=5 PARKED_RECOVERABLE; legacy v0.8.2 rc=2)"
                 )
 
         class _SpyGate8:
@@ -899,7 +904,7 @@ class TestT62CmdAutoExecuteHonorsParkRc2(unittest.TestCase):
                 gate8_calls.append((a, kw))
                 raise AssertionError(
                     "Gate8VerificationRunner.verify called despite "
-                    "Phase 2 park (rc=2)"
+                    "Phase 2 park (rc=5 PARKED_RECOVERABLE; legacy v0.8.2 rc=2)"
                 )
 
         # Stub out the front-of-loop machinery so we can reach the
@@ -1003,24 +1008,25 @@ class TestT62CmdAutoExecuteHonorsParkRc2(unittest.TestCase):
                 for obj, name, val in reversed(patches):
                     setattr(obj, name, val)
 
-        # _cmd_auto_execute must propagate rc=2 (parked) and NEVER
-        # reach the merge gate. Caller distinguishes parked (rc=2)
-        # from passed (rc=0) and terminal-blocked (rc=3).
+        # _cmd_auto_execute must propagate rc=5 (parked) and NEVER
+        # reach the merge gate. Caller distinguishes parked (rc=5
+        # PARKED_RECOVERABLE) from passed (rc=0) and terminal-blocked
+        # (rc=3). v0.8.2.1: was rc=2 in v0.8.2; corrected to rc=5.
         self.assertEqual(merge_calls, [],
                          "merge_task must NOT run when Phase 2 parked")
         self.assertEqual(gate8_calls, [],
                          "gate 8 verify must NOT run when Phase 2 parked")
         self.assertEqual(
-            return_codes, [2],
-            f"_cmd_auto_execute must return rc=2 on park, got "
-            f"{return_codes}",
+            return_codes, [PARKED_RECOVERABLE],
+            f"_cmd_auto_execute must return rc=5 (PARKED_RECOVERABLE) "
+            f"on park, got {return_codes}",
         )
 
-    def test_cmd_auto_execute_logs_park_message_on_rc2(self):
-        """rc=2 should produce an operator-visible 'Phase 2 parked'
-        message on stderr so a human resuming knows to use
-        `/flow:resume`. We capture stderr by redirecting sys.stderr
-        during the call."""
+    def test_cmd_auto_execute_logs_park_message_on_rc5(self):
+        """rc=5 (PARKED_RECOVERABLE) should produce an operator-visible
+        'Phase 2 parked' message on stderr so a human resuming knows
+        to use `/flow:resume`. We capture stderr by redirecting
+        sys.stderr during the call. (v0.8.2.1: was rc=2 in v0.8.2.)"""
         import io
         import contextlib
         import flow_orchestrator as fo
@@ -1104,7 +1110,7 @@ class TestT62CmdAutoExecuteHonorsParkRc2(unittest.TestCase):
                        lambda **kw: SimpleNamespace(
                            fire_block=lambda **k: None,
                        ))
-                _patch(fo, "_phase2_dispatch", lambda **_kw: 2)
+                _patch(fo, "_phase2_dispatch", lambda **_kw: PARKED_RECOVERABLE)
 
                 with contextlib.redirect_stderr(buf):
                     rc = fo._cmd_auto_execute("t62-park-msg")
@@ -1112,7 +1118,7 @@ class TestT62CmdAutoExecuteHonorsParkRc2(unittest.TestCase):
                 for obj, name, val in reversed(patches):
                     setattr(obj, name, val)
 
-            self.assertEqual(rc, 2)
+            self.assertEqual(rc, PARKED_RECOVERABLE)
             stderr_text = buf.getvalue()
             # Operator-visible cues: "park" + "/flow:resume".
             self.assertIn(

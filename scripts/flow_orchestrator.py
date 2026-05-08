@@ -61,6 +61,7 @@ from flow_notification import Notifier  # type: ignore
 from dispatch_template import (  # type: ignore  # v0.8.2 T4
     build_implementer_prompt,
 )
+from common.exit_codes import PARKED_RECOVERABLE  # type: ignore  # v0.8.2.1
 
 
 # Files implicitly shared across tasks — copied from flow_wave_planner; v0.8.0
@@ -4950,9 +4951,12 @@ def dispatch_with_retry(
         "afk_hard_cap", "budget_hit", "retry_cap", "review_cap"}
       - snapshot is a ``HardStopSnapshot`` for any non-pass,
         non-park outcome (T6.1 P1.1: ``afk_idle_park`` is RECOVERABLE
-        — no snapshot, no notifier, rc=0; caller stays parked
-        outside the loop awaiting next activity / hard cap),
-        or ``None`` for "pass".
+        — no snapshot, no notifier, ``rc=5`` (``PARKED_RECOVERABLE``);
+        caller stays parked outside the loop awaiting next activity /
+        hard cap), or ``None`` for "pass". (v0.8.2.1: corrected from
+        the v0.8.2 stale "rc=0" doc-drift; T6.2 had moved the literal
+        to 2 but this docstring lagged. v0.8.2.1 then migrated 2 → 5
+        per the Flow exit-code registry.)
 
     State machine (B-class):
 
@@ -4978,12 +4982,14 @@ def dispatch_with_retry(
         if afk_state == "timeout":
             # T6.1 P1.1 — three distinct outcomes:
             #   - mode='wait'  + idle timeout     -> "afk_idle_park"
-            #     (RECOVERABLE: no snapshot, rc=2 [translated by
-            #     `_phase2_dispatch`], no notifier, no merge; caller
-            #     park hand-off lives outside the loop. Operator runs
-            #     /flow:resume to continue. The deterministic test path
-            #     returns immediately so the loop CANNOT fall through
-            #     into another impl/review cycle).
+            #     (RECOVERABLE: no snapshot, rc=5 (PARKED_RECOVERABLE)
+            #     [translated by `_phase2_dispatch`], no notifier, no
+            #     merge; caller park hand-off lives outside the loop.
+            #     Operator runs /flow:resume to continue. The
+            #     deterministic test path returns immediately so the
+            #     loop CANNOT fall through into another impl/review
+            #     cycle). v0.8.2.1: was rc=2 in v0.8.2; migrated to
+            #     rc=5 to disambiguate from rc=2 = USAGE_ERROR.
             #   - mode='abort' + idle timeout     -> "afk_aborted"
             #     (TERMINAL: snapshot, rc=3, notifier).
             #   - any mode     + 24h hard cap     -> "afk_hard_cap"
@@ -5221,14 +5227,18 @@ def _phase2_dispatch(
     """Phase 2 production wire-up.
 
     Return codes (T6.2 P1.1 — three distinct values, NOT a binary
-    pass/blocked split):
+    pass/blocked split; v0.8.2.1 migrated park 2 → 5 per the Flow
+    exit-code registry in ``scripts/common/exit_codes.py``):
 
       * ``0`` — Phase 2 passed; caller proceeds to gate-7 merge.
-      * ``2`` — Phase 2 PARKED (wait-mode AFK idle timeout).
-                RECOVERABLE: no snapshot, no notifier; caller MUST NOT
-                proceed to merge. Caller logs "parked, run /flow:resume"
-                and returns. Distinct from rc=0 so park-becomes-merge
-                is mechanically impossible (D-class regression guard).
+      * ``5`` — Phase 2 PARKED (recoverable, wait-mode AFK idle
+                timeout). RECOVERABLE: no snapshot, no notifier;
+                caller MUST NOT proceed to merge. Caller logs
+                "parked, run /flow:resume" and returns. Distinct from
+                rc=0 so park-becomes-merge is mechanically impossible
+                (D-class regression guard). NOTE: ``2`` is reserved
+                for ``USAGE_ERROR`` (argparse / CLI misuse) per the
+                v0.8.2.1 registry, not for park.
       * ``3`` — Phase 2 TERMINAL (budget_hit / retry_cap / review_cap /
                 afk_hard_cap / afk_aborted). HardStopSnapshot persisted
                 to ``.flow/tasks/<slug>/hard-stop.json`` (atomic);
@@ -5351,15 +5361,17 @@ def _phase2_dispatch(
         return 0
 
     # T6.2 P1.1 — wait-mode AFK idle park is RECOVERABLE and now returns
-    # rc=2 (DISTINCT from rc=0 pass). T6.1 used rc=0 here, but the caller
+    # rc=5 (DISTINCT from rc=0 pass). T6.1 used rc=0 here, but the caller
     # `_cmd_auto_execute` interprets rc=0 as "Phase 2 passed → proceed
     # to gate 7 merge", which silently merged partial work whenever AFK
     # parked. Distinct rc kills the park-becomes-merge regression
     # mechanically (D-class). Still: no snapshot, no notifier — park is
     # not a block; the caller's outer driver re-enters when activity
-    # resumes or the 24h hard cap fires.
+    # resumes or the 24h hard cap fires. (v0.8.2.1: was rc=2 in v0.8.2;
+    # migrated to rc=5 (PARKED_RECOVERABLE) to disambiguate from
+    # rc=2 = USAGE_ERROR per the Flow exit-code registry.)
     if outcome == "afk_idle_park":
-        return 2
+        return PARKED_RECOVERABLE
 
     # ── Non-pass terminal: persist snapshot + fire block ───────────
     if snap is not None:
@@ -5417,19 +5429,26 @@ def _cmd_auto_execute(slug: str) -> int:
       5. Gate8VerificationRunner.verify() — gate 8 + 9a/9b (T15)
       6. MergeQueue.can_proceed() — S1 wave block (T15)
 
-    Exit codes:
+    Exit codes (per the Flow global registry in
+    ``scripts/common/exit_codes.py``; v0.8.2.1 migrated park 2 → 5):
       0 = all manifests merged + verified, OR contract missing →
           interactive fallback, OR pre-lock recovery → fail-closed
           interactive (legal silent — user never opted in this attempt).
-      2 = AFK idle park (v0.8.2 T6.2): wait-mode AFK timeout without
-          24h hard cap. Recoverable — no blocked.md, no snapshot, no
-          merge. Operator runs /flow:resume to continue. Distinct from
-          rc=3 terminal blocks.
+      2 = USAGE_ERROR (reserved). Argparse / CLI misuse. Not produced
+          by ``_cmd_auto_execute`` itself — kept distinct from park
+          per v0.8.2.1 disambiguation; 5 internal CLIs (flow.py,
+          flow_doctor.py, flow_promote.py, flow_autosave.py,
+          flow_ralph.sh) emit rc=2 on argparse failure.
       3 = block raised at any phase (recovery / dispatch / gate 1-6 /
           merge / gate 8 / wave halt) OR Phase 2 terminal hard-stop
           (budget_hit / retry_cap / codex_review_cap / afk_aborted /
           afk_hard_cap — all write unified HardStopSnapshot v1).
           Distinct from exit 4 (S5 nested-autonomy aborted_nested).
+      5 = AFK idle park (recoverable). Wait-mode AFK timeout without
+          24h hard cap. No blocked.md, no snapshot, no merge. Operator
+          runs /flow:resume to continue. Distinct from rc=3 terminal
+          blocks. (v0.8.2.1: was rc=2 in v0.8.2; migrated to rc=5 =
+          PARKED_RECOVERABLE.)
 
     Staleness gate (T20) is OUT-OF-LOOP for v0.8.1 — operator runs
     `flow doctor <slug>` manually before invoking --auto-execute.
@@ -5568,8 +5587,9 @@ def _cmd_auto_execute(slug: str) -> int:
         )
         # T6.2 P1.1 — three distinct return paths (NEVER conflate park
         # with pass; park-becomes-merge would silently merge partial
-        # work). rc semantics live in `_phase2_dispatch.__doc__`.
-        if rc == 2:
+        # work). rc semantics live in `_phase2_dispatch.__doc__` and
+        # the registry at `scripts/common/exit_codes.py` (v0.8.2.1).
+        if rc == PARKED_RECOVERABLE:
             # Parked (wait-mode AFK idle timeout). RECOVERABLE: no
             # snapshot, no block. Operator resumes via `/flow:resume`
             # once activity returns or the 24h hard cap fires.
@@ -5579,7 +5599,7 @@ def _cmd_auto_execute(slug: str) -> int:
                 f"activity returns (24h hard cap still applies).",
                 file=sys.stderr,
             )
-            return 2
+            return PARKED_RECOVERABLE
         if rc != 0:
             return rc
 

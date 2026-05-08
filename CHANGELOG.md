@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.8.2.1] - 2026-05-08
+
+### Fixed
+- **Observable change**: AFK idle park exit code corrected from `2`
+  (published in v0.8.2) to `5`. Wrappers/monitors that branch on
+  `rc=2` from `_cmd_auto_execute` must be updated. The change
+  resolves a semantic collision with Flow's internal `rc=2 = USAGE_ERROR`
+  convention used by 5 internal CLIs.
+- Stale `_run_retry_loop` docstring (line ~4953) that still claimed
+  AFK idle park returns rc=0 (a v0.8.2 T6.2 doc-drift bug) — now
+  correctly says rc=5.
+
+### Added
+- `scripts/common/exit_codes.py` — Flow global exit-code registry
+  (single source of truth):
+  `0=PASS / 1=GENERIC_FAIL / 2=USAGE_ERROR / 3=BLOCKED /
+   4=NESTED_ABORT / 5=PARKED_RECOVERABLE`.
+
+### Notes
+- `v0.8.2` tag remains pinned at commit `24bdecc` (NOT force-moved).
+- 5 existing CLI files (`flow.py`, `flow_doctor.py`, `flow_promote.py`,
+  `flow_autosave.py`, `flow_ralph.sh`) still use rc=2 = USAGE_ERROR;
+  this is consistent with the new registry. Their literal-to-constant
+  refactor is deferred to v0.8.3 P3 backlog.
+
 ## v0.8.2 — 2026-05-08
 
 **Safety stack live.** v0.8.1 schema-only T17/T18 placeholders are now

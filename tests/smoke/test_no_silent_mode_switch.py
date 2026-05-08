@@ -9,10 +9,15 @@ never silent-fallback to interactive).
 T17 / T18 / Y8 budget-during-AFK-with-throttled-notification cross-cut
 integration scenarios are deferred to v0.8.2 - this file owns the
 SKILL-routing surface only.
+
+v0.8.2.1 also pins the SKILL.md exit-code contract (rc=5 AFK park
+disambiguated from rc=2 USAGE_ERROR) via ``TestSkillMdExitCodeContract``
+below — normalized matching tolerates Markdown formatting drift.
 """
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -112,6 +117,64 @@ class TestSkillRoutingNoSilentSwitch(unittest.TestCase):
             # flow:skill form), not a python file path.
             self.assertNotIn(".py", default)
             self.assertIn(":", default)
+
+
+def _normalize(s: str) -> str:
+    """Normalize Markdown text for substring matching: strip backticks,
+    bold markers, italic markers; collapse whitespace runs to single
+    spaces; lowercase. Tolerates rendering variants like ``5 = AFK
+    idle park`` vs ``**5** = AFK idle park``.
+    """
+    s = s.replace("`", "")
+    s = s.replace("**", "")
+    s = s.replace("*", "")
+    s = re.sub(r"\s+", " ", s)
+    return s.lower()
+
+
+class TestSkillMdExitCodeContract(unittest.TestCase):
+    """v0.8.2.1: pin the Phase 2 SKILL.md exit-code documentation
+    contract. The narrative + table must reflect rc=5 = AFK idle park
+    (recoverable), not the v0.8.2 rc=2 wording. Uses normalized
+    matching to tolerate Markdown formatting drift.
+    """
+
+    def setUp(self):
+        self.skill_path = (
+            Path(__file__).resolve().parent.parent.parent
+            / "claude/skills/flow/flow-phase2-execute/SKILL.md"
+        )
+        self.assertTrue(
+            self.skill_path.exists(),
+            f"SKILL.md missing: {self.skill_path}",
+        )
+        self.content = self.skill_path.read_text(encoding="utf-8")
+        self.normalized = _normalize(self.content)
+
+    def test_skill_md_documents_rc5_afk_park(self):
+        """Normalized SKILL.md MUST contain ``5 = afk idle park``
+        (any backtick / bold / italic / whitespace variant)."""
+        self.assertIn(
+            "5 = afk idle park",
+            self.normalized,
+            "SKILL.md must document rc=5 = AFK idle park "
+            "(v0.8.2.1 contract); see normalized form.",
+        )
+
+    def test_skill_md_does_not_claim_rc2_park(self):
+        """Normalized SKILL.md MUST NOT contain the v0.8.2 wordings
+        ``rc=2 is recoverable park`` or ``2 = afk idle park``."""
+        forbidden = (
+            "rc=2 is recoverable park",
+            "2 = afk idle park",
+        )
+        for needle in forbidden:
+            self.assertNotIn(
+                needle,
+                self.normalized,
+                f"SKILL.md must NOT contain {needle!r} "
+                "(v0.8.2 wording superseded by v0.8.2.1).",
+            )
 
 
 if __name__ == "__main__":

@@ -165,22 +165,30 @@ subsequent path to interactive mode MUST go through
 `block + user choice`. NEVER silently switch — this includes crash
 recovery on next-startup. If `flow orchestrator --auto-execute <slug>`
 exits with rc 3/4, follow `blocked.md` instructions for the user
-choice. rc=2 is recoverable park (no `blocked.md` written) — see exit
-code table below.
+choice. rc=5 is recoverable park (no `blocked.md` written) — see exit
+code table below. (Note: rc=2 is reserved for USAGE_ERROR per the
+v0.8.2.1 exit-code registry, not for park.)
 
-Exit codes:
+Exit codes (per the Flow exit-code registry,
+`scripts/common/exit_codes.py`):
 
 - `0` = clean completion, OR contract missing → interactive fallback
   (legal pre-lock — user never opted in this attempt).
-- `2` = **AFK idle park** (v0.8.2 T6.2): wait-mode AFK timeout fired
-  without 24h hard cap. Recoverable: NO `blocked.md`, NO hard-stop
-  snapshot, NO merge. Operator runs `/flow:resume` to continue.
+- `2` = **USAGE_ERROR** (reserved). Argparse / CLI misuse from
+  internal Flow CLIs (`flow.py`, `flow_doctor.py`, `flow_promote.py`,
+  `flow_autosave.py`, `flow_ralph.sh`). Not produced by
+  `_cmd_auto_execute` itself; kept distinct from park per v0.8.2.1.
 - `3` = block raised (`blocked.md` written; user resume needed).
   Includes terminal hard-stop reasons: `budget_hit`, `retry_cap`,
   `codex_review_cap`, `afk_aborted`, `afk_hard_cap`. All write a
   unified `HardStopSnapshot` (schema v1) with reason + last-gate
   context.
 - `4` = `aborted_nested` (nested-autonomy attempt detected).
+- `5` = **AFK idle park** (recoverable). Wait-mode AFK timeout fired
+  without 24h hard cap. Recoverable: NO `blocked.md`, NO hard-stop
+  snapshot, NO merge. Operator runs `/flow:resume` to continue.
+  (v0.8.2.1: was rc=2 in v0.8.2; corrected to rc=5 =
+  `PARKED_RECOVERABLE` to disambiguate from rc=2 USAGE_ERROR.)
 
 ## Step 1 — Determine dispatch strategy
 
