@@ -4582,6 +4582,40 @@ def _load_prior_baseline(task_dir: Path, task_id: str) -> Optional[BaselineRecor
     return BaselineRecord(failing=failing)
 
 
+def _resolve_afk_monitor(contract: Contract, start_iso: str):
+    """v0.8.2 T2 — instantiate AfkMonitor from a Contract.
+
+    Reads ``afk_on_timeout`` (default ``"wait"``) and
+    ``afk_timeout_min`` (default 30 min if absent) from the parsed
+    contract; constructs an ``AfkMonitor`` with a fresh
+    ``PausedClock`` rooted at ``start_iso``.
+
+    Imported lazily so this module's import surface stays unchanged
+    for callers that do not need AFK (orchestrator dry-run, doctor,
+    etc.). T3 will call this from the Phase 2 retry loop alongside
+    budget enforcement; T2 ships it dormant (helper exists, not yet
+    consumed inside the live dispatch loop).
+
+    I-class guard: each call constructs a NEW monitor — there is no
+    cross-task state leakage. The clock starts at the supplied
+    ``start_iso`` (caller passes a fresh per-task timestamp).
+    """
+    from common.afk_monitor import (  # type: ignore
+        DEFAULT_IDLE_SECONDS_THRESHOLD,
+        AfkMonitor,
+    )
+    mode = contract.afk_on_timeout if contract.afk_on_timeout else "wait"
+    if contract.afk_timeout_min is not None:
+        idle_seconds = float(contract.afk_timeout_min) * 60.0
+    else:
+        idle_seconds = DEFAULT_IDLE_SECONDS_THRESHOLD
+    return AfkMonitor(
+        start_iso=start_iso,
+        mode=mode,
+        idle_seconds_threshold=idle_seconds,
+    )
+
+
 def _invoke_subagent_dispatch(ctx: WorktreeContext, **kw) -> None:
     """Subagent dispatch shim. T22 owns the SKILL implementation that
     actually invokes Claude CLI via the configured capability.

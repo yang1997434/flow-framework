@@ -38,6 +38,32 @@ gate. v0.8.1 fails fast on first gate non-pass via Notifier. Run
 `flow doctor <slug>` BEFORE invoking `--auto-execute` to check
 staleness (the in-loop gate ships in v0.8.2).
 
+### AFK runtime (v0.8.2 T2 — ships AFK monitor; T3 wires retry loop)
+
+Contract field `afk_on_timeout` is now consumed at runtime via
+`scripts/common/afk_monitor.py`:
+
+- **Default `wait`** — autonomy norm; idle timeout produces no
+  hard-stop snapshot, caller stays parked. Only the 24 h hard cap can
+  override `wait` and force termination.
+- **`abort`** — idle past `idle_seconds_threshold` (default 30 min)
+  produces a `HardStopSnapshot(reason="afk_timeout", …)` via
+  `apply_afk_check(monitor, slug, now_iso)`. Snapshot reuses the T1
+  frozen `schema_version="v1"`.
+- **24 h hard cap** — `clock.active_seconds(now) >= 86400` ALWAYS
+  produces a snapshot, regardless of mode. This is the load-bearing
+  invariant: even `wait` mode cannot exceed 24 h.
+- **3 mechanical activity signals** reset the AFK timer (any one):
+  monitored-dir file mtime tick, command issuance to subagent,
+  subagent heartbeat / progress.md update.
+- Pause/resume passthrough delegates to T1 `PausedClock`. Activity
+  recorded during a pause does NOT auto-resume the clock (B-class
+  state-machine guard).
+
+T2 ships the helper dormant. T3 invokes `apply_afk_check` per
+dispatch tick inside the Phase 2 retry loop alongside budget
+enforcement. Both share the single hard-stop snapshot path.
+
 **Subagent contract** (PRD §1.2): execute the per-task prompt; return
 narrative summary ONLY. Orchestrator derives facts from worktree
 `git diff` and test logs — subagent self-report fields are ignored.
