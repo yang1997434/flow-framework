@@ -29,9 +29,11 @@ from common import budget_counter as bc  # noqa: E402  type: ignore
 from common.afk_monitor import AfkMonitor  # noqa: E402  type: ignore
 from common.snapshot import HardStopSnapshot  # noqa: E402  type: ignore
 from flow_orchestrator import (  # noqa: E402  type: ignore
+    Contract,
     RetryConfig,
     RetryDeps,
     RetrySessionState,
+    _phase2_dispatch,
     dispatch_with_retry,
     redact_blindspot_index,
 )
@@ -273,6 +275,202 @@ class TestReviewerTransparencyRedaction(unittest.TestCase):
     def test_preserves_text_without_class_headers(self):
         feedback = "All good. Specific finding: typo on line 7.\n"
         self.assertEqual(redact_blindspot_index(feedback), feedback)
+
+
+class TestCmdAutoExecuteUsesRetryLoop(unittest.TestCase):
+    """T3.1 wire-up: production `_cmd_auto_execute` (via the extracted
+    `_phase2_dispatch` helper) flows through `dispatch_with_retry`.
+
+    D-class: legacy fail-fast `GateRunner.run_phase2` is no longer
+    reachable from the production entrypoint when `_phase2_dispatch`
+    is in use — the prod adapter calls `gate_runner.run_phase2` only
+    inside the retry-loop's review callback, NOT directly.
+
+    Strategy: drive `_phase2_dispatch` with a fake `deps_factory` that
+    spies impl/review calls. Asserts the retry loop iterated (impl
+    called twice across a fail→pass scripted review).
+    """
+
+    def _make_contract(self) -> Contract:
+        # Minimal contract: huge budgets so the loop never trips, no
+        # AFK pressure (default afk_timeout_min=None -> default
+        # 1800s threshold; we won't accumulate that in the test).
+        return Contract(
+            contract_schema_version=1,
+            autonomy_mode="full",
+            created_at="2026-05-08T00:00:00Z",
+            budget={
+                "tokens_in": 1_000_000.0,
+                "tokens_out": 1_000_000.0,
+                "cost_usd": 1000.0,
+                "active_wallclock_minutes": 600.0,
+                "subagent_dispatches": 100.0,
+            },
+        )
+
+    def test_phase2_dispatch_routes_through_retry_loop(self):
+        with tempfile.TemporaryDirectory() as td:
+            task_dir = Path(td)
+            (task_dir / "progress.md").write_text(
+                "# progress\n\n## Execute Log\n",
+                encoding="utf-8",
+            )
+
+            # Spy: track every call to impl / review and assert no
+            # direct GateRunner.run_phase2 invocation occurred.
+            impl_calls: list = []
+            review_outcomes = ["fail", "pass"]
+            review_calls: list = []
+            run_phase2_invocations: list = []
+
+            def _fake_deps_factory(**_kw):
+                def _impl(*, state, prompt_prefix, **__):
+                    impl_calls.append({
+                        "round": state.dispatch_retry_rounds,
+                        "prefix": prompt_prefix,
+                    })
+                    return {}
+
+                def _review(*, state, impl_deltas, **__):
+                    review_calls.append(state.dispatch_retry_rounds)
+                    return review_outcomes.pop(0)
+
+                return RetryDeps(
+                    run_implementer_round=_impl,
+                    run_codex_review=_review,
+                )
+
+            # Sentinel notifier — never asked to fire on a "pass" path.
+            class _SpyNotifier:
+                def __init__(self):
+                    self.fired: list = []
+
+                def fire_block(self, **kw):
+                    self.fired.append(kw)
+
+            notifier = _SpyNotifier()
+            contract = self._make_contract()
+            # Patch GateRunner.run_phase2 globally so any accidental
+            # direct call (D-class regression) is detected loudly.
+            import flow_orchestrator as fo
+            orig_run_phase2 = fo.GateRunner.run_phase2
+
+            def _trapped_run_phase2(self, *a, **kw):
+                run_phase2_invocations.append((a, kw))
+                raise AssertionError(
+                    "legacy GateRunner.run_phase2 reached from "
+                    "_phase2_dispatch — retry-loop wire-up regression"
+                )
+
+            fo.GateRunner.run_phase2 = _trapped_run_phase2  # type: ignore
+            try:
+                rc = _phase2_dispatch(
+                    slug="t3-1-wireup",
+                    task_dir=task_dir,
+                    contract=contract,
+                    manifest=object(),
+                    facts=object(),
+                    ctx=object(),
+                    criteria=[],
+                    gate_cmds={
+                        "baseline": "true",
+                        "codex": "true",
+                        "smoke": "true",
+                    },
+                    run_id="run-1",
+                    task_id="task-1",
+                    notifier=notifier,
+                    deps_factory=_fake_deps_factory,
+                )
+            finally:
+                fo.GateRunner.run_phase2 = orig_run_phase2  # type: ignore
+
+            self.assertEqual(rc, 0, "fail-then-pass should land at rc=0")
+            # Retry loop ran impl twice (round 1 fail -> round 2 pass).
+            self.assertEqual(
+                len(impl_calls), 2,
+                f"expected 2 impl rounds, got {len(impl_calls)}",
+            )
+            self.assertEqual(impl_calls[0]["round"], 0)
+            self.assertEqual(impl_calls[1]["round"], 1)
+            # Review called twice mirroring impl rounds.
+            self.assertEqual(len(review_calls), 2)
+            # No legacy fail-fast direct invocation.
+            self.assertEqual(run_phase2_invocations, [])
+            # No block fired on the pass terminal.
+            self.assertEqual(notifier.fired, [])
+
+    def test_phase2_dispatch_terminal_writes_snapshot_and_blocks(self):
+        """Non-pass terminal (retry_cap) -> snapshot file written +
+        notifier.fire_block called -> rc=3."""
+        with tempfile.TemporaryDirectory() as td:
+            task_dir = Path(td)
+            (task_dir / "progress.md").write_text(
+                "# progress\n\n## Execute Log\n",
+                encoding="utf-8",
+            )
+
+            # Always-fail review forces retry-cap exhaustion.
+            def _fake_deps_factory(**_kw):
+                def _impl(*, state, prompt_prefix, **__):
+                    del state, prompt_prefix
+                    return {}
+
+                def _review(*, state, impl_deltas, **__):
+                    del state, impl_deltas
+                    return "fail"
+
+                return RetryDeps(
+                    run_implementer_round=_impl,
+                    run_codex_review=_review,
+                )
+
+            class _SpyNotifier:
+                def __init__(self):
+                    self.fired: list = []
+
+                def fire_block(self, **kw):
+                    self.fired.append(kw)
+
+            notifier = _SpyNotifier()
+            contract = self._make_contract()
+
+            rc = _phase2_dispatch(
+                slug="t3-1-terminal",
+                task_dir=task_dir,
+                contract=contract,
+                manifest=object(),
+                facts=object(),
+                ctx=object(),
+                criteria=[],
+                gate_cmds={
+                    "baseline": "true",
+                    "codex": "true",
+                    "smoke": "true",
+                },
+                run_id="run-2",
+                task_id="task-2",
+                notifier=notifier,
+                deps_factory=_fake_deps_factory,
+            )
+
+            self.assertEqual(rc, 3)
+            self.assertEqual(len(notifier.fired), 1)
+            self.assertEqual(
+                notifier.fired[0]["block_type"], "phase2_retry_cap"
+            )
+            # Snapshot persisted to stable path.
+            snap_path = task_dir / "hard-stop.json"
+            self.assertTrue(
+                snap_path.exists(),
+                f"expected hard-stop.json at {snap_path}",
+            )
+            # Round-trip via the snapshot reader (verifies G-class
+            # atomic write produced a valid v1-schema payload).
+            from common.snapshot import read as _read_snap
+            snap = _read_snap(snap_path)
+            self.assertEqual(snap.reason, "retry_cap")
+            self.assertIsInstance(snap, HardStopSnapshot)
 
 
 if __name__ == "__main__":

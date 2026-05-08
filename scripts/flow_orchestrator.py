@@ -5047,6 +5047,213 @@ def _invoke_subagent_dispatch(ctx: WorktreeContext, **kw) -> None:
     mod.invoke(ctx, **kw)
 
 
+# ────────────────────────────────────────────────────────────────────────
+# v0.8.2 T3.1 — production wire-up of Phase 2 dispatch through the retry
+# loop (`dispatch_with_retry`). T3 shipped the loop as a tested
+# abstraction; T3.1 routes the live `_cmd_auto_execute` entrypoint
+# through it so the legacy fail-fast `GateRunner.run_phase2` call is no
+# longer reachable from production.
+#
+# Design (D-class, J-class):
+#
+#   * `_phase2_dispatch` is the SOLE Phase 2 entrypoint from
+#     `_cmd_auto_execute`. It builds fresh-per-invocation budget +
+#     AfkMonitor + RetrySessionState (I-class: no cross-task counter
+#     leak), constructs `RetryDeps` either from the prod adapter or
+#     from the test seam (`deps_factory`), and translates the 5 retry
+#     outcomes to the existing return contract: pass→rc=0, all others
+#     →rc=3 with HardStopSnapshot persisted to disk.
+#
+#   * Snapshot path: `.flow/tasks/<slug>/hard-stop.json` (overwrite;
+#     latest wins). Atomic write via `common.snapshot.write` (G-class).
+#
+#   * Backwards-compat: contract has no `phase2.retry` block in the
+#     v0.8.1 schema, so we always use safe defaults (3 dispatch retry
+#     rounds, 2 codex review rounds). v0.8.2+ may extend Contract to
+#     surface these — until then, the constants live with `RetryConfig`.
+#
+#   * Test seam: `deps_factory` is the documented hook for
+#     `tests/smoke/test_phase2_retry_loop.py::test_cmd_auto_execute_uses_retry_loop`.
+#     If None, we build prod deps from the gate runner. Tests inject a
+#     callable returning a `(RetryDeps, sentinel_dict)` to spy the
+#     retry-loop wiring without touching `dispatch_with_retry` itself.
+#
+# I-class: every call to `_phase2_dispatch` constructs a NEW
+# RetrySessionState + budget + AfkMonitor. No module-level retain of
+# any of these.
+#
+# J-class: state.task_slug, contract, task_dir, run_id, task_id all
+# flow through to both `dispatch_with_retry` and the prod review
+# adapter without losing fields.
+
+def _phase2_dispatch(
+    *,
+    slug: str,
+    task_dir: Path,
+    contract: Contract,
+    manifest,
+    facts,
+    ctx,
+    criteria: list,
+    gate_cmds: dict,
+    run_id: str,
+    task_id: str,
+    notifier: "Notifier",
+    deps_factory: Optional[Callable[..., RetryDeps]] = None,
+) -> int:
+    """Phase 2 production wire-up. Returns rc (0 = pass, 3 = blocked).
+
+    On non-pass terminals, writes the HardStopSnapshot to
+    ``.flow/tasks/<slug>/hard-stop.json`` (atomic) and fires a
+    structured block via ``notifier`` before returning 3.
+    """
+    from common import snapshot as _snap  # type: ignore
+    from common.afk_monitor import now_iso_utc  # type: ignore
+    from common import budget_counter as _bc  # type: ignore
+
+    # ── Fresh-per-invocation state (I-class) ────────────────────────
+    start_iso = now_iso_utc()
+    afk = _resolve_afk_monitor(contract, start_iso=start_iso)
+    # Read budget limits from contract.budget; missing keys default to
+    # 0.0 (a 0-limit counter never trips because BudgetCounter checks
+    # value >= limit only when limit > 0; T1 invariant).
+    raw_budget = contract.budget or {}
+    limits = {
+        "tokens_in": float(raw_budget.get("tokens_in", 0.0)),
+        "tokens_out": float(raw_budget.get("tokens_out", 0.0)),
+        "cost_usd": float(raw_budget.get("cost_usd", 0.0)),
+        "active_wallclock_minutes": float(
+            raw_budget.get("active_wallclock_minutes", 0.0)
+        ),
+        "subagent_dispatches": float(
+            raw_budget.get("subagent_dispatches", 0.0)
+        ),
+    }
+    budget = _bc.make_default_set(limits)
+
+    config = RetryConfig(
+        max_dispatch_retry_rounds=3,
+        max_codex_review_rounds=2,
+    )
+    state = RetrySessionState(
+        task_slug=slug,
+        progress_path=task_dir / "progress.md",
+    )
+
+    # ── Build deps (prod default or test-injected) ──────────────────
+    if deps_factory is not None:
+        deps = deps_factory(
+            slug=slug,
+            task_dir=task_dir,
+            contract=contract,
+            manifest=manifest,
+            facts=facts,
+            ctx=ctx,
+            criteria=criteria,
+            gate_cmds=gate_cmds,
+            run_id=run_id,
+            task_id=task_id,
+        )
+    else:
+        # Prod adapter: implementer round 1 already ran via
+        # auto_dispatch_task before _phase2_dispatch was called, so the
+        # adapter returns empty deltas on round 1. v0.8.2 T18 will
+        # extend this to re-dispatch on retry rounds 2+.
+        gate_runner = GateRunner(
+            ctx=ctx,
+            contract=contract,
+            task_dir=task_dir,
+            run_id=run_id,
+            task_id=task_id,
+            prior_baseline=_load_prior_baseline(task_dir, task_id),
+        )
+
+        def _prod_impl(*, state, prompt_prefix, **_kw):
+            # Round 1: auto_dispatch_task already produced facts; no
+            # additional impl work needed. T18 wires real re-dispatch.
+            del prompt_prefix
+            return {}
+
+        attempt_id = f"{run_id}+{task_id}"
+
+        def _prod_review(*, state, impl_deltas, **_kw):
+            del impl_deltas
+            verdict = gate_runner.run_phase2(
+                manifest=manifest,
+                facts=facts,
+                criteria=criteria,
+                attempt_id=attempt_id,
+                retry_idx=state.dispatch_retry_rounds,
+                baseline_command=gate_cmds["baseline"],
+                codex_command=gate_cmds["codex"],
+                smoke_command=gate_cmds["smoke"],
+            )
+            if verdict.status == "pass":
+                return "pass"
+            # Cache reviewer feedback so the next implementer round
+            # gets it as prompt prefix (transparency rule).
+            gr = verdict.gate_result
+            details = (gr.details if gr is not None else None) or {}
+            state.last_reviewer_feedback = (
+                f"phase 2 halted at {verdict.halted_at_gate}: "
+                f"{details}"
+            )
+            return "fail"
+
+        deps = RetryDeps(
+            run_implementer_round=_prod_impl,
+            run_codex_review=_prod_review,
+        )
+
+    # ── Drive the retry loop ────────────────────────────────────────
+    outcome, snap = dispatch_with_retry(
+        state=state,
+        config=config,
+        budget=budget,
+        afk=afk,
+        deps=deps,
+        now_iso_fn=now_iso_utc,
+    )
+
+    if outcome == "pass":
+        return 0
+
+    # ── Non-pass terminal: persist snapshot + fire block ───────────
+    if snap is not None:
+        snap_path = task_dir / "hard-stop.json"
+        try:
+            _snap.write(snap, snap_path)
+        except OSError:
+            # G-class: a write failure here is non-fatal — the block
+            # notifier still fires below; operator can still triage.
+            pass
+
+    block_type = {
+        "budget_hit": "phase2_budget_hit",
+        "retry_cap": "phase2_retry_cap",
+        "review_cap": "phase2_review_cap",
+        "afk_hard_cap": "phase2_afk_hard_cap",
+    }.get(outcome, "phase2_halted")
+    issue_id = (
+        snap.counter_name
+        if (snap is not None and snap.counter_name)
+        else outcome
+    )
+    why = f"phase 2 retry-loop terminal: {outcome}"
+    if snap is not None and snap.value is not None and snap.limit is not None:
+        why += f" ({snap.counter_name}={snap.value}/{snap.limit})"
+    notifier.fire_block(
+        block_type=block_type,
+        phase=2,
+        task_id=task_id,
+        issue_id=str(issue_id),
+        why_blocked=why,
+        required_choice=["abort_task", "switch_to_interactive"],
+        safe_resume_command=f"flow orchestrator --resume {slug}",
+    )
+    return 3
+
+
 def _cmd_auto_execute(slug: str) -> int:
     """T19 Step 19.11 — end-to-end dispatch loop. Replaces v0.8.0 exit-2
     stub. Per manifest:
@@ -5071,8 +5278,10 @@ def _cmd_auto_execute(slug: str) -> int:
     `flow doctor <slug>` manually before invoking --auto-execute.
     v0.8.2 promotes to gate-0 in the dispatch loop.
 
-    AFK / Budget / retry budget all DEFERRED to v0.8.2 per route-A
-    re-scope. T17/T18/in-loop-staleness/T20-routing all v0.8.2.
+    AFK + Budget + retry-loop wired in v0.8.2 T1/T2/T3 + T3.1: Phase 2
+    flows through `dispatch_with_retry` via `_phase2_dispatch`. T18
+    extends the prod implementer-round adapter to actually re-dispatch
+    on retry rounds (today: round-1 facts only, retries reuse them).
     """
     # Parse + R11 ceiling check via build_plan; raises SystemExit on
     # too-new schema before we touch the dispatch loop.
@@ -5181,48 +5390,27 @@ def _cmd_auto_execute(slug: str) -> int:
         # `flow doctor <slug>`; user runs manually before invoking
         # --auto-execute. v0.8.2 adds StalenessChecker.check_all here.
 
-        # ── T12 + T13: Phase 2 gates 1→3→4→5→6 ─────────────────────────
-        gate_runner = GateRunner(
-            ctx=ctx,
-            contract=plan.contract,
+        # ── T12 + T13 + T3.1: Phase 2 retry-loop (gates 1→3→4→5→6) ─────
+        # v0.8.2 T3.1: replaces fail-fast `GateRunner.run_phase2` call
+        # with retry-loop wire-up via `_phase2_dispatch`. Round caps
+        # default to (3, 2) until contract surfaces phase2.retry config.
+        # Non-pass outcomes write HardStopSnapshot to
+        # `.flow/tasks/<slug>/hard-stop.json` and fire a structured block.
+        rc = _phase2_dispatch(
+            slug=slug,
             task_dir=task_dir,
-            run_id=run_id,
-            task_id=task_id,
-            prior_baseline=_load_prior_baseline(task_dir, task_id),
-        )
-        attempt_id = f"{run_id}+{task_id}"
-        verdict = gate_runner.run_phase2(
+            contract=plan.contract,
             manifest=manifest,
             facts=facts,
+            ctx=ctx,
             criteria=criteria,
-            attempt_id=attempt_id,
-            retry_idx=0,
-            baseline_command=gate_cmds["baseline"],
-            codex_command=gate_cmds["codex"],
-            smoke_command=gate_cmds["smoke"],
+            gate_cmds=gate_cmds,
+            run_id=run_id,
+            task_id=task_id,
+            notifier=notifier,
         )
-        if verdict.status != "pass":
-            # GateRunner methods do NOT write blocked.md themselves.
-            # Fire block here using the halted-gate context. Retry loop
-            # is OUT OF SCOPE for v0.8.1 (T17/T18 v0.8.2 deferred).
-            gr = verdict.gate_result
-            details = (gr.details if gr is not None else None) or {}
-            issue_id = details.get("issue_id", verdict.halted_at_gate or "phase2_halted")
-            block_row = details.get("block_row", "?")
-            why = (
-                f"phase 2 halted at {verdict.halted_at_gate}: "
-                f"block_row={block_row}"
-            )
-            notifier.fire_block(
-                block_type=verdict.halted_at_gate or "phase2_halted",
-                phase=2,
-                task_id=task_id,
-                issue_id=str(issue_id),
-                why_blocked=why,
-                required_choice=["abort_task", "switch_to_interactive"],
-                safe_resume_command=f"flow orchestrator --resume {slug}",
-            )
-            return 3
+        if rc != 0:
+            return rc
 
         # ── T14: gate 7 atomic merge (R3 9-step sequence steps 1-7) ─────
         merger = MergeRunner(
