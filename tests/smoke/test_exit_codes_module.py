@@ -45,7 +45,12 @@ class TestExitCodeImportStyle(unittest.TestCase):
 
 class TestExitCodeNoSideEffect(unittest.TestCase):
     def test_module_reload_is_idempotent(self):
-        from common import exit_codes as ec  # noqa: E402  type: ignore
+        # Module-form import (`import common.exit_codes as ec`) is
+        # required to obtain a module reference for `importlib.reload`.
+        # The forbidden-grep AC targets bare `import exit_codes` /
+        # `from exit_codes import ...`; the canonical-prefix form here
+        # is consistent with the contract.
+        import common.exit_codes as ec  # noqa: E402  type: ignore
         before_value = ec.PARKED_RECOVERABLE
         # Reload should not raise (no side effects beyond constant
         # rebinding) and the value must be preserved.

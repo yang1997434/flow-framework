@@ -5184,8 +5184,12 @@ def _invoke_subagent_dispatch(ctx: WorktreeContext, **kw) -> None:
 #     AfkMonitor + RetrySessionState (I-class: no cross-task counter
 #     leak), constructs `RetryDeps` either from the prod adapter or
 #     from the test seam (`deps_factory`), and translates the 5 retry
-#     outcomes to the existing return contract: pass→rc=0, all others
-#     →rc=3 with HardStopSnapshot persisted to disk.
+#     outcomes to the return contract:
+#         pass            → rc=0
+#         afk_idle_park   → rc=5 (PARKED_RECOVERABLE; no snapshot,
+#                                 no notifier; v0.8.2.1 split rc=2→5
+#                                 to disambiguate from USAGE_ERROR)
+#         all others      → rc=3 with HardStopSnapshot persisted to disk.
 #
 #   * Snapshot path: `.flow/tasks/<slug>/hard-stop.json` (overwrite;
 #     latest wins). Atomic write via `common.snapshot.write` (G-class).
