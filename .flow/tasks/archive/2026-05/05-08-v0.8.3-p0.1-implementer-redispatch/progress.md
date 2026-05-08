@@ -134,8 +134,9 @@ blocked_by: []
 
 ## Files Touched
 
-_Updated 2026-05-08 09:58 (last 20 unique edits)_:
+_Updated 2026-05-08 10:40 (last 20 unique edits)_:
 
+- `.flow/pitfalls/edit-absolute-path-resolves-master.md`
 - `/tmp/v083-p01-prefork-msg.txt`
 - `.flow/tasks/05-08-v0.8.3-p0.1-implementer-redispatch/progress.md`
 - `.flow/tasks/05-08-v0.8.3-p0.1-implementer-redispatch/prd.md`
@@ -155,7 +156,6 @@ _Updated 2026-05-08 09:58 (last 20 unique edits)_:
 - `/home/yangpeng/claude-linux-config/claude/hooks/pre-commit-review.py`
 - `/tmp/codex-review-v083-p00.txt`
 - `/tmp/hook-quick-test.py`
-- `tests/smoke/test_dispatch_template.py`
 
 ## Commits
 
