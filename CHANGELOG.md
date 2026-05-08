@@ -25,13 +25,17 @@ hardened 8-gate safety stack:
 - **Nested-autonomy**: `FLOW_AUTONOMY_PARENT_PID` env-var mechanical
   guard at orchestrator entry.
 - **context_estimator 1M-mode fix**: `_resolve_limit` priority chain
-  (`FLOW_CONTEXT_LIMIT` env > `~/.claude/settings.json::env::
-  ANTHROPIC_DEFAULT_<BASE>_MODEL` ending `[1m]` > `MODEL_LIMITS` table
-  > 200k default). Fixes 5x context-percent inflation on 1M-mode
-  sessions whose transcripts record bare `claude-opus-4-7`. 16 new
-  unit cases in `tests/unit/test_context_estimator_1m_resolution.py`.
+  (`FLOW_CONTEXT_LIMIT` env > rung 2a model-specific
+  `ANTHROPIC_DEFAULT_<BASE>_MODEL` ending `[1m]` > rung 2b plan-level
+  heuristic — *any* `ANTHROPIC_DEFAULT_*_MODEL` ending `[1m]` upgrades
+  all models, since 1M is an Anthropic plan-level paid add-on, not
+  per-model > `MODEL_LIMITS` table > 200k default). Fixes 5x context-
+  percent inflation on 1M-mode sessions whose transcripts record bare
+  `claude-opus-4-7`, including the common case where the user only
+  aliased one base (e.g. sonnet) but runs others under the same plan.
+  22 unit cases in `tests/unit/test_context_estimator_1m_resolution.py`.
 
-**Validation**: full suite 814 cases passing (717 smoke + 97 unit);
+**Validation**: full suite 820 cases passing (717 smoke + 103 unit);
 `flow doctor` clean; `flow_selftest.py` ALL CHECKS PASSED; 3 contract
 fixtures (`docs/fixtures/v081-{minimal,typical,advanced}.json`)
 validate; v0.8.0 forward-compat smoke green.

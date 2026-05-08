@@ -14,16 +14,24 @@ fill may diverge by ±20% due to JSON metadata, tool payload escaping, etc.
 
 Limit resolution priority chain (see `_resolve_limit`):
   1. ``FLOW_CONTEXT_LIMIT`` env var (explicit override, positive int tokens)
-  2. ``~/.claude/settings.json::env::ANTHROPIC_DEFAULT_<BASE>_MODEL`` ending
-     ``[1m]`` (BASE inferred from detected model: opus / sonnet / haiku)
-     -> 1_000_000
+  2a. ``~/.claude/settings.json::env::ANTHROPIC_DEFAULT_<BASE>_MODEL``
+      ending ``[1m]`` (BASE inferred from detected model: opus / sonnet /
+      haiku) -> 1_000_000 (model-specific alias match)
+  2b. *Plan-level heuristic*: any ``ANTHROPIC_DEFAULT_*_MODEL`` entry in
+      settings.json ending ``[1m]`` -> 1_000_000 for the current model.
+      1M context is a plan/pricing-level Anthropic add-on (not per-
+      model), so any [1m] alias is a strong signal the user's plan
+      grants 1M to all models — even ones the user hasn't aliased.
   3. ``MODEL_LIMITS`` table lookup
   4. ``DEFAULT_LIMIT`` (200_000)
 
 Rung 2 exists because Claude Code transcripts record the bare model id
 (e.g. ``claude-opus-4-7``) regardless of whether the active session is
 the 200k or 1M context variant. The only external signal of "this
-session is 1M-mode" is the env-var alias in settings.json.
+session is 1M-mode" is the env-var alias in settings.json. 2a covers
+the case where the user explicitly aliased the matching base; 2b
+covers the common case where the user only aliased *one* base (e.g.
+sonnet) and runs other models (e.g. opus) in the same 1M-enabled plan.
 """
 from __future__ import annotations
 
@@ -142,7 +150,7 @@ def _resolve_limit(model: Optional[str]) -> int:
             if value > 0:
                 return value
 
-    # Rung 2: settings.json env-alias [1m] suffix on the matching base.
+    # Rung 2a: settings.json env-alias [1m] suffix on the matching base.
     if model:
         env_key = _env_key_for_model(model)
         if env_key is not None:
@@ -154,6 +162,15 @@ def _resolve_limit(model: Optional[str]) -> int:
                 # a higher limit for this exact id, prefer that.
                 table_limit = MODEL_LIMITS.get(model, 0)
                 return max(ONE_MILLION_LIMIT, table_limit)
+
+    # Rung 2b: plan-level heuristic. 1M context is an Anthropic plan-level
+    # add-on, not a per-model setting. If the user has aliased *any* base
+    # model with a [1m] suffix, infer the plan covers 1M for all models —
+    # so the current model (which 2a missed because it has no matching
+    # alias) is also 1M-enabled.
+    if model and _any_settings_alias_signals_1m():
+        table_limit = MODEL_LIMITS.get(model, 0)
+        return max(ONE_MILLION_LIMIT, table_limit)
 
     # Rung 3 + 4: existing table lookup with default fallback.
     if model:
@@ -169,18 +186,45 @@ def _env_key_for_model(model: str) -> Optional[str]:
     return None
 
 
-def _read_settings_env_var(env_key: str):
-    """Best-effort read of `~/.claude/settings.json::env::<env_key>`.
+def _any_settings_alias_signals_1m() -> bool:
+    """Plan-level heuristic: scan settings.json env block for any
+    ``ANTHROPIC_DEFAULT_*_MODEL`` value ending ``[1m]``.
 
-    Returns the raw value (any JSON type) or None on any failure path:
-    file missing, JSON parse error, missing `env` block, env not a dict,
-    key absent. Never raises. Never logs (this runs in hot estimation
-    path).
+    1M context is an Anthropic plan-level paid add-on. A single ``[1m]``
+    alias (on any base) is a strong signal the plan covers 1M for all
+    models in the session — even bases the user hasn't aliased.
+
+    Returns True if any matching alias exists, False on every
+    defensive path (file missing, JSON parse error, env block absent
+    or malformed, no matching keys, non-string values, etc.). Never
+    raises.
+    """
+    env_block = _read_settings_env_block()
+    if env_block is None:
+        return False
+    # Iterate keys defensively. Match the same prefix/suffix pattern the
+    # Claude Code env loader recognises: ``ANTHROPIC_DEFAULT_<BASE>_MODEL``.
+    for key, value in env_block.items():
+        if not isinstance(key, str):
+            continue
+        if not (key.startswith("ANTHROPIC_DEFAULT_")
+                and key.endswith("_MODEL")):
+            continue
+        # L-class type guard: skip non-string values silently.
+        if isinstance(value, str) and value.endswith("[1m]"):
+            return True
+    return False
+
+
+def _read_settings_env_block():
+    """Best-effort read of `~/.claude/settings.json::env` as a dict.
+
+    Returns the env dict or None on any failure (file missing, JSON
+    parse error, top-level not dict, env not dict). Never raises.
     """
     try:
         settings_path = Path.home() / ".claude" / "settings.json"
     except (RuntimeError, OSError):
-        # Path.home() can raise RuntimeError when HOME is unset.
         return None
 
     try:
@@ -197,5 +241,19 @@ def _read_settings_env_var(env_key: str):
         return None
     env_block = data.get("env")
     if not isinstance(env_block, dict):
+        return None
+    return env_block
+
+
+def _read_settings_env_var(env_key: str):
+    """Best-effort read of `~/.claude/settings.json::env::<env_key>`.
+
+    Returns the raw value (any JSON type) or None on any failure path:
+    file missing, JSON parse error, missing `env` block, env not a dict,
+    key absent. Never raises. Never logs (this runs in hot estimation
+    path).
+    """
+    env_block = _read_settings_env_block()
+    if env_block is None:
         return None
     return env_block.get(env_key)

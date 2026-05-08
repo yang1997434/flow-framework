@@ -123,19 +123,35 @@ class TestResolveLimitPriorityChain(_SettingsHomeMixin, unittest.TestCase):
             self.assertEqual(
                 _resolve_limit("claude-haiku-4-5-20251001"), 1_000_000)
 
-    def test_settings_json_alias_only_upgrades_for_matching_base(self):
-        """sonnet alias [1m] does NOT upgrade an opus model lookup."""
+    def test_settings_json_alias_only_upgrades_for_matching_base_2a(self):
+        """2a alone (no plan-level fallback) only upgrades the matching base.
+
+        This pins the rung-2a *direct match* semantics: the OPUS env key
+        derived from the model is consulted directly. With plan-level
+        rung 2b layered on top, the sonnet [1m] alias *does* upgrade opus
+        — that path is covered by
+        `test_plan_level_heuristic_sonnet_alias_upgrades_opus`. Here we
+        verify rung 2a in isolation by patching out 2b's helper, so
+        regressions to either layer surface independently.
+        """
         self._make_home(settings_payload={
             "env": {"ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6[1m]"}
             # no OPUS alias
         })
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("FLOW_CONTEXT_LIMIT", None)
-            # opus model -> falls through to MODEL_LIMITS table = 200k
-            self.assertEqual(
-                _resolve_limit("claude-opus-4-7"),
-                MODEL_LIMITS["claude-opus-4-7"],
-            )
+            with mock.patch.object(
+                context_estimator,
+                "_any_settings_alias_signals_1m",
+                return_value=False,
+            ):
+                # opus model with 2b stubbed off -> falls through to
+                # MODEL_LIMITS table = 200k (2a never matches because
+                # OPUS alias is missing).
+                self.assertEqual(
+                    _resolve_limit("claude-opus-4-7"),
+                    MODEL_LIMITS["claude-opus-4-7"],
+                )
 
     # ---- Rung 2 negative: [1m] suffix absent => not upgraded ----------------
     def test_settings_json_no_1m_suffix_uses_default_table(self):
@@ -218,6 +234,104 @@ class TestResolveLimitPriorityChain(_SettingsHomeMixin, unittest.TestCase):
         """settings.json with other env keys but no relevant alias -> table."""
         self._make_home(settings_payload={
             "env": {"FOO": "bar", "ANTHROPIC_BASE_URL": "https://example"}
+        })
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FLOW_CONTEXT_LIMIT", None)
+            self.assertEqual(
+                _resolve_limit("claude-opus-4-7"),
+                MODEL_LIMITS["claude-opus-4-7"],
+            )
+
+    # ---- Rung 2b: plan-level [1m] heuristic --------------------------------
+    # 1M context is an Anthropic plan-level paid add-on. ANY *_MODEL alias
+    # ending [1m] signals the plan grants 1M to all models in the session,
+    # so a model whose own alias is missing should still upgrade to 1M.
+    def test_plan_level_heuristic_sonnet_alias_upgrades_opus(self):
+        """[P1] reproduce: sonnet [1m] alias, no opus alias -> opus = 1M.
+
+        Codex round-1 finding: production settings.json has
+        ANTHROPIC_DEFAULT_SONNET_MODEL=...[1m] but no OPUS variant.
+        Pre-2b code derived only the OPUS env key, missed the signal,
+        and fell through to MODEL_LIMITS table = 200k. Result: bare
+        `claude-opus-4-7` transcript reported ~100% instead of ~25%.
+        """
+        self._make_home(settings_payload={
+            "env": {
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6[1m]",
+                # no OPUS alias — this is the bug-trigger configuration
+            }
+        })
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FLOW_CONTEXT_LIMIT", None)
+            self.assertEqual(_resolve_limit("claude-opus-4-7"), 1_000_000)
+
+    def test_plan_level_heuristic_haiku_alias_upgrades_sonnet(self):
+        """haiku [1m] alias, no sonnet alias -> sonnet = 1M (plan-level)."""
+        self._make_home(settings_payload={
+            "env": {
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL":
+                    "claude-haiku-4-5-20251001[1m]",
+                # no SONNET alias
+            }
+        })
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FLOW_CONTEXT_LIMIT", None)
+            self.assertEqual(_resolve_limit("claude-sonnet-4-6"), 1_000_000)
+
+    def test_plan_level_heuristic_no_aliases_with_1m_no_upgrade(self):
+        """No alias has [1m] suffix -> stay on MODEL_LIMITS table."""
+        self._make_home(settings_payload={
+            "env": {
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL":
+                    "claude-haiku-4-5-20251001",
+            }
+        })
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FLOW_CONTEXT_LIMIT", None)
+            self.assertEqual(
+                _resolve_limit("claude-opus-4-7"),
+                MODEL_LIMITS["claude-opus-4-7"],
+            )
+
+    def test_plan_level_heuristic_explicit_alias_takes_precedence(self):
+        """When 2a matches, 2b is unreachable. Both paths lead to 1M but 2a
+        runs first — verifies precedence ordering didn't regress.
+        """
+        self._make_home(settings_payload={
+            "env": {
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-7[1m]",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6[1m]",
+            }
+        })
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FLOW_CONTEXT_LIMIT", None)
+            # opus -> 2a hits (matching base alias) -> 1M
+            self.assertEqual(_resolve_limit("claude-opus-4-7"), 1_000_000)
+
+    def test_plan_level_heuristic_non_matching_keys_ignored(self):
+        """Random *_MODEL-suffixed keys without ANTHROPIC_DEFAULT_ prefix
+        must not trigger the plan-level upgrade.
+        """
+        self._make_home(settings_payload={
+            "env": {
+                "OTHER_VENDOR_MODEL": "some-model[1m]",  # not Anthropic
+                "ANTHROPIC_BASE_URL": "https://example[1m]",  # wrong shape
+            }
+        })
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("FLOW_CONTEXT_LIMIT", None)
+            self.assertEqual(
+                _resolve_limit("claude-opus-4-7"),
+                MODEL_LIMITS["claude-opus-4-7"],
+            )
+
+    def test_plan_level_heuristic_non_string_value_ignored(self):
+        """L-class: non-string [1m]-ish payload doesn't fool the scan."""
+        self._make_home(settings_payload={
+            "env": {
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": ["claude-sonnet-4-6[1m]"],
+            }
         })
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("FLOW_CONTEXT_LIMIT", None)
