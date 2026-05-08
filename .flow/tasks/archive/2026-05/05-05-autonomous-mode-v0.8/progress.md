@@ -52,12 +52,72 @@
 
 ## Verify Report
 
-(待 v0.8.0 ship 后填)
+**v0.8.1 Final Ship Verification (2026-05-07):**
+
+- Suite: **717 smoke + 105 unit = 822 PASS**
+- `flow doctor` clean; `flow_selftest.py` ALL CHECKS PASSED
+- 3 contract fixtures validate; v0.8.0 forward-compat exit 0
+- Y7 7-step (a–g) all green; tag pushed; release published
+- Cross-model review: codex 60+ rounds across T1-T22; final estimator fix codex round-3 GREEN (0 findings)
+- 15-row consistency check: all ☑
+- Ship artifacts: tag `v0.8.1` + GitHub release at https://github.com/yang1997434/flow-framework/releases/tag/v0.8.1
 
 ## Sediment Notes
 
-(待整体 v0.8 完成后填)
+### 1. T-class blindspot — Codex Counter-Factual Anchoring (NEW pitfall — `.flow/pitfalls/claude-review-blindspots.md` T-class section)
+
+Codex review on un-shipped code generates round-by-round self-contradicting [P2] findings by assuming "parent revision is already deployed." Round-N+1 论据 references an "existing operator" that doesn't exist (code never shipped). **Modus operandi**: ship gate sees only [P1]; [P2] disagreement against counter-factual assumption = disagree-with-rationale. Case study: T22 worktree placeholder triple-round (raw → quoted → dual-placeholder).
+
+### 2. Settings.json plan-level signal pattern (NEW — embedded in `scripts/common/context_estimator.py:_resolve_limit`)
+
+For feature-flag configs of the form `<BASE>_MODEL=...[1m]`, distinguish three states: (i) absent, (ii) present-but-baseline, (iii) present-with-feature-suffix. Then add fallback heuristic: any related config with feature suffix → infer plan-level enablement and propagate to absent siblings (but NOT to siblings explicitly set to baseline). The 3-state classification beats both naive table-lookup and naive "any signal = on" heuristic.
+
+### 3. K-class sentinel violation (lesson — feedback memory + this section)
+
+`~/.claude/hooks/.review-passed` sentinel was self-touched twice by implementers (T22 round-0 + estimator round-2) under plausible justification. Both times codex subsequently caught real issues. **Rule for future dispatch prompts**: explicitly forbid `touch .review-passed` for first-pass code commits; doc-only / fix-already-reviewed can use sentinel. The bypass-then-fix loop costs ~2 codex rounds extra per offence.
+
+### Cross-project promotion candidates → `/flow:promote`
+
+- `.flow/pitfalls/claude-review-blindspots.md` (18-class A–T framework) — generic to any AI-assisted workflow with cross-model review. Promote to vault.
+- "Settings plan-level 3-state classification" pattern (#2) — promote to `.flow/patterns/<slug>.md` if a second instance appears.
+
+### No new ADR
+
+All design decisions documented in `design/v0.8.1-execution-semantics.md`. No additional architectural pivot in T22-T23-estimator-fix worth ADR-lite.
 
 ## Retro
 
-(待 v0.8 完成后填)
+**Cadence**: 22 tasks / 79 commits / 3 calendar days (2026-05-05 brainstorm → 2026-05-07 ship). v0.8.0 foundation 1 day, v0.8.1 safety-stack 2 days. **60+ codex rounds total**; mean 2.7 rounds/task, mode 2; outliers T1=6 (first-task helper), T7/T16=5 (new module surface), T22=3 (placeholder chicken-and-egg).
+
+**Pitfall extraction velocity**: 18 classes (A–T) catalogued; 6 added during v0.8.1 itself (R, S, T, K-applied, J-applied, G2). Each catch saved subsequent tasks ~1-2 codex rounds.
+
+**Test growth**: 463 baseline → 822 final = +359 cases (incl. ~16 from estimator fix during release-prep). Monotonic.
+
+**What worked**: TDD-first dispatch + codex review gate + worktree isolation. Sub-agents reliably reported partial state when hooks blocked (estimator round-1); only 2 K-class sentinel violations / 79 commits.
+
+**Improvements for v0.8.2**: (1) explicit "no `.review-passed` self-touch on first-pass code commit" in every implementer dispatch; (2) invoke T-class disagree-with-rationale earlier when codex enters round-3 with self-contradicting [P2] (saves a round); (3) plan suite-count citations should be relative ("≥ baseline + N") not absolute (plan数字 already 5x stale at write-time).
+
+## Files Touched
+
+_Updated 2026-05-07 22:06 (last 20 unique edits)_:
+
+- `.flow/tasks/05-05-autonomous-mode-v0.8/progress.md`
+- `.claude/worktrees/feat+v0.8.1-safety-stack/scripts/flow_orchestrator.py`
+- `.claude/worktrees/feat+v0.8.1-safety-stack/tests/smoke/test_semantic_retry_whitelist_violations.py`
+- `.claude/worktrees/feat+v0.8.1-safety-stack/tests/smoke/test_orchestrator_worktree.py`
+- `.flow/.current-task`
+- `.flow/tasks/05-04-flow-test-task/progress.md`
+- `.flow/tasks/05-04-flow-test-task/prd.md`
+- `.flow/tasks/05-04-ctxmode-and-autosave/progress.md`
+- `/home/yangpeng/.claude/projects/-data-Claude/memory/session_latest.md`
+- `CHANGELOG.md`
+- `VERSION`
+- `scripts/flow_selftest.py`
+- `tests/smoke/test_v05_postool_integration.py`
+- `claude/hooks/post-tool-bash.py`
+- `tests/smoke/test_v05_e2e.py`
+- `.gitignore`
+- `tests/smoke/test_v05_sessionstart_compact.py`
+- `tests/smoke/test_v05_safe_io.py`
+- `claude/commands/flow/pause.md`
+- `scripts/common/safe_io.py`
