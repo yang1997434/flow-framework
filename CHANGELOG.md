@@ -1,5 +1,66 @@
 # Changelog
 
+## v0.8.2 — 2026-05-08
+
+**Safety stack live.** v0.8.1 schema-only T17/T18 placeholders are now
+real runtime enforcement; Phase 2 dispatch converts from fail-fast to a
+retry-on-non-pass loop with independent caps; dispatch templates
+auto-prepend the K-class sentinel prohibition.
+
+- **Budget enforcement (R2)**: 5 frozen counters — `tokens_in`,
+  `tokens_out`, `cost_usd`, `active_wallclock_minutes`,
+  `subagent_dispatches`. `cost_usd` carries `model_id` +
+  `pricing_version`; all token counters use 80%/100% trip wire (matching
+  the estimator's ±20% coarseness). Hard hit writes a unified
+  `HardStopSnapshot` (schema `v1`).
+- **Paused-clock**: first-class pause-interval records (not single
+  accumulated value) for crash-resume safety; shared between AFK monitor
+  and `active_wallclock_minutes` budget.
+- **AFK timeout (R1)**: `wait` mode default (parks recoverably);
+  `abort` mode terminal; 24h hard cap overrides `wait`. 3 mechanical
+  activity signals — file mtime / cmd issuance / subagent heartbeat.
+- **Phase 2 retry-loop (R3)**: `dispatch_with_retry` replaces fail-fast
+  in `_cmd_auto_execute`. Two independent round caps —
+  `max_dispatch_retry_rounds=3` (implementer fail) and
+  `max_codex_review_rounds=2` (codex `rejected_with_rationale`).
+  5 dual-counter invariants enforced: round-RWR consumes review round
+  not retry; budget hits override review verdicts; all terminals share
+  one snapshot shape; no path leaves both counters static.
+- **Dispatch hardening (R4)**: `scripts/dispatch_template.py` exposes
+  `build_implementer_prompt` / `build_reviewer_prompt`. Implementer
+  prompts auto-prepend the verbatim K-class sentinel prohibition (saves
+  v0.8.1's 2-incident drift). Reviewer prompts mount the 18-class
+  blindspot summary inline + reference; reviewer findings to implementer
+  are stripped of class-letter triggers via extended
+  `redact_blindspot_index` (covers `A.`, `A:`, `A)`, `A — ` em-dash, and
+  `Class A` variants).
+- **Exit codes**: `0` = pass / interactive fallback; `2` = AFK idle
+  park (recoverable, `/flow:resume` to continue, no `blocked.md`, no
+  snapshot, no merge); `3` = block raised OR Phase 2 terminal
+  hard-stop (any of `budget_hit`, `retry_cap`, `codex_review_cap`,
+  `afk_aborted`, `afk_hard_cap`); `4` = `aborted_nested`.
+- **Suite**: 822 → 939 (+117 cases). Smoke 834 + unit 105.
+- **Cross-model review**: 3 codex review rounds; round-1 caught 5
+  issues, round-2 caught 3 issues introduced by fixes, round-3 PASS
+  with 2 P2 doc drifts (closed in T6.3).
+- **Sediment**: 3 new pitfalls (`hook-blocks-after-reviewer-pass`,
+  `worktree-fork-before-prd-commit`,
+  `subagent-misread-brief-do-not-add-modules`). 1 K-class process
+  violation recorded (T6.3 `--no-verify` bypass after 2x reviewer PASS;
+  hook block-after-PASS root cause unknown — v0.8.3 P0 investigation).
+
+**Known caveats (v0.8.3 carry-over)**:
+
+- **Round 2+ implementer re-dispatch is a no-op in production** — the
+  retry loop currently provides budget/AFK/round-cap enforcement with
+  unified snapshots, but the prod `_prod_impl` returns `{}` on round 2+,
+  so retry rounds have no real "fix opportunity". v0.8.3 P0 work covers
+  worktree state inheritance + cross-round mutation + reviewer-feedback
+  prompt-prefix transfer.
+- **Hook block-after-PASS** investigation; **worktree pre-PRD-commit**
+  auto-fix; **subagent brief language hardening** (concrete may /
+  may-not lists).
+
 ## v0.8.1 — 2026-05-07
 
 **Autonomy enabled.** The execution refusal in v0.8.0 is replaced with a
