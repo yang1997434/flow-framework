@@ -150,8 +150,10 @@ None new — the existing `hook-blocks-after-reviewer-pass` is now `status=resol
 
 ## Files Touched
 
-_Updated 2026-05-08 08:42 (last 20 unique edits)_:
+_Updated 2026-05-08 08:43 (last 20 unique edits)_:
 
+- `/home/yangpeng/.claude/projects/-data-Claude-flow-framework/memory/session_latest.md`
+- `/tmp/sediment-msg.txt`
 - `.flow/tasks/05-08-v0.8.3-p0.0-hook-fix/progress.md`
 - `/tmp/flow-commit-msg.txt`
 - `/tmp/dt-c.py`
@@ -170,5 +172,7 @@ _Updated 2026-05-08 08:42 (last 20 unique edits)_:
 - `/home/yangpeng/claude-linux-config/claude/hooks/_vendor/_selftest.py`
 - `/tmp/codex-consult-v083-p00-r5.txt`
 - `/tmp/codex-consult-v083-p00-r4.txt`
-- `/tmp/codex-consult-v083-p00-r3.txt`
-- `/tmp/bashlex-probe.py`
+
+## Commits
+
+- [2026-05-08 08:42] `61dcddf` chore(v0.8.3 P0.0): finalize progress.md with execute log + sediment notes
