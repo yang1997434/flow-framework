@@ -58,6 +58,9 @@ from flow_state_writer import (  # type: ignore
     append_decision, DecisionRecord,
 )
 from flow_notification import Notifier  # type: ignore
+from dispatch_template import (  # type: ignore  # v0.8.2 T4
+    build_implementer_prompt,
+)
 
 
 # Files implicitly shared across tasks — copied from flow_wave_planner; v0.8.0
@@ -4956,8 +4959,22 @@ def dispatch_with_retry(
         # ── Implementer round ─────────────────────────────────────
         # Round number = retry_rounds + 1 on round 1; visual.
         round_num = state.dispatch_retry_rounds + 1
-        prefix = redact_blindspot_index(
+        # v0.8.2 T4 — build the implementer prompt prefix via the
+        # canonical builder so the K-class sentinel prohibition (no
+        # touching `~/.claude/hooks/.review-passed` for first-pass
+        # code) auto-prepends. The reviewer feedback is first redacted
+        # of 18-class trigger lines (T3 transparency rule) and then
+        # appended with a visible separator. The retry-loop semantics
+        # stay unchanged: we still emit a single `prefix` string fed
+        # to the implementer adapter via prompt_prefix.
+        redacted_feedback = redact_blindspot_index(
             state.last_reviewer_feedback or ""
+        )
+        prefix = build_implementer_prompt(
+            task_brief="",
+            reviewer_feedback=redacted_feedback or None,
+            is_first_pass=True,
+            is_doc_only=False,
         )
         impl_deltas = deps.run_implementer_round(
             state=state, prompt_prefix=prefix,

@@ -102,6 +102,58 @@ progress.md.
 AFK. The loop calls `afk.pause("codex_review")` before each review
 and `afk.resume()` after.
 
+## Reviewer self-check — 18-class blindspot framework
+
+The full framework lives at `.flow/pitfalls/claude-review-blindspots.md`.
+Reviewer agents (gate 4 codex pass + any human reviewer) MUST consult
+the trigger checklists per class as part of self-check. The
+`scripts/dispatch_template.py::build_reviewer_prompt` helper mounts
+the same content into Python-built reviewer prompts; this SKILL.md
+section is the equivalent for SKILL-driven reviewer flows.
+
+Class summary (one line each — full triggers in the file above):
+
+  A — Python falsy/truthy traps (.get + or, is None vs not in)
+  B — design cross-reference semantics (enum × field cartesian product)
+  C — architectural ordering / reachability (gate before exception swallow)
+  D — bypass via fallback path (try/except return False; rc != 0 lying)
+  E — shell=True + prefix-match = compound-command bypass; metachar guard
+  F — identity check fail-open (missing hash → block, never skip)
+  G — facts-from-disk: enumerate ALL state layers (HEAD/index/wt/untracked)
+  H — external tool output parsing ambiguity (use -z / --json, not split)
+  I — repeating earlier task's mistake; grep existing helpers before writing
+  J — fix-chain paper-cuts (audit verdict / forensic / labels with happy path)
+  K — plausible-justification trap; deviating from helper needs codex audit
+  L — type-check vs presence-check (key in dict ≠ value is the right type)
+  M — shared state file cross-task pollution (filter jsonl by task scope)
+  N — disk identity vs ref identity (merge SHA, not branch ref)
+  O — same-pid TOCTOU within-second (use µs ts for path-from-ts collisions)
+  P — JSONL scope key must include task_id, not just run_id
+  Q — filter + enumerate index drift (preserve original idx for audit)
+  R — frontmatter / OSC injection (full splitlines() separator class)
+  S — wire-up gap: helper exists but production never calls it
+  T — codex counter-factual anchoring across review rounds
+
+**Redaction rule** (do NOT skip this): review feedback that flows
+back to the implementer (via `state.last_reviewer_feedback`) MUST NOT
+include class letters. The `flow_orchestrator.redact_blindspot_index`
+helper enforces this by stripping `A. ` / `Class A:` / `[A] ` /
+`(A) ` line headers (letters A-T) before the next implementer round.
+Use class letters to organize YOUR self-check; emit specific concrete
+findings (file refs, line refs, exact behaviours) to the implementer.
+Class labels in impl-facing feedback would let the implementer
+cargo-cult the categorisation rather than fix the actual bug.
+
+## Implementer prompt — K-class sentinel prohibition
+
+`scripts/dispatch_template.py::build_implementer_prompt` auto-prepends
+the K-class prohibition to every first-pass code dispatch. The text
+is pinned by tests (`tests/smoke/test_dispatch_template.py`); do not
+weaken it. Doc-only dispatches (`is_doc_only=True`) — progress.md
+updates, sediment notes — opt out because the pre-commit review hook
+they would bypass does not run on doc-only paths anyway. The default
+is safe-by-default: prohibition prepended unless explicitly opted out.
+
 **Subagent contract** (PRD §1.2): execute the per-task prompt; return
 narrative summary ONLY. Orchestrator derives facts from worktree
 `git diff` and test logs — subagent self-report fields are ignored.
