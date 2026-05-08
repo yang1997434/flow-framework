@@ -66,15 +66,16 @@ class TestFiveCounters(unittest.TestCase):
         self.assertIsNone(cs2["tokens_in"].hit_at_iso)
 
     def test_tokens_in_hit_and_near_hit(self):
+        # T6.2 P2: warn boundary lowered to 80% (matches slack_state).
         cs = bc.make_default_set(_LIMITS)
         c = cs["tokens_in"]
-        c.add(890.0)  # 89%
+        c.add(790.0)  # 79%
         self.assertFalse(c.is_warn())
         self.assertFalse(c.is_hit())
-        c.add(10.0)  # 90%
+        c.add(10.0)  # 80%
         self.assertTrue(c.is_warn())
         self.assertFalse(c.is_hit())
-        c.add(110.0)  # 101% (1010 of 1000)
+        c.add(210.0)  # 101% (1010 of 1000)
         self.assertTrue(c.is_hit())
 
     def test_tokens_out_exact_100_pct_is_hit(self):
@@ -84,12 +85,13 @@ class TestFiveCounters(unittest.TestCase):
         self.assertTrue(c.is_hit())
 
     def test_active_wallclock_minutes_hit(self):
+        # T6.2 P2: warn at 80% (matches slack_state).
         cs = bc.make_default_set(_LIMITS)
         c = cs["active_wallclock_minutes"]
-        c.add(54.0)  # 90%
+        c.add(48.0)  # 80%
         self.assertTrue(c.is_warn())
         self.assertFalse(c.is_hit())
-        c.add(7.0)  # 101.6%
+        c.add(13.0)  # 101.6%
         self.assertTrue(c.is_hit())
 
     def test_subagent_dispatches_hit(self):

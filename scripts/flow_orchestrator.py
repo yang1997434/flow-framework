@@ -4904,6 +4904,35 @@ def _first_tripped_counter(budget: dict):
     return None
 
 
+def _tick_wallclock_from_clock(
+    budget: dict, afk, now_iso: str,
+) -> None:
+    """Sync ``budget['active_wallclock_minutes'].value`` with the AFK
+    PausedClock's active_seconds at ``now_iso``.
+
+    The loop never auto-advances this counter via impl deltas (impl
+    rounds carry tokens / cost only). Without explicit ticks the budget
+    never trips on long runs — see T6.1 P1.2 (initial fix: tick at top
+    of loop) and T6.2 P1.2 (final fix: ALSO tick post-impl, before the
+    review-outcome branch, so a slow impl that pushed active_seconds
+    over the cap can't be salvaged by a "pass" verdict).
+
+    Test fakes may inject a stripped budget shape (no
+    ``active_wallclock_minutes``) or an AFK without a real PausedClock
+    — both are silently skipped (this is a budget enforcement helper,
+    not a contract assertion site).
+    """
+    if "active_wallclock_minutes" not in budget:
+        return
+    try:
+        budget["active_wallclock_minutes"].value = (
+            afk.clock.active_seconds(now_iso) / 60.0
+        )
+    except (AttributeError, ValueError):
+        # Test fakes may not have a PausedClock; skip silently.
+        pass
+
+
 def dispatch_with_retry(
     *,
     state: RetrySessionState,
@@ -4964,19 +4993,9 @@ def dispatch_with_retry(
             snap = afk.to_snapshot(state.task_slug, now, reason="timeout")
             return "afk_aborted", snap
 
-        # ── T6.1 P1.2 — tick active_wallclock_minutes from clock ──
-        # The loop never auto-advances this counter in production
-        # (impl deltas only carry tokens / cost). Without an explicit
-        # tick the budget never trips. Source-of-truth is
-        # AfkMonitor's PausedClock; convert seconds → minutes.
-        if "active_wallclock_minutes" in budget:
-            try:
-                budget["active_wallclock_minutes"].value = (
-                    afk.clock.active_seconds(now) / 60.0
-                )
-            except (AttributeError, ValueError):
-                # Test fakes may inject a stripped budget shape; skip.
-                pass
+        # ── T6.1 P1.2 / T6.2 P1.2 — tick wallclock from PausedClock.
+        # See `_tick_wallclock_from_clock` docstring for rationale.
+        _tick_wallclock_from_clock(budget, afk, now)
 
         # ── Pre-tick: budget gates (any tripped -> terminal) ──────
         tripped = _first_tripped_counter(budget)
@@ -5073,6 +5092,27 @@ def dispatch_with_retry(
             f"reviewer({review_outcome})",
             {},
         )
+
+        # ── T6.2 P1.2 — post-impl/post-review budget recheck ──────
+        # Pre-tick at top of loop only catches the budget BEFORE impl
+        # runs. If impl is slow enough to push active_wallclock_minutes
+        # over the cap, the loop would return ("pass", None) on a
+        # successful review — bypassing the budget. Re-tick wallclock
+        # (other counters are already accumulated via
+        # `_apply_impl_deltas_to_budget` above) and re-check ALL
+        # counters BEFORE branching on review_outcome. Budget
+        # enforcement WINS over the review verdict (J-class: a config
+        # boundary must not silently pass on a counter hit; the
+        # enforced budget is the ground truth).
+        post_now = now_iso_fn()
+        _tick_wallclock_from_clock(budget, afk, post_now)
+        tripped = _first_tripped_counter(budget)
+        if tripped is not None:
+            tripped.mark_hit(post_now)
+            snap = _build_budget_snapshot(
+                tripped, state.task_slug, post_now,
+            )
+            return "budget_hit", snap
 
         # ── State transition (J-class invariant 5) ────────────────
         if review_outcome == "pass":
@@ -5176,11 +5216,21 @@ def _phase2_dispatch(
     notifier: "Notifier",
     deps_factory: Optional[Callable[..., RetryDeps]] = None,
 ) -> int:
-    """Phase 2 production wire-up. Returns rc (0 = pass, 3 = blocked).
+    """Phase 2 production wire-up.
 
-    On non-pass terminals, writes the HardStopSnapshot to
-    ``.flow/tasks/<slug>/hard-stop.json`` (atomic) and fires a
-    structured block via ``notifier`` before returning 3.
+    Return codes (T6.2 P1.1 — three distinct values, NOT a binary
+    pass/blocked split):
+
+      * ``0`` — Phase 2 passed; caller proceeds to gate-7 merge.
+      * ``2`` — Phase 2 PARKED (wait-mode AFK idle timeout).
+                RECOVERABLE: no snapshot, no notifier; caller MUST NOT
+                proceed to merge. Caller logs "parked, run /flow:resume"
+                and returns. Distinct from rc=0 so park-becomes-merge
+                is mechanically impossible (D-class regression guard).
+      * ``3`` — Phase 2 TERMINAL (budget_hit / retry_cap / review_cap /
+                afk_hard_cap / afk_aborted). HardStopSnapshot persisted
+                to ``.flow/tasks/<slug>/hard-stop.json`` (atomic);
+                ``notifier.fire_block`` invoked.
     """
     from common import snapshot as _snap  # type: ignore
     from common.afk_monitor import now_iso_utc  # type: ignore
@@ -5298,12 +5348,16 @@ def _phase2_dispatch(
     if outcome == "pass":
         return 0
 
-    # T6.1 P1.1 — wait-mode AFK idle park is RECOVERABLE: no snapshot,
-    # no notifier, rc=0 (caller's outer driver re-enters when activity
-    # resumes or the 24h hard cap fires; the loop's job is to NOT keep
-    # dispatching while parked).
+    # T6.2 P1.1 — wait-mode AFK idle park is RECOVERABLE and now returns
+    # rc=2 (DISTINCT from rc=0 pass). T6.1 used rc=0 here, but the caller
+    # `_cmd_auto_execute` interprets rc=0 as "Phase 2 passed → proceed
+    # to gate 7 merge", which silently merged partial work whenever AFK
+    # parked. Distinct rc kills the park-becomes-merge regression
+    # mechanically (D-class). Still: no snapshot, no notifier — park is
+    # not a block; the caller's outer driver re-enters when activity
+    # resumes or the 24h hard cap fires.
     if outcome == "afk_idle_park":
-        return 0
+        return 2
 
     # ── Non-pass terminal: persist snapshot + fire block ───────────
     if snap is not None:
@@ -5505,6 +5559,20 @@ def _cmd_auto_execute(slug: str) -> int:
             task_id=task_id,
             notifier=notifier,
         )
+        # T6.2 P1.1 — three distinct return paths (NEVER conflate park
+        # with pass; park-becomes-merge would silently merge partial
+        # work). rc semantics live in `_phase2_dispatch.__doc__`.
+        if rc == 2:
+            # Parked (wait-mode AFK idle timeout). RECOVERABLE: no
+            # snapshot, no block. Operator resumes via `/flow:resume`
+            # once activity returns or the 24h hard cap fires.
+            print(
+                f"PARKED: phase 2 paused on AFK idle wait for task "
+                f"{task_id} — resume with `/flow:resume {slug}` once "
+                f"activity returns (24h hard cap still applies).",
+                file=sys.stderr,
+            )
+            return 2
         if rc != 0:
             return rc
 

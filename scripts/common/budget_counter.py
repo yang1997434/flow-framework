@@ -4,9 +4,11 @@
     tokens_in / tokens_out / cost_usd / active_wallclock_minutes /
     subagent_dispatches
 
-Trip wire policy: warn at 90 %, hard-stop at 100 % (matches
-`context_estimator.slack_state` — guards against estimator ±20 %
-precision illusion; see PRD §R2.3).
+Trip wire policy: warn at 80 %, hard-stop at 100 %. Aligned with
+``context_estimator.slack_state`` — gives ~20 % headroom for the
+estimator's ±20 % coarseness (see PRD §R2.3). T6.2 P2: previously
+0.9; lowered to 0.8 to match slack_state and remove the dual warn
+policy that confused operators.
 
 Schema notes:
 - Schema is intended to be stable for v0.8.2; persisted JSON is round-
@@ -37,8 +39,10 @@ from typing import Optional
 
 
 # Counter trip wires. Caller may override per-counter via `is_warn(threshold)`,
-# but defaults are the policy stated above.
-DEFAULT_WARN_THRESHOLD = 0.9
+# but defaults are the policy stated above. T6.2 P2: warn threshold lowered
+# from 0.9 to 0.8 to align with `context_estimator.slack_state` and provide
+# 20% headroom for the estimator's ±20% coarseness.
+DEFAULT_WARN_THRESHOLD = 0.8
 DEFAULT_HIT_THRESHOLD = 1.0
 
 

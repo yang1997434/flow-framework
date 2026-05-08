@@ -735,5 +735,525 @@ class TestT61LastHaltedGateInSnapshot(unittest.TestCase):
                           f"expected gate name in why_blocked, got {why!r}")
 
 
+# ----------------------------------------------------------------------
+# T6.2 P1.1 — afk_idle_park returns rc=2 (distinct from rc=0 pass and
+# rc=3 terminal-with-snapshot). _cmd_auto_execute must NOT proceed to
+# gate-7 merge when Phase 2 parked. Park-becomes-merge would silently
+# merge partial work — semantic regression of T6.1.
+# ----------------------------------------------------------------------
+
+class TestT62Phase2DispatchParkReturnsRc2(unittest.TestCase):
+    """T6.2 P1.1: rc mapping in `_phase2_dispatch`:
+        pass            -> 0
+        afk_idle_park   -> 2  (RECOVERABLE; no snapshot, no notifier)
+        terminal-w-snap -> 3  (snapshot persisted + notifier fired)
+    """
+
+    def _make_contract(self) -> Contract:
+        return Contract(
+            contract_schema_version=1,
+            autonomy_mode="full",
+            created_at="2026-05-08T00:00:00Z",
+            budget={
+                "tokens_in": 1_000_000.0,
+                "tokens_out": 1_000_000.0,
+                "cost_usd": 1000.0,
+                "active_wallclock_minutes": 600.0,
+                "subagent_dispatches": 100.0,
+            },
+        )
+
+    def test_phase2_dispatch_park_returns_rc2_no_merge(self):
+        """wait-mode AFK timeout in `_phase2_dispatch` -> rc=2.
+        No hard-stop.json on disk. Notifier MUST NOT have been fired."""
+        with tempfile.TemporaryDirectory() as td:
+            task_dir = Path(td)
+            (task_dir / "progress.md").write_text(
+                "# progress\n\n## Execute Log\n", encoding="utf-8",
+            )
+
+            class _SpyNotifier:
+                def __init__(self):
+                    self.fired: list = []
+
+                def fire_block(self, **kw):
+                    self.fired.append(kw)
+
+            notifier = _SpyNotifier()
+
+            # Inject a deps_factory whose impl never gets called because
+            # the wait-mode AFK timeout fires on the very first pre-tick.
+            def _deps_factory(**_kw):
+                def _impl(*, state, prompt_prefix, **__):
+                    raise AssertionError("impl must not run on park")
+
+                def _review(*, state, impl_deltas, **__):
+                    raise AssertionError("review must not run on park")
+
+                return RetryDeps(run_implementer_round=_impl,
+                                 run_codex_review=_review)
+
+            # Patch _resolve_afk_monitor to return a wait-mode AFK that
+            # times out on the very first evaluate() call.
+            import flow_orchestrator as fo
+            from common.afk_monitor import AfkMonitor
+
+            start = datetime(2026, 5, 8, 0, 0, 0, tzinfo=timezone.utc)
+            start_iso = _iso(start)
+            wait_afk = AfkMonitor(
+                start_iso=start_iso,
+                mode="wait",
+                idle_seconds_threshold=1.0,
+                hard_cap_seconds=99_999.0,
+            )
+            # Force the next evaluate to time out: roll last_activity
+            # back by 999s so the next now() (still close to start) is
+            # already > idle_seconds_threshold.
+            wait_afk.last_activity_iso = _iso(
+                start - timedelta(seconds=999),
+            )
+
+            orig_resolve_afk = fo._resolve_afk_monitor
+
+            def _patched_resolve_afk(contract, *, start_iso):
+                del contract, start_iso
+                return wait_afk
+
+            fo._resolve_afk_monitor = _patched_resolve_afk  # type: ignore
+            try:
+                rc = _phase2_dispatch(
+                    slug="t62-park",
+                    task_dir=task_dir,
+                    contract=self._make_contract(),
+                    manifest=object(),
+                    facts=object(),
+                    ctx=object(),
+                    criteria=[],
+                    gate_cmds={
+                        "baseline": "true", "codex": "true",
+                        "smoke": "true",
+                    },
+                    run_id="run-park",
+                    task_id="task-park",
+                    notifier=notifier,
+                    deps_factory=_deps_factory,
+                )
+            finally:
+                fo._resolve_afk_monitor = orig_resolve_afk  # type: ignore
+
+            # rc=2 = parked (distinct from 0/pass and 3/terminal).
+            self.assertEqual(
+                rc, 2,
+                f"wait-mode park must return rc=2, got {rc}",
+            )
+            # No hard-stop.json on disk (park is recoverable).
+            self.assertFalse(
+                (task_dir / "hard-stop.json").exists(),
+                "park must NOT persist HardStopSnapshot",
+            )
+            # No notifier.fire_block on park.
+            self.assertEqual(notifier.fired, [],
+                             "park must NOT fire block notifier")
+
+
+class TestT62CmdAutoExecuteHonorsParkRc2(unittest.TestCase):
+    """T6.2 P1.1: `_cmd_auto_execute` MUST treat rc=2 from
+    `_phase2_dispatch` as 'parked, do NOT proceed to merge'. Merge gate
+    must NOT be invoked."""
+
+    def test_cmd_auto_execute_does_not_merge_on_park_rc2(self):
+        """Drive _cmd_auto_execute with monkeypatched _phase2_dispatch
+        returning rc=2; assert MergeRunner.merge_task is NEVER called
+        (gate 7 short-circuited on park)."""
+        import flow_orchestrator as fo
+
+        # Spies for the key call sites past the rc check.
+        merge_calls: list = []
+        gate8_calls: list = []
+        return_codes: list = []
+
+        # Monkeypatch _phase2_dispatch to return rc=2 (parked).
+        orig_phase2 = fo._phase2_dispatch
+
+        def _fake_phase2(**_kw):
+            return 2
+
+        # Monkeypatch MergeRunner so any accidental merge attempt is
+        # captured as a test failure (D-class regression detector).
+        class _SpyMerger:
+            def __init__(self, **kw):
+                pass
+
+            def merge_task(self, *a, **kw):
+                merge_calls.append((a, kw))
+                raise AssertionError(
+                    "MergeRunner.merge_task called despite Phase 2 "
+                    "park (rc=2)"
+                )
+
+        class _SpyGate8:
+            def __init__(self, **kw):
+                pass
+
+            def verify(self, *a, **kw):
+                gate8_calls.append((a, kw))
+                raise AssertionError(
+                    "Gate8VerificationRunner.verify called despite "
+                    "Phase 2 park (rc=2)"
+                )
+
+        # Stub out the front-of-loop machinery so we can reach the
+        # _phase2_dispatch call site quickly.
+        with tempfile.TemporaryDirectory() as td:
+            task_dir = Path(td) / ".flow" / "tasks" / "t62-park-merge"
+            task_dir.mkdir(parents=True)
+            # Minimal contract.json so _cmd_auto_execute can hash it.
+            contract_json = task_dir / "contract.json"
+            contract_json.write_text(
+                "{\"contract_schema_version\":1,"
+                "\"autonomy_mode\":\"full\","
+                "\"created_at\":\"2026-05-08T00:00:00Z\"}",
+                encoding="utf-8",
+            )
+
+            # Build a synthetic plan with one manifest whose recovery
+            # is "proceed", auto_dispatch is success, then _phase2 = rc2.
+            from types import SimpleNamespace
+
+            fake_manifest = SimpleNamespace(id="task-1")
+            fake_contract = fo.Contract(
+                contract_schema_version=1,
+                autonomy_mode="full",
+                created_at="2026-05-08T00:00:00Z",
+                budget={
+                    "tokens_in": 1_000_000.0,
+                    "tokens_out": 1_000_000.0,
+                    "cost_usd": 1000.0,
+                    "active_wallclock_minutes": 600.0,
+                    "subagent_dispatches": 100.0,
+                },
+            )
+            fake_plan = SimpleNamespace(
+                contract=fake_contract,
+                manifests=[fake_manifest],
+                fallback_reason=None,
+            )
+
+            patches = []
+
+            def _patch(obj, name, value):
+                patches.append((obj, name, getattr(obj, name)))
+                setattr(obj, name, value)
+
+            try:
+                _patch(fo, "build_plan", lambda slug: fake_plan)
+                _patch(fo, "_resolve_slug_dir",
+                       lambda slug: task_dir)
+                _patch(fo, "_resolve_or_create_run_id",
+                       lambda td_: "run-1")
+                _patch(fo, "_resolve_gate_commands",
+                       lambda c: {"baseline": "true",
+                                  "codex": "true",
+                                  "smoke": "true",
+                                  "merge_strategy": "merge"})
+                _patch(fo, "_resolve_integration_target",
+                       lambda c: "main")
+                _patch(fo, "_task_already_completed",
+                       lambda task_dir, *, run_id, task_id: False)
+
+                # Recovery dispatcher → "proceed".
+                class _OkVerdict:
+                    action = "proceed"
+                    block_type = None
+                    blocked_md_path = None
+                    details = None
+
+                class _OkDispatcher:
+                    def __init__(self, **kw):
+                        pass
+
+                    def classify(self):
+                        return _OkVerdict()
+
+                _patch(fo, "CrashRecoveryDispatcher", _OkDispatcher)
+
+                # auto_dispatch_task → success (status NOT 'blocked').
+                class _OkOutcome:
+                    status = "ok"
+                    block_type = None
+                    blocked_md_path = None
+                    ctx = SimpleNamespace()
+                    facts = SimpleNamespace()
+
+                _patch(fo, "auto_dispatch_task",
+                       lambda **kw: _OkOutcome())
+
+                _patch(fo, "Notifier",
+                       lambda **kw: SimpleNamespace(
+                           fire_block=lambda **k: None,
+                       ))
+
+                _patch(fo, "_phase2_dispatch", _fake_phase2)
+                _patch(fo, "MergeRunner", _SpyMerger)
+                _patch(fo, "Gate8VerificationRunner", _SpyGate8)
+
+                rc = fo._cmd_auto_execute("t62-park-merge")
+                return_codes.append(rc)
+            finally:
+                for obj, name, val in reversed(patches):
+                    setattr(obj, name, val)
+
+        # _cmd_auto_execute must propagate rc=2 (parked) and NEVER
+        # reach the merge gate. Caller distinguishes parked (rc=2)
+        # from passed (rc=0) and terminal-blocked (rc=3).
+        self.assertEqual(merge_calls, [],
+                         "merge_task must NOT run when Phase 2 parked")
+        self.assertEqual(gate8_calls, [],
+                         "gate 8 verify must NOT run when Phase 2 parked")
+        self.assertEqual(
+            return_codes, [2],
+            f"_cmd_auto_execute must return rc=2 on park, got "
+            f"{return_codes}",
+        )
+
+    def test_cmd_auto_execute_logs_park_message_on_rc2(self):
+        """rc=2 should produce an operator-visible 'Phase 2 parked'
+        message on stderr so a human resuming knows to use
+        `/flow:resume`. We capture stderr by redirecting sys.stderr
+        during the call."""
+        import io
+        import contextlib
+        import flow_orchestrator as fo
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as td:
+            task_dir = Path(td) / ".flow" / "tasks" / "t62-park-msg"
+            task_dir.mkdir(parents=True)
+            (task_dir / "contract.json").write_text(
+                "{\"contract_schema_version\":1,"
+                "\"autonomy_mode\":\"full\","
+                "\"created_at\":\"2026-05-08T00:00:00Z\"}",
+                encoding="utf-8",
+            )
+
+            fake_manifest = SimpleNamespace(id="task-1")
+            fake_contract = fo.Contract(
+                contract_schema_version=1,
+                autonomy_mode="full",
+                created_at="2026-05-08T00:00:00Z",
+                budget={
+                    "tokens_in": 1_000_000.0,
+                    "tokens_out": 1_000_000.0,
+                    "cost_usd": 1000.0,
+                    "active_wallclock_minutes": 600.0,
+                    "subagent_dispatches": 100.0,
+                },
+            )
+            fake_plan = SimpleNamespace(
+                contract=fake_contract,
+                manifests=[fake_manifest],
+                fallback_reason=None,
+            )
+
+            patches = []
+
+            def _patch(obj, name, value):
+                patches.append((obj, name, getattr(obj, name)))
+                setattr(obj, name, value)
+
+            class _OkVerdict:
+                action = "proceed"
+                block_type = None
+                blocked_md_path = None
+                details = None
+
+            class _OkDispatcher:
+                def __init__(self, **kw):
+                    pass
+
+                def classify(self):
+                    return _OkVerdict()
+
+            class _OkOutcome:
+                status = "ok"
+                block_type = None
+                blocked_md_path = None
+                ctx = SimpleNamespace()
+                facts = SimpleNamespace()
+
+            buf = io.StringIO()
+            try:
+                _patch(fo, "build_plan", lambda slug: fake_plan)
+                _patch(fo, "_resolve_slug_dir",
+                       lambda slug: task_dir)
+                _patch(fo, "_resolve_or_create_run_id",
+                       lambda td_: "run-1")
+                _patch(fo, "_resolve_gate_commands",
+                       lambda c: {"baseline": "true",
+                                  "codex": "true",
+                                  "smoke": "true",
+                                  "merge_strategy": "merge"})
+                _patch(fo, "_resolve_integration_target",
+                       lambda c: "main")
+                _patch(fo, "_task_already_completed",
+                       lambda task_dir, *, run_id, task_id: False)
+                _patch(fo, "CrashRecoveryDispatcher", _OkDispatcher)
+                _patch(fo, "auto_dispatch_task",
+                       lambda **kw: _OkOutcome())
+                _patch(fo, "Notifier",
+                       lambda **kw: SimpleNamespace(
+                           fire_block=lambda **k: None,
+                       ))
+                _patch(fo, "_phase2_dispatch", lambda **_kw: 2)
+
+                with contextlib.redirect_stderr(buf):
+                    rc = fo._cmd_auto_execute("t62-park-msg")
+            finally:
+                for obj, name, val in reversed(patches):
+                    setattr(obj, name, val)
+
+            self.assertEqual(rc, 2)
+            stderr_text = buf.getvalue()
+            # Operator-visible cues: "park" + "/flow:resume".
+            self.assertIn(
+                "park", stderr_text.lower(),
+                f"stderr must mention 'park'; got {stderr_text!r}",
+            )
+            self.assertIn(
+                "flow:resume", stderr_text,
+                f"stderr must hint at /flow:resume; got "
+                f"{stderr_text!r}",
+            )
+
+
+# ----------------------------------------------------------------------
+# T6.2 P1.2 — wallclock budget can be bypassed on the final successful
+# round. Pre-tick happens BEFORE impl runs; if impl is slow enough to
+# push active_seconds over the cap, the post-impl review "pass" path
+# returned without re-checking. Fix: re-tick + re-check after impl,
+# BEFORE branching on review_outcome. Budget enforcement wins over
+# review verdict.
+# ----------------------------------------------------------------------
+
+class TestT62WallclockBudgetPostImplOverridesPass(unittest.TestCase):
+    def test_wallclock_budget_hit_post_impl_overrides_review_pass(self):
+        """Setup: wallclock limit = 1 minute. now_iso advances by 90s on
+        the impl call (simulating a slow round). Pre-tick ticks 0min ok,
+        impl runs, post-impl now=90s -> 1.5min > 1min limit -> budget_hit
+        even though scripted review said 'pass'."""
+        start = datetime(2026, 5, 8, 0, 0, 0, tzinfo=timezone.utc)
+        start_iso = _iso(start)
+        # Wide AFK so it never fires.
+        afk = AfkMonitor(
+            start_iso=start_iso,
+            mode="abort",
+            idle_seconds_threshold=99_999_999.0,
+            hard_cap_seconds=99_999_999.0,
+        )
+
+        # Hand-crafted now_fn: deterministic sequence so we can simulate
+        # impl taking 90s.
+        #   Call 1 (pre-tick):           t = start + 0s
+        #   Call 2 (impl-end activity):  t = start + 90s
+        #   Call 3 (review note):        t = start + 90s
+        #   Call 4 (post-impl tick):     t = start + 90s
+        #   ... etc.
+        # We use a list of pre-set times.
+        times = [
+            start,                              # pre-tick
+            start + timedelta(seconds=90),      # afk heartbeat
+            start + timedelta(seconds=90),      # progress log
+            start + timedelta(seconds=90),      # post-impl re-tick
+            start + timedelta(seconds=90),      # afk pause
+            start + timedelta(seconds=90),      # afk resume
+            start + timedelta(seconds=90),      # progress log review
+            start + timedelta(seconds=90),      # extra
+            start + timedelta(seconds=90),      # extra
+            start + timedelta(seconds=90),      # extra
+        ]
+        idx = {"i": 0}
+
+        def now_fn() -> str:
+            i = idx["i"]
+            idx["i"] = min(i + 1, len(times) - 1)
+            return _iso(times[i])
+
+        # Limit 1 minute (60s); 90s elapsed -> 1.5min > 1min.
+        budget = bc.make_default_set({**_LIMITS,
+                                      "active_wallclock_minutes": 1.0})
+
+        # Scripted impl returns no deltas (all the "slowness" is wallclock,
+        # not tokens), so only wallclock can trip.
+        impl_calls: list = []
+        review_calls: list = []
+
+        def _impl(*, state, prompt_prefix, **__):
+            del state, prompt_prefix
+            impl_calls.append(True)
+            return {}
+
+        def _review(*, state, impl_deltas, **__):
+            del state, impl_deltas
+            review_calls.append(True)
+            return "pass"   # Reviewer says pass; budget MUST override.
+
+        deps = RetryDeps(
+            run_implementer_round=_impl, run_codex_review=_review,
+        )
+        state = _make_state(start_iso)
+        cfg = RetryConfig(max_dispatch_retry_rounds=99,
+                          max_codex_review_rounds=99)
+        outcome, snap = dispatch_with_retry(
+            state=state, config=cfg, budget=budget,
+            afk=afk, deps=deps, now_iso_fn=now_fn,
+        )
+        # Budget enforcement wins over review "pass".
+        self.assertEqual(
+            outcome, "budget_hit",
+            f"post-impl wallclock recheck must override review pass; "
+            f"got {outcome!r}",
+        )
+        self.assertIsInstance(snap, HardStopSnapshot)
+        self.assertEqual(snap.counter_name, "active_wallclock_minutes")
+        self.assertEqual(snap.limit, 1.0)
+        # impl ran exactly once (loop terminated post-impl).
+        self.assertEqual(len(impl_calls), 1)
+        # Review may or may not run depending on implementation
+        # (re-check could happen before review). Either way, the loop
+        # must NOT reach a "pass" terminal.
+
+
+# ----------------------------------------------------------------------
+# T6.2 P2 — BudgetCounter.DEFAULT_WARN_THRESHOLD aligned to 0.8
+# (matching context_estimator.slack_state — 20% headroom for ±20%
+# coarseness). T6.1 lowered slack_state to 0.8 but left BudgetCounter
+# at 0.9, creating two competing warn policies.
+# ----------------------------------------------------------------------
+
+class TestT62BudgetCounterWarnThresholdAligned(unittest.TestCase):
+    def test_budget_counter_default_warn_at_80_pct(self):
+        """80% used should trip is_warn() with the default threshold."""
+        c = bc.BudgetCounter(name="x", value=80.0, limit=100.0)
+        self.assertTrue(
+            c.is_warn(),
+            "default warn threshold must be 0.8 (matches slack_state)",
+        )
+
+    def test_budget_counter_just_below_default_warn_is_ok(self):
+        """79% used should NOT trip is_warn() with default threshold."""
+        c = bc.BudgetCounter(name="x", value=79.0, limit=100.0)
+        self.assertFalse(c.is_warn())
+
+    def test_budget_counter_warn_threshold_module_constant_is_080(self):
+        """Module-level DEFAULT_WARN_THRESHOLD literal == 0.8."""
+        self.assertEqual(bc.DEFAULT_WARN_THRESHOLD, 0.8)
+
+    def test_budget_counter_explicit_threshold_still_honored(self):
+        """Caller-supplied threshold overrides default."""
+        c = bc.BudgetCounter(name="x", value=85.0, limit=100.0)
+        self.assertFalse(c.is_warn(threshold=0.9))
+        self.assertTrue(c.is_warn(threshold=0.79))
+
+
 if __name__ == "__main__":
     unittest.main()
