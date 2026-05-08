@@ -94,20 +94,74 @@ still a process violation. Don't bypass without consent.
    bash calls are fine). Don't assume one touch covers multiple commits.
 4. **30-min TTL** is generous but real — long sessions need fresh touch.
 
+## Second symptom (2026-05-08 /flow:pause attempt) — RESOLVED via codex consult
+
+During /flow:pause execution, a bash command using **heredoc**
+(`python3 <<'EOF' ... EOF` containing v0.5 helper writes) was
+**blocked** by the hook. Switching to file-based execution
+(`python3 /tmp/script.py`) passed.
+
+**Root mechanism (codex consult `019e067f...` round 4)**:
+
+> `^` in `grep -E` matches the start of **any line** in the input,
+> NOT the start of the entire command string. So when `tool_input.command`
+> is a multi-line bash command (heredoc body, quoted multi-line string,
+> Python f-string content, comments...), the hook scans **every line**
+> for `^\s*git\s+commit`. Any single line in the heredoc body that
+> happens to start with that pattern → block fires.
+
+This perfectly explains all three observations:
+
+| Command shape | First line | Has any line starting with `git commit`? | Result |
+|---|---|---|---|
+| `touch X && git commit ...` | the whole command | No (single line; `git commit` is mid-line after `&&`) | PASS ✅ |
+| `python3 /tmp/file.py` | the whole command | No (single line; hook can't see file content) | PASS ✅ |
+| `python3 <<EOF\n...\nEOF` (multi-line heredoc) | `python3 <<EOF` | **Some line in body matched** | BLOCK ❌ |
+
+For the failed heredoc, the body included intent_body / journal text
+discussing v0.8.2 git history. Some line (probably indented-`git commit`-prefixed bullet or quoted in narrative) matched the per-line regex.
+
+**Implication**: this hook has BOTH failure modes simultaneously:
+
+- **False negative** (security gap): `touch && git commit ...` bypasses
+  via the no-leading-`git commit` prefix
+- **False positive** (UX gap): heredoc / multi-line commands whose body
+  happens to contain a `git commit`-style line block legitimate work
+
+Same grep-line-by-line behavior is the cause of both.
+
 ## v0.8.3 fix candidates
 
-- **Option A (cheapest)**: tighten regex to also match `git commit` ANYWHERE
-  in the compound command:
-  `grep -qE '(^|[^A-Za-z])git\s+commit(\s|$)'`. Covers `touch && git commit`,
-  `cd X && git commit`, etc.
-- **Option B**: replace single-use marker with content-hash check —
-  marker stores SHA of staged content at review time; hook compares to
-  current staged-content SHA. Survives the regex bypass AND prevents
-  "review the diff, then sneak in extra changes" attack.
-- **Option C**: remove the `rm -f` (multi-use marker), keep only TTL.
-  Cheapest fix but weakens safety.
-- **Option D (recommended for v0.8.3)**: A + B combined — broad regex
-  match + content hash. Closes both gaps.
+**REVISED after codex round 4** — original Option A "match `git commit`
+anywhere" alone is INSUFFICIENT; it would worsen the heredoc false
+positive. The real fix needs to **distinguish shell-syntax context
+from data**.
+
+- **Option A**: word-boundary regex `(^|[^A-Za-z])git\s+commit(\s|$)`.
+  Covers `touch && git commit` prefix bypass. **Does NOT fix** heredoc
+  body false-positive.
+- **Option B**: content-hash marker — marker stores SHA of staged
+  content at review time; hook compares to current staged-content SHA.
+  Orthogonal to regex problem; closes "review then sneak changes" gap.
+- **Option C**: remove `rm -f` (multi-use marker), keep TTL. Weakens.
+- **Option E (codex quick fix)**: only inspect first line of `$COMMAND`:
+  ```bash
+  FIRST_LINE=$(printf '%s\n' "$COMMAND" | sed -n '1p')
+  if ! printf '%s\n' "$FIRST_LINE" | grep -qE '^\s*git\s+commit\b'; then exit 0; fi
+  ```
+  Eliminates heredoc false-positive. **Still allows** `touch && git commit`.
+- **Option F (codex recommended for true correctness)**: use a real
+  shell parser (e.g. `bashlex` or `bash -n` instrumentation) to find
+  whether the command will execute `git commit` as a top-level
+  simple-command. Heavyweight but fundamentally sound.
+- **Option D (v0.8.3 P0.0 recommended)**: B (content-hash) + F (shell
+  parser). Closes both false-negative AND false-positive together.
+  Higher implementation cost.
+- **Option G (pragmatic compromise)**: E + B (first-line check +
+  content-hash). Accepts `touch && git commit` bypass on the LLM side,
+  relies on R4 K-class prohibition + reviewer agent to keep LLM honest.
+  Avoids shell-parser dependency. Recommended IF F is too expensive
+  (10s hook timeout could be exceeded by parsing huge heredocs).
 
 ## Related
 
