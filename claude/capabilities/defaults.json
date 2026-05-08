@@ -207,11 +207,11 @@
     "_v0_8_phase2_additions": "Phase 2 capabilities added in v0.8.0 (autonomy orchestrator)",
     "autonomy_orchestrator": {
       "default": "flow:flow-phase2-execute",
-      "description": "Phase 2 — autonomous orchestrator (v0.8.1 promoted: worktree-per-task dispatch + 8-gate runner + Notifier + crash recovery)",
+      "description": "Phase 2 — autonomous orchestrator (v0.8.1 promoted: worktree-per-task dispatch + 8-gate runner + Notifier + crash recovery). v0.8.1 ships dispatch SHIM infrastructure only; production subagent invocation requires operator to export FLOW_SUBAGENT_DISPATCH_CMD env var (no built-in default — the SKILL handle is not a shell command and would fail rc=127 if executed). Production wire-up of the Claude CLI invocation template is v0.8.2 scope.",
       "skip_if_not_available": false,
       "v0_8_1_promoted": true,
       "backed_by": "scripts/flow_orchestrator.py:auto_dispatch_task",
-      "dispatch_cmd": "flow:flow-phase2-execute --slug {slug} --task {task_id} --worktree {worktree}"
+      "dispatch_cmd_note": "Intentionally absent — must be supplied via FLOW_SUBAGENT_DISPATCH_CMD env var; see scripts/flow_subagent_dispatch.py::_resolve_cmd_template fallback message."
     },
     "acceptance_verify": {
       "default": "flow:flow-phase3-finish",

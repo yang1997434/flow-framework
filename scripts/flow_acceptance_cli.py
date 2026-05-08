@@ -17,6 +17,7 @@ Empty ``acceptance_criteria`` returns 0 — the legacy test+codex gate
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -47,7 +48,11 @@ def _cmd_acceptance(args: argparse.Namespace) -> int:
     # Lazy import — keeps the CLI fast for `--help` and isolates the
     # heavy contract/runner deps to actual run paths.
     from flow_acceptance import AcceptanceRunner, EvalDecision
-    from flow_contract import parse_contract
+    from flow_contract import (
+        CONTRACT_SCHEMA_VERSION,
+        ContractError,
+        parse_contract,
+    )
 
     slug = args.run
     task_dir = _resolve_slug_dir(slug)
@@ -59,7 +64,56 @@ def _cmd_acceptance(args: argparse.Namespace) -> int:
         )
         return 1
 
-    contract = parse_contract(contract_path)
+    # L-class (codex round-1 F5): R11 schema-version ceiling MUST fire on
+    # this CLI path too, mirroring ``flow_orchestrator.build_plan`` lines
+    # 118-148. parse_contract alone does NOT enforce a ceiling — a
+    # contract_schema_version=999 contract can roundtrip parse fields
+    # this v0.8.1 runtime knows about and execute under v1 semantics
+    # (silently). Pre-parse raw-JSON check is the canonical pattern: it
+    # also fires when the future schema makes parse itself fail (a v=999
+    # contract with a future-only field would otherwise degrade through
+    # the ContractError path below). Same Rule as build_plan: only
+    # ceiling-check on a clean int > known max; everything else falls
+    # through to parse_contract's error paths.
+    try:
+        raw = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw = None
+    if isinstance(raw, dict):
+        raw_v = raw.get("contract_schema_version")
+        if (
+            isinstance(raw_v, int)
+            and not isinstance(raw_v, bool)
+            and raw_v > CONTRACT_SCHEMA_VERSION
+        ):
+            print(
+                f"ERROR: contract.json declares contract_schema_version="
+                f"{raw_v} but this flow runtime knows up to "
+                f"{CONTRACT_SCHEMA_VERSION}. Upgrade flow OR downgrade "
+                f"the contract.",
+                file=sys.stderr,
+            )
+            return 1
+
+    try:
+        contract = parse_contract(contract_path)
+    except ContractError as e:
+        print(f"ERROR: contract parse failed: {e}", file=sys.stderr)
+        return 1
+
+    # Defense-in-depth: parsed-side ceiling check (mirrors build_plan
+    # lines 157-169). Pre-parse check above already covers happy path;
+    # this catches any future code that bypasses the raw-JSON guard.
+    if contract.contract_schema_version > CONTRACT_SCHEMA_VERSION:
+        print(
+            f"ERROR: contract.json declares contract_schema_version="
+            f"{contract.contract_schema_version} but this flow runtime "
+            f"knows up to {CONTRACT_SCHEMA_VERSION}. Upgrade flow OR "
+            f"downgrade the contract.",
+            file=sys.stderr,
+        )
+        return 1
+
     criteria = list(contract.acceptance_criteria or [])
     if not criteria:
         # Empty criteria is legal; the SKILL Step 0.5 routes to the

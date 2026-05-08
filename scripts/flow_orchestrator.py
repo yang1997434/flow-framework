@@ -849,7 +849,16 @@ def auto_dispatch_task(
     # downstream mutations cannot reach back into the parent process.
     subagent_env = os.environ.copy()
     subagent_env[AUTONOMY_PARENT_PID_ENV] = str(os.getpid())
-    dispatch_fn(ctx, subagent_env=subagent_env)
+    # F1 wire-up (codex round-1): WorktreeContext intentionally has NO
+    # ``task_id`` field (the dataclass only carries worktree-level state;
+    # task identity lives on the per-iteration manifest). The dispatch
+    # shim's template needs ``{task_id}`` to invoke the subagent against
+    # the right task — pass it explicitly as a kwarg so the shim doesn't
+    # silently fall through ``getattr(ctx, "task_id", "")`` to "" and
+    # interpolate ``--task `` (empty arg). Test fixtures that set
+    # ``ctx.task_id`` directly still work (kwarg None → getattr fallback)
+    # but production now goes through the canonical path.
+    dispatch_fn(ctx, subagent_env=subagent_env, task_id=manifest.id)
     # Authoritative facts come from disk, not the dispatch return value.
     facts = derive_task_facts(ctx)
 

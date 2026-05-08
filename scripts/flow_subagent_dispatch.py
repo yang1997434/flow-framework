@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -37,7 +38,18 @@ from typing import Any
 
 
 ENV_VAR = "FLOW_SUBAGENT_DISPATCH_CMD"
-CAPABILITY_FILE = Path("claude/capabilities/defaults.json")
+# G/S-class (codex round-1 F3): resolve relative to THIS module's install
+# location, NOT relative to cwd. Production callers (`flow orchestrator
+# --auto-execute`) chdir into a user project root that has only ``.flow/``
+# under it — the framework's own ``claude/capabilities/defaults.json``
+# lives next to ``scripts/`` in the framework install. Using cwd-relative
+# resolution made the capability fallback unreachable in production and
+# turned every dispatch into the explicit RuntimeError, even when the
+# (now-removed) dispatch_cmd default was in place.
+CAPABILITY_FILE = (
+    Path(__file__).resolve().parent.parent
+    / "claude" / "capabilities" / "defaults.json"
+)
 
 # R-class: only allow chars that cannot terminate a shell token. Mirror the
 # slug regex used by flow_contract / flow_doctor (alnum + dot + underscore +
@@ -101,19 +113,36 @@ def _resolve_cmd_template() -> str:
                 if isinstance(cmd, str) and cmd:
                     return cmd
     raise RuntimeError(
-        f"subagent dispatch not configured: set {ENV_VAR} env var "
-        f"OR populate claude/capabilities/defaults.json::"
-        f"capabilities.autonomy_orchestrator.dispatch_cmd. "
-        f"v0.8.1 fails closed rather than silently skipping dispatch."
+        f"subagent dispatch not configured: export {ENV_VAR} env var "
+        f"with the subagent invocation template "
+        f"(e.g. 'claude -p flow:flow-phase2-execute --slug {{slug}} "
+        f"--task {{task_id}} --worktree {{worktree}}'). "
+        f"v0.8.1 ships the dispatch shim infrastructure but the "
+        f"capability default (autonomy_orchestrator.dispatch_cmd) is "
+        f"intentionally absent — the SKILL handle is NOT a shell "
+        f"command. Production wire-up of the Claude CLI invocation "
+        f"template is v0.8.2 scope. v0.8.1 fails closed rather than "
+        f"silently skipping dispatch."
     )
 
 
-def invoke(ctx: Any, *, subagent_env: dict | None = None, **_kw: Any) -> None:
+def invoke(
+    ctx: Any,
+    *,
+    subagent_env: dict | None = None,
+    task_id: str | None = None,
+    **_kw: Any,
+) -> None:
     """Called by orchestrator's ``_invoke_subagent_dispatch``.
 
-    ``ctx`` is duck-typed: ``ctx.worktree_path`` (Path or str),
-    ``ctx.slug``, optional ``ctx.task_id``. The resolved command template
-    receives those three as ``str.format()`` placeholders.
+    ``ctx`` is duck-typed: ``ctx.worktree_path`` (Path or str) +
+    ``ctx.slug``. ``task_id`` is taken from the explicit kwarg first
+    (orchestrator passes ``manifest.id``); only as a last-resort fallback
+    do we look at ``ctx.task_id`` — production WorktreeContext does NOT
+    define ``task_id`` (it's only on the per-iteration manifest), so the
+    kwarg path is the canonical wiring. Falling back to ``getattr`` keeps
+    older test fixtures (which set ``ctx.task_id`` directly) working
+    while production uses the explicit kwarg path.
 
     The subagent runs as a subprocess so its crash doesn't take down the
     orchestrator. Nonzero return code is a *soft* signal - the orchestrator's
@@ -123,7 +152,10 @@ def invoke(ctx: Any, *, subagent_env: dict | None = None, **_kw: Any) -> None:
     template = _resolve_cmd_template()
 
     slug = getattr(ctx, "slug", "")
-    task_id = getattr(ctx, "task_id", "")
+    # F1 wiring: orchestrator-supplied task_id is authoritative; fall back
+    # to ctx attribute only for backward-compat with existing tests.
+    if task_id is None:
+        task_id = getattr(ctx, "task_id", "")
     worktree_path = str(getattr(ctx, "worktree_path", ""))
 
     _validate_ident("slug", slug)
@@ -132,8 +164,13 @@ def invoke(ctx: Any, *, subagent_env: dict | None = None, **_kw: Any) -> None:
     if task_id:
         _validate_ident("task_id", task_id)
 
+    # R-class hardening (codex round-1 F4): worktree path is NOT covered
+    # by ``_validate_ident`` (path may legitimately contain ``/`` and
+    # platform-specific chars). Quote it before interpolation so spaces,
+    # ``;``, ``$()``, etc. cannot leak into shell-token boundaries when
+    # the template runs under shell=True.
     cmd_str = template.format(
-        worktree=worktree_path,
+        worktree=shlex.quote(worktree_path),
         slug=slug,
         task_id=task_id,
     )
