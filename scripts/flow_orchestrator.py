@@ -315,7 +315,8 @@ class WorktreeContext:
     """
     slug: str
     task_idx: int                      # zero-based — the t<n> in branch name
-    worktree_id: str                   # = `<slug>+t<n>+<shortsha>`
+    worktree_id: str                   # = `<slug>+t<n>+<shortsha>` or
+                                       # `<slug>+t<n>+r<N>+<shortsha>` for N>=2
     worktree_path: Path
     branch: str                        # same as worktree_id
     integration_target: str            # parent branch (e.g., master)
@@ -324,6 +325,11 @@ class WorktreeContext:
     base_shortsha: str                 # 7-char short of original
     lifecycle_state: str               # active|merging|merged|aborted|blocked
     created_at: str                    # ISO 8601
+    # v0.8.3 P0.1 — first-class round identity. Round 1 worktrees keep
+    # the legacy `<slug>+t<n>+<shortsha>` naming and round_num=1 (default).
+    # Round 2+ worktrees include `+r<N>` in the id and round_num>=2. Field
+    # has a default so all existing constructors keep working unchanged.
+    round_num: int = 1
 
 
 @dataclass
@@ -361,8 +367,11 @@ def _git(
 
 def create_task_worktree(
     *, repo_root: Path, slug: str, task_idx: int, integration_target: str,
+    round_num: int = 1,
 ) -> WorktreeContext:
-    """Create a worktree at `.claude/worktrees/<slug>+t<n>+<shortsha>/`.
+    """Create a worktree at `.claude/worktrees/<slug>+t<n>+<shortsha>/`
+    (Round 1) or `.claude/worktrees/<slug>+t<n>+r<N>+<shortsha>/`
+    (Round 2+ — v0.8.3 P0.1 fresh-per-round dispatch).
 
     §4 Q4.1: name uses shortsha from `integration_target` HEAD at
     create-time — stable for the worktree lifetime; retries reuse the
@@ -370,10 +379,17 @@ def create_task_worktree(
     §4 S6: at creation `original_base_commit == current_base_commit`;
     they only diverge after a later rebase.
 
+    v0.8.3 P0.1 (codex round-1 G2): when ``round_num >= 2`` the worktree
+    id includes ``+r<N>`` so concurrent retry rounds against the same
+    integration_target SHA cannot collide on path / branch name. Round 1
+    deliberately preserves the legacy naming for backward compatibility
+    — existing artefacts and journal entries reference that exact form.
+
     Validation:
       - `slug` must match `_SLUG_RE` (lowercase alphanumeric + `_-`).
       - `integration_target` must match `_REF_RE` (git refname-shaped).
       - `task_idx` must be a non-negative int.
+      - `round_num` must be a positive int (>=1).
     Validation runs BEFORE any disk side effect — invalid input raises
     ValueError without creating directories or invoking git.
 
@@ -406,6 +422,17 @@ def create_task_worktree(
         raise ValueError(
             f"task_idx must be a non-negative int; got {task_idx!r}"
         )
+    # v0.8.3 P0.1 — round_num is part of the worktree id for N>=2; same
+    # bool-as-int trap as task_idx, plus reject 0/negative (round 1 is
+    # the lower bound — there is no "round 0").
+    if (
+        not isinstance(round_num, int)
+        or isinstance(round_num, bool)
+        or round_num < 1
+    ):
+        raise ValueError(
+            f"round_num must be a positive int (>=1); got {round_num!r}"
+        )
 
     head = _git(repo_root, "rev-parse", integration_target).stdout.strip()
     if not head or len(head) < 7:
@@ -418,7 +445,14 @@ def create_task_worktree(
             f"output: {head!r}"
         )
     shortsha = head[:7]
-    worktree_id = f"{slug}+t{task_idx}+{shortsha}"
+    # v0.8.3 P0.1 (codex round-1 G2): Round 1 keeps legacy naming for
+    # backward compat with existing journals and worktree-cleanup logic;
+    # Round 2+ adds `+r<N>` so retry rounds against the same target SHA
+    # produce distinct paths + branch names.
+    if round_num >= 2:
+        worktree_id = f"{slug}+t{task_idx}+r{round_num}+{shortsha}"
+    else:
+        worktree_id = f"{slug}+t{task_idx}+{shortsha}"
     worktree_path = repo_root / WORKTREE_ROOT / worktree_id
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
     # `git worktree add -b <branch> <path> <start-point>` — list-form argv.
@@ -439,6 +473,7 @@ def create_task_worktree(
         base_shortsha=shortsha,
         lifecycle_state="active",
         created_at=now,
+        round_num=round_num,
     )
 
 
@@ -4737,6 +4772,34 @@ class RetryConfig:
             )
 
 
+@dataclass(frozen=True)
+class RoundRecord:
+    """Lightweight forensic record for a finished implementer round.
+
+    v0.8.3 P0.1: identifies a worktree produced by a dispatch round
+    without retaining the full WorktreeContext on the in-memory
+    RetrySessionState. Stored on `state.failed_rounds` so Phase 4
+    sediment / batch ExitWorktree at task end can locate the round
+    artefacts on disk.
+
+    Frozen so accidental mutation after a round terminates is a loud
+    TypeError (the round is over; its identity must not drift).
+    """
+    worktree_id: str
+    worktree_path: Path
+    branch: str
+    round_num: int
+
+    @classmethod
+    def from_ctx(cls, ctx: "WorktreeContext") -> "RoundRecord":
+        return cls(
+            worktree_id=ctx.worktree_id,
+            worktree_path=ctx.worktree_path,
+            branch=ctx.branch,
+            round_num=ctx.round_num,
+        )
+
+
 @dataclass
 class RetrySessionState:
     """Per-dispatch-session state.
@@ -4750,6 +4813,24 @@ class RetrySessionState:
     On retry_cap / codex_review_cap terminals the snapshot's ``extra``
     field is populated with these so operator triage doesn't lose
     which gate failed and why. Reset to None per dispatch session.
+
+    v0.8.3 P0.1 — fresh-worktree-per-round state additions:
+
+    - ``current_round_ctx`` / ``current_round_facts``: the (ctx, facts)
+      pair produced by the current dispatch round. Round 1: set by the
+      caller to the auto_dispatch_task outcome BEFORE driving the loop.
+      Round 2+: produced by the prod implementer adapter via
+      `_dispatch_implementer_fresh_worktree`. The review adapter reads
+      these to gate-eval the LATEST round (NOT a closed-over Round 1
+      ctx) — codex round-1 G4.
+    - ``failed_rounds``: append-only history of FAIL rounds, populated
+      via two-phase commit in `_prod_impl` (codex round-1 P0 §2). Each
+      element is a frozen RoundRecord; raw WorktreeContext objects do
+      not enter this list (codex P1 §4 — keeps state lightweight).
+    - ``winner_ctx`` / ``winner_facts``: set on PASS by the loop driver
+      so `_phase2_dispatch` can return the winner to `_cmd_auto_execute`
+      for Gate 7 merge wiring. Codex P0 §3: rc==0 ⇒ winner_ctx is not
+      None is enforced as a hard invariant by callers.
     """
     task_slug: str
     dispatch_retry_rounds: int = 0
@@ -4761,6 +4842,18 @@ class RetrySessionState:
     # T6.1 P1.3 — last halted gate context (kept for snapshot.extra).
     last_halted_at_gate: Optional[str] = None
     last_gate_details: Optional[dict] = None
+    # v0.8.3 P0.1 — fresh-worktree-per-round wiring.
+    current_round_ctx: Optional["WorktreeContext"] = None
+    current_round_facts: Optional["TaskFacts"] = None
+    failed_rounds: List[RoundRecord] = field(default_factory=list)
+    winner_ctx: Optional["WorktreeContext"] = None
+    winner_facts: Optional["TaskFacts"] = None
+    # v0.8.3 P0.1 Step K — task brief rendered once at session-start
+    # by `_phase2_dispatch` and consumed every round by
+    # `dispatch_with_retry::build_implementer_prompt`. Empty string is
+    # the safe default (Round 1 is a no-op so it doesn't matter; tests
+    # that don't set it still see the legacy `task_brief=""` posture).
+    task_brief: str = ""
 
 
 @dataclass
@@ -5055,8 +5148,17 @@ def dispatch_with_retry(
         redacted_feedback = redact_blindspot_index(
             state.last_reviewer_feedback or ""
         )
+        # v0.8.3 P0.1 Step K — populate the brief from
+        # `state.task_brief` (rendered upstream by `_phase2_dispatch`
+        # from prd.md / criteria). Round 1's prod adapter still no-ops
+        # (auto_dispatch_task already produced facts) so a populated
+        # brief here is harmless on R1 — but Round 2+ in the prod
+        # adapter REQUIRES it: `_dispatch_implementer_fresh_worktree`
+        # would otherwise hand a fresh subagent an empty brief and the
+        # subagent has no context. Tests that don't set `task_brief`
+        # see the legacy `""` behaviour (RetrySessionState default).
         prefix = build_implementer_prompt(
-            task_brief="",
+            task_brief=state.task_brief or "",
             reviewer_feedback=redacted_feedback or None,
             is_first_pass=True,
             is_doc_only=False,
@@ -5124,6 +5226,19 @@ def dispatch_with_retry(
 
         # ── State transition (J-class invariant 5) ────────────────
         if review_outcome == "pass":
+            # v0.8.3 P0.1 Step F — capture winner ctx + facts on PASS so
+            # `_phase2_dispatch` can return the round-N (N>=1) ctx to
+            # `_cmd_auto_execute` for Gate 7 merge wiring (codex
+            # round-1 P0 §3 — winner null-guard at the merge boundary).
+            # Round 1 PASS path: current_round_ctx is the seeded Round 1
+            # ctx (aliased; codex round-1 §H test reminds us the alias
+            # is intentional and Round 1 ctx fields are never mutated
+            # past this point — `WorktreeContext` is logically frozen
+            # apart from `current_base_commit`). Round 2+ PASS path:
+            # current_round_* are the helper-produced fresh values from
+            # the most recent `_prod_impl` two-phase commit.
+            state.winner_ctx = state.current_round_ctx
+            state.winner_facts = state.current_round_facts
             return "pass", None
         if review_outcome == "fail":
             state.dispatch_retry_rounds += 1
@@ -5168,6 +5283,196 @@ def _invoke_subagent_dispatch(ctx: WorktreeContext, **kw) -> None:
             "scripts/flow_subagent_dispatch.py via T22 SKILL"
         ) from e
     mod.invoke(ctx, **kw)
+
+
+# ────────────────────────────────────────────────────────────────────────
+# v0.8.3 P0.1 — fresh-worktree-per-round helper for retry-round
+# implementer dispatch. Codex round-1 review finding G3: Round 2+ MUST
+# bypass `auto_dispatch_task` because (a) the auto_engaged event is a
+# one-shot Q7.2 boundary marker — re-emitting it would cause
+# CrashRecoveryDispatcher state-3 misclassification on the next startup,
+# and (b) the auto_prepare_lock contract pairs lock-write with the
+# auto_engaged emission and is consumed exactly once. The helper builds
+# a fresh worktree off the same integration_target with `+r<N>`
+# discriminator (codex G2 — same-shortsha collisions), invokes the
+# subagent dispatch shim, and re-derives facts FROM DISK so the review
+# adapter sees the round-N diff (codex G4 — never let the retry loop
+# eval round 1 facts after a fresh round 2 has run).
+# ────────────────────────────────────────────────────────────────────────
+
+
+class InfraFailureError(RuntimeError):
+    """Raised when fresh-worktree round dispatch fails for an
+    infrastructure reason (worktree creation, subagent shim error, fact
+    derivation) BEFORE any review verdict could be produced.
+
+    v0.8.3 P0.1 (codex round-1 D §1): the retry loop's J-class progress
+    invariant says every iteration advances exactly one counter or
+    terminates. An infra failure is neither a "fail" review (which
+    advances `dispatch_retry_rounds`) nor a "pass" — silently looping
+    on it would deadlock the loop, and counting it against
+    dispatch_retry_rounds would smuggle infra noise into a budget
+    designed for review-driven retries. Solution: terminate via this
+    distinct exception class so `_phase2_dispatch` can map it to a
+    `phase2_infra_failure` block (rc=3) WITHOUT touching counters.
+
+    Subclassing RuntimeError keeps the existing T22 ImportError-to-
+    RuntimeError contract from `_invoke_subagent_dispatch` consistent —
+    callers that already catch RuntimeError still see this; callers
+    that want infra-specific handling check `isinstance(e,
+    InfraFailureError)`.
+    """
+
+
+def _dispatch_implementer_fresh_worktree(
+    *,
+    repo_root: Path,
+    slug: str,
+    task_id: str,
+    task_idx: int,
+    integration_target: str,
+    prompt_prefix: str,
+    round_num: int,
+) -> Tuple[WorktreeContext, TaskFacts, dict]:
+    """v0.8.3 P0.1 — Round 2+ implementer dispatch into a fresh worktree.
+
+    Produces (ctx, facts, deltas):
+      * ctx: a brand-new ``WorktreeContext`` from ``create_task_worktree``
+        with the round-discriminator naming (`+r<N>` for N>=2).
+      * facts: ``TaskFacts`` derived from the post-dispatch worktree diff
+        (NOT inherited from any earlier round — codex G4).
+      * deltas: empty dict for now (token / cost capture lives outside
+        this shim; identical posture to the round-1 prod_impl stub).
+        Future P0.x can populate via the subagent dispatch return path.
+
+    Side-effects intentionally OMITTED relative to ``auto_dispatch_task``
+    (codex round-1 F §F):
+      * No ``auto_prepare_lock`` write/consume — Round 1 owns the lock
+        lifecycle for the whole task; Round 2+ runs INSIDE the
+        consumed-lock window.
+      * No ``EVENT_AUTO_ENGAGED`` emission — single boundary marker per
+        task (Q7.2).
+      * No manifest verification — Round 1 already passed scope check.
+        Retry rounds re-implement against the SAME manifest scope; if a
+        round 2+ implementer accidentally widens scope, gate 3 (manifest
+        verify in the retry loop's review path via GateRunner.run_phase2)
+        still catches it.
+
+    Failure handling (codex round-1 D §1, G §1):
+      * Worktree creation errors (subprocess.CalledProcessError, OSError)
+        → wrapped in ``InfraFailureError`` so the caller can route to a
+        terminal phase2_infra_failure block instead of bumping retry
+        counters.
+      * Subagent shim errors (RuntimeError from ``_invoke_subagent_dispatch``)
+        → wrapped in ``InfraFailureError`` for the same reason. ``ctx``
+        IS retained on the exception (as ``e.ctx`` attribute) so the
+        caller can still record the orphan worktree for cleanup at task
+        end (codex D §3 — orphan ctx must be recordable).
+      * Fact derivation errors (subprocess.CalledProcessError from git)
+        → wrapped in ``InfraFailureError`` with ``e.ctx`` set.
+
+    No partial state is exposed: if any step raises, the caller MUST NOT
+    treat the helper's return value as valid (Python guarantees this —
+    no return tuple is ever produced for the failing path).
+    """
+    if round_num < 2:
+        raise ValueError(
+            "_dispatch_implementer_fresh_worktree is for retry rounds "
+            f"only (round_num >= 2); got round_num={round_num!r}"
+        )
+
+    # Step 1: fresh worktree (round-discriminator naming).
+    try:
+        ctx = create_task_worktree(
+            repo_root=repo_root,
+            slug=slug,
+            task_idx=task_idx,
+            integration_target=integration_target,
+            round_num=round_num,
+        )
+    except (subprocess.CalledProcessError, OSError) as e:
+        # No ctx exists yet — orphan-cleanup is not applicable.
+        raise InfraFailureError(
+            f"worktree creation failed for round {round_num}: {e}"
+        ) from e
+
+    # Step 2: subagent dispatch. Wrap shim errors so caller can route
+    # terminal. Same env-propagation pattern as auto_dispatch_task
+    # (T21 / S5 nested-autonomy guard + AUTONOMY_PARENT_PID).
+    subagent_env = os.environ.copy()
+    subagent_env[AUTONOMY_PARENT_PID_ENV] = str(os.getpid())
+    try:
+        _invoke_subagent_dispatch(
+            ctx,
+            subagent_env=subagent_env,
+            task_id=task_id,
+            prompt_prefix=prompt_prefix,
+        )
+    except RuntimeError as e:
+        # Attach ctx to the exception so the retry-loop caller can
+        # forensic-cleanup the orphaned worktree at task end.
+        infra = InfraFailureError(
+            f"subagent dispatch failed for round {round_num}: {e}"
+        )
+        infra.ctx = ctx  # type: ignore[attr-defined]
+        raise infra from e
+
+    # Step 3: derive authoritative facts from disk (G-class — never
+    # trust subagent narrative; PRD §1.2). Wrap git failures so callers
+    # don't see a bare CalledProcessError leak through the retry loop.
+    try:
+        facts = derive_task_facts(ctx)
+    except subprocess.CalledProcessError as e:
+        infra = InfraFailureError(
+            f"fact derivation failed for round {round_num}: {e}"
+        )
+        infra.ctx = ctx  # type: ignore[attr-defined]
+        raise infra from e
+
+    # Deltas: empty for now (parity with round-1 _prod_impl). Future
+    # P0.x will wire token / cost capture from the subagent dispatch
+    # return path. Empty dict is safe — `_apply_impl_deltas_to_budget`
+    # handles {} as a no-op.
+    return ctx, facts, {}
+
+
+def _render_task_brief(*, task_dir: Path, criteria: list) -> str:
+    """v0.8.3 P0.1 Step K — assemble the task brief for retry-round
+    implementer prompts (`build_implementer_prompt(task_brief=...)`).
+
+    Strategy: prefer the rendered prd.md (the same human-authored file
+    the operator approved at Phase 1 confirmation), fall back to a
+    bullet-rendered acceptance-criteria list. The fallback exists so a
+    test fixture or a stripped-down task without a prd.md still feeds
+    SOMETHING actionable to the round-2+ subagent.
+
+    Round 1's prod adapter returns ``{}`` without consuming the prefix,
+    so the rendered brief lands in `state.task_brief` but is benign.
+    """
+    prd_path = task_dir / "prd.md"
+    try:
+        text = prd_path.read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    except OSError as exc:
+        # File missing / permission denied — proceed to fallback. We
+        # don't raise because the criteria fallback is a legitimate
+        # path for tests + minimal task dirs. But log a stderr warning
+        # so prompt-quality regressions (e.g. corrupt prd.md) don't
+        # silently mask a degraded subagent prompt — codex review R1
+        # round-1 J: "silently drops; observability weak".
+        print(
+            f"[v0.8.3 P0.1] _render_task_brief: prd.md unreadable at "
+            f"{prd_path} ({exc!r}); falling back to acceptance "
+            f"criteria. Round 2+ implementer prompt will be degraded.",
+            file=sys.stderr,
+        )
+    if criteria:
+        lines = ["## Acceptance Criteria", ""]
+        for c in criteria:
+            lines.append(f"- {c}")
+        return "\n".join(lines)
+    return ""
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -5227,14 +5532,25 @@ def _phase2_dispatch(
     task_id: str,
     notifier: "Notifier",
     deps_factory: Optional[Callable[..., RetryDeps]] = None,
-) -> int:
+) -> Tuple[int, Optional[WorktreeContext], Optional[TaskFacts]]:
     """Phase 2 production wire-up.
 
-    Return codes (T6.2 P1.1 — three distinct values, NOT a binary
-    pass/blocked split; v0.8.2.1 migrated park 2 → 5 per the Flow
-    exit-code registry in ``scripts/common/exit_codes.py``):
+    v0.8.3 P0.1 — return signature extended from a bare ``int`` to
+    ``(rc, winner_ctx, winner_facts)``: with fresh-worktree-per-round,
+    the round that PASSES (winner) is no longer guaranteed to equal the
+    Round 1 ctx that the caller passed in. ``_cmd_auto_execute`` MUST
+    use the returned winner pair to construct the Gate 7 ``MergeRunner``
+    — passing Round 1's stale ctx after a Round 3 PASS would merge an
+    empty / wrong worktree. ``winner_ctx`` is non-None iff ``rc == 0``;
+    the assertion is enforced before this function returns (codex
+    round-1 P0 §3 — winner null guard).
+
+    Return codes (T6.2 P1.1 — distinct values, NOT a binary pass/
+    blocked split; v0.8.2.1 migrated park 2 → 5 per the Flow exit-code
+    registry in ``scripts/common/exit_codes.py``):
 
       * ``0`` — Phase 2 passed; caller proceeds to gate-7 merge.
+                ``winner_ctx`` and ``winner_facts`` are non-None.
       * ``5`` — Phase 2 PARKED (recoverable, wait-mode AFK idle
                 timeout). RECOVERABLE: no snapshot, no notifier;
                 caller MUST NOT proceed to merge. Caller logs
@@ -5242,11 +5558,15 @@ def _phase2_dispatch(
                 rc=0 so park-becomes-merge is mechanically impossible
                 (D-class regression guard). NOTE: ``2`` is reserved
                 for ``USAGE_ERROR`` (argparse / CLI misuse) per the
-                v0.8.2.1 registry, not for park.
+                v0.8.2.1 registry, not for park. ``winner_*`` are None.
       * ``3`` — Phase 2 TERMINAL (budget_hit / retry_cap / review_cap /
-                afk_hard_cap / afk_aborted). HardStopSnapshot persisted
-                to ``.flow/tasks/<slug>/hard-stop.json`` (atomic);
-                ``notifier.fire_block`` invoked.
+                afk_hard_cap / afk_aborted / phase2_infra_failure).
+                HardStopSnapshot persisted to
+                ``.flow/tasks/<slug>/hard-stop.json`` (atomic) for the
+                budget/cap/AFK reasons; ``phase2_infra_failure`` (codex
+                round-1 D §1) does not produce a snapshot but DOES fire
+                a structured block via the notifier. ``winner_*`` are
+                None.
     """
     from common import snapshot as _snap  # type: ignore
     from common.afk_monitor import now_iso_utc  # type: ignore
@@ -5272,13 +5592,31 @@ def _phase2_dispatch(
     }
     budget = _bc.make_default_set(limits)
 
+    # v0.8.3 P0.1 Step J — round-cap default lowered 3 → 2 because each
+    # retry now creates a fresh worktree + dispatches a real subagent
+    # (round 2+ goes through `_dispatch_implementer_fresh_worktree`),
+    # so each round is materially more expensive than v0.8.2's no-op
+    # retry. Contract override is not yet plumbed through `Contract`
+    # (v0.8.2 noted "until then constants live with RetryConfig"); when
+    # added, the higher-priority value should override the default
+    # below. Codex round-1 P1 §6: the cap change is auditable via
+    # CHANGELOG + ADR-lite preserved in the task dir.
     config = RetryConfig(
-        max_dispatch_retry_rounds=3,
+        max_dispatch_retry_rounds=2,
         max_codex_review_rounds=2,
     )
+    # v0.8.3 P0.1 — seed state.current_round_* with Round 1's ctx + facts
+    # so `_prod_review` can read state for the LATEST round. Codex G4
+    # protection: never let the review adapter fall through to a closed-
+    # over Round 1 facts after the round-2+ helper has produced fresh
+    # values. `task_brief` is rendered ONCE here; consumed every loop
+    # iteration by `dispatch_with_retry::build_implementer_prompt`.
     state = RetrySessionState(
         task_slug=slug,
         progress_path=task_dir / "progress.md",
+        current_round_ctx=ctx,
+        current_round_facts=facts,
+        task_brief=_render_task_brief(task_dir=task_dir, criteria=criteria),
     )
 
     # ── Build deps (prod default or test-injected) ──────────────────
@@ -5296,32 +5634,84 @@ def _phase2_dispatch(
             task_id=task_id,
         )
     else:
-        # Prod adapter: implementer round 1 already ran via
-        # auto_dispatch_task before _phase2_dispatch was called, so the
-        # adapter returns empty deltas on round 1. v0.8.2 T18 will
-        # extend this to re-dispatch on retry rounds 2+.
-        gate_runner = GateRunner(
-            ctx=ctx,
-            contract=contract,
-            task_dir=task_dir,
-            run_id=run_id,
-            task_id=task_id,
-            prior_baseline=_load_prior_baseline(task_dir, task_id),
-        )
+        # v0.8.3 P0.1 — Round 1: auto_dispatch_task already produced
+        # ctx + facts (seeded into `state.current_round_*` above), so
+        # `_prod_impl` returns empty deltas. Round 2+: `_prod_impl`
+        # invokes `_dispatch_implementer_fresh_worktree` to spin a new
+        # worktree from `integration_target` and dispatch the implementer
+        # subagent inside it. Two-phase commit: only after the helper
+        # successfully returns (ctx, facts, deltas) does state mutate.
+        # `InfraFailureError` raised by the helper propagates out of
+        # `dispatch_with_retry` — caught below.
+        attempt_id = f"{run_id}+{task_id}"
+        repo_root = task_dir.parents[2]
+        # `task_dir` = `<repo>/.flow/tasks/<slug>`, so `parents[2]` is
+        # always the repo root. (parents[0]=tasks dir, [1]=.flow, [2]=repo)
+        # Consistent with `_cmd_auto_execute`'s own `repo_root` derivation.
+        round_1_integration_target = ctx.integration_target
+        round_1_task_idx = ctx.task_idx
 
         def _prod_impl(*, state, prompt_prefix, **_kw):
-            # Round 1: auto_dispatch_task already produced facts; no
-            # additional impl work needed. T18 wires real re-dispatch.
-            del prompt_prefix
-            return {}
-
-        attempt_id = f"{run_id}+{task_id}"
+            # Round 1: state.current_round_ctx already seeded by
+            # `_phase2_dispatch` outer scope from the auto_dispatch_task
+            # outcome. Nothing to do.
+            if state.dispatch_retry_rounds == 0:
+                del prompt_prefix
+                return {}
+            # Round 2+: fresh worktree dispatch via helper.
+            new_ctx, new_facts, deltas = (
+                _dispatch_implementer_fresh_worktree(
+                    repo_root=repo_root,
+                    slug=slug,
+                    task_id=task_id,
+                    task_idx=round_1_task_idx,
+                    integration_target=round_1_integration_target,
+                    prompt_prefix=prompt_prefix,
+                    round_num=state.dispatch_retry_rounds + 1,
+                )
+            )
+            # Two-phase commit (codex round-1 P0 §2): the helper has
+            # fully succeeded (no InfraFailureError) before we touch
+            # state. Only NOW append the prev round to failed_rounds
+            # and swap current_round_*. Any exception INSIDE the helper
+            # raises before this point so state stays coherent.
+            prev_ctx = state.current_round_ctx
+            if prev_ctx is not None:
+                state.failed_rounds.append(RoundRecord.from_ctx(prev_ctx))
+            state.current_round_ctx = new_ctx
+            state.current_round_facts = new_facts
+            return deltas
 
         def _prod_review(*, state, impl_deltas, **_kw):
             del impl_deltas
+            # v0.8.3 P0.1 Step E — read ctx + facts from state so the
+            # gate runner sees the LATEST round's worktree and diff
+            # (codex round-1 G4: closure-captured Round 1 facts after a
+            # Round 2 swap is the foundational bug fresh-per-round must
+            # prevent). Build a fresh `GateRunner` per review so its
+            # `ctx` field tracks `state.current_round_ctx` — `GateRunner`
+            # caches no per-round derived state across constructions.
+            cur_ctx = state.current_round_ctx
+            cur_facts = state.current_round_facts
+            if cur_ctx is None or cur_facts is None:
+                # Defensive — should not happen if `_phase2_dispatch`
+                # seeded state correctly. Fail-loud rather than route
+                # to a phantom pass on an empty diff.
+                raise RuntimeError(
+                    "review adapter: state.current_round_ctx/facts "
+                    "not seeded; phase2 wiring is broken"
+                )
+            gate_runner = GateRunner(
+                ctx=cur_ctx,
+                contract=contract,
+                task_dir=task_dir,
+                run_id=run_id,
+                task_id=task_id,
+                prior_baseline=_load_prior_baseline(task_dir, task_id),
+            )
             verdict = gate_runner.run_phase2(
                 manifest=manifest,
-                facts=facts,
+                facts=cur_facts,
                 criteria=criteria,
                 attempt_id=attempt_id,
                 retry_idx=state.dispatch_retry_rounds,
@@ -5352,17 +5742,55 @@ def _phase2_dispatch(
         )
 
     # ── Drive the retry loop ────────────────────────────────────────
-    outcome, snap = dispatch_with_retry(
-        state=state,
-        config=config,
-        budget=budget,
-        afk=afk,
-        deps=deps,
-        now_iso_fn=now_iso_utc,
-    )
+    # v0.8.3 P0.1 Step I — catch `InfraFailureError` from the round-2+
+    # fresh-worktree helper and route to a `phase2_infra_failure` block
+    # (rc=3). Other RuntimeErrors propagate as-is — they signal a
+    # framework bug, not a recoverable infra failure. Codex round-1 D
+    # §1: infra failures must NOT bump retry counters (would smuggle
+    # noise into a budget designed for review-driven retries).
+    try:
+        outcome, snap = dispatch_with_retry(
+            state=state,
+            config=config,
+            budget=budget,
+            afk=afk,
+            deps=deps,
+            now_iso_fn=now_iso_utc,
+        )
+    except InfraFailureError as e:
+        # Capture orphan ctx (worktree was created but dispatch/facts
+        # failed) so it can be batch-cleaned at task end. Codex round-1
+        # D §3: orphan record-keeping is MANDATORY for fresh-per-round
+        # to avoid silent worktree leaks.
+        orphan_ctx = getattr(e, "ctx", None)
+        if orphan_ctx is not None:
+            state.failed_rounds.append(RoundRecord.from_ctx(orphan_ctx))
+        why = f"phase 2 infra failure: {e}"
+        notifier.fire_block(
+            block_type="phase2_infra_failure",
+            phase=2,
+            task_id=task_id,
+            issue_id="phase2_infra_failure",
+            why_blocked=why,
+            required_choice=["abort_task", "switch_to_interactive"],
+            safe_resume_command=f"flow orchestrator --resume {slug}",
+        )
+        return 3, None, None
 
     if outcome == "pass":
-        return 0
+        # v0.8.3 P0.1 Step F + codex round-1 P0 §3 — winner null guard.
+        # state.winner_ctx is set in `dispatch_with_retry` on the PASS
+        # branch; if it's somehow None here, the wiring is broken and
+        # we MUST fail loud rather than route a phantom-empty merge.
+        # Round 1 PASS: winner_ctx aliases the seeded ctx (= the input
+        # `ctx` argument). Round 2+ PASS: winner_ctx is the helper-
+        # produced fresh ctx.
+        if state.winner_ctx is None or state.winner_facts is None:
+            raise RuntimeError(
+                "internal invariant: pass outcome without winner_ctx / "
+                "winner_facts on state; phase2 wiring is broken"
+            )
+        return 0, state.winner_ctx, state.winner_facts
 
     # T6.2 P1.1 — wait-mode AFK idle park is RECOVERABLE and now returns
     # rc=5 (DISTINCT from rc=0 pass). T6.1 used rc=0 here, but the caller
@@ -5375,7 +5803,7 @@ def _phase2_dispatch(
     # migrated to rc=5 (PARKED_RECOVERABLE) to disambiguate from
     # rc=2 = USAGE_ERROR per the Flow exit-code registry.)
     if outcome == "afk_idle_park":
-        return PARKED_RECOVERABLE
+        return PARKED_RECOVERABLE, None, None
 
     # ── Non-pass terminal: persist snapshot + fire block ───────────
     if snap is not None:
@@ -5419,7 +5847,7 @@ def _phase2_dispatch(
         required_choice=["abort_task", "switch_to_interactive"],
         safe_resume_command=f"flow orchestrator --resume {slug}",
     )
-    return 3
+    return 3, None, None
 
 
 def _cmd_auto_execute(slug: str) -> int:
@@ -5573,10 +6001,17 @@ def _cmd_auto_execute(slug: str) -> int:
         # ── T12 + T13 + T3.1: Phase 2 retry-loop (gates 1→3→4→5→6) ─────
         # v0.8.2 T3.1: replaces fail-fast `GateRunner.run_phase2` call
         # with retry-loop wire-up via `_phase2_dispatch`. Round caps
-        # default to (3, 2) until contract surfaces phase2.retry config.
-        # Non-pass outcomes write HardStopSnapshot to
+        # default to (2, 2) (v0.8.3 P0.1 lowered from 3 to 2 since each
+        # retry now creates a fresh worktree + dispatches a real
+        # subagent) until contract surfaces phase2.retry config. Non-pass
+        # outcomes write HardStopSnapshot to
         # `.flow/tasks/<slug>/hard-stop.json` and fire a structured block.
-        rc = _phase2_dispatch(
+        # v0.8.3 P0.1 — return tuple extended to (rc, winner_ctx,
+        # winner_facts). When rc == 0 the winner pair must replace the
+        # original ctx/facts at the Gate 7 merge boundary; round 1 PASS
+        # has winner_ctx is ctx (same object), round 2+ PASS has a
+        # fresh helper-produced ctx.
+        rc, winner_ctx, winner_facts = _phase2_dispatch(
             slug=slug,
             task_dir=task_dir,
             contract=plan.contract,
@@ -5606,17 +6041,30 @@ def _cmd_auto_execute(slug: str) -> int:
             return PARKED_RECOVERABLE
         if rc != 0:
             return rc
+        # v0.8.3 P0.1 codex round-1 P0 §3 — winner null guard at the
+        # caller boundary too (defence-in-depth: the inner assertion in
+        # `_phase2_dispatch` already raised RuntimeError on None, but
+        # an explicit guard here makes the merge-input contract loud).
+        assert winner_ctx is not None and winner_facts is not None, (
+            "_phase2_dispatch returned rc=0 without winner ctx/facts"
+        )
 
         # ── T14: gate 7 atomic merge (R3 9-step sequence steps 1-7) ─────
+        # v0.8.3 P0.1: merge the WINNER round's worktree (may be Round 1
+        # — same object — or Round 2+ fresh worktree). Codex G2 / G3:
+        # winner ctx + facts are the only safe inputs to MergeRunner
+        # under fresh-per-round; using the original Round 1 ctx after a
+        # Round 2 PASS would merge an empty / wrong worktree.
         merger = MergeRunner(
-            ctx=ctx,
+            ctx=winner_ctx,
             contract=plan.contract,
             task_dir=task_dir,
             run_id=run_id,
             task_id=task_id,
         )
         mr = merger.merge_task(
-            facts=facts, merge_strategy=gate_cmds["merge_strategy"],
+            facts=winner_facts,
+            merge_strategy=gate_cmds["merge_strategy"],
         )
         if mr.status != "merged":
             # MergeRunner returns blocked status on git-merge fail (clean
@@ -5638,8 +6086,13 @@ def _cmd_auto_execute(slug: str) -> int:
             return 3
 
         # ── T15: gate 8 post-merge verify (9a PASS / 9b FAIL) ───────────
+        # v0.8.3 P0.1: post-merge verify also reads from the winner
+        # worktree (Round 1 PASS: same as input ctx; Round 2+ PASS:
+        # fresh helper-produced ctx). MergeRunner already operated on
+        # winner_ctx so its ``target_commit_post_merge`` reflects that
+        # tree — Gate 8 must look at the same source of truth.
         gate8 = Gate8VerificationRunner(
-            ctx=ctx,
+            ctx=winner_ctx,
             contract=plan.contract,
             task_dir=task_dir,
             run_id=run_id,

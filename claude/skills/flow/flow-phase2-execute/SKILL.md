@@ -64,15 +64,46 @@ T2 ships the helper dormant. T3 invokes `apply_afk_check` per
 dispatch tick inside the Phase 2 retry loop alongside budget
 enforcement. Both share the single hard-stop snapshot path.
 
-### Retry-on-non-pass loop (v0.8.2 T3)
+### Retry-on-non-pass loop (v0.8.2 T3, v0.8.3 P0.1 fresh-per-round)
 
 `flow_orchestrator.dispatch_with_retry` replaces v0.8.1 fail-fast
 with a bounded retry loop. Two **independent** round caps:
 
-- `phase2.retry.max_dispatch_retry_rounds` (default `3`) — caps
-  implementer retries; advanced ONLY by review verdict `fail`.
+- `phase2.retry.max_dispatch_retry_rounds` (default `2` since v0.8.3
+  P0.1; was `3` in v0.8.2 — lowered because each retry now creates a
+  fresh worktree + dispatches a real subagent, so each round is
+  materially more expensive than v0.8.2's no-op retry. Override via
+  contract `phase2.retry` block when added). Caps implementer
+  retries; advanced ONLY by review verdict `fail`.
 - `phase2.review.max_codex_review_rounds` (default `2`) — caps codex
   review rounds; advanced ONLY by `rejected_with_rationale` (RWR).
+
+**Fresh-worktree-per-round (v0.8.3 P0.1)**:
+
+- Round 1 runs in the auto_dispatch_task-produced worktree
+  (`<slug>+t<n>+<shortsha>`).
+- Round 2+ runs in a FRESH worktree
+  (`<slug>+t<n>+r<N>+<shortsha>`) created by
+  `_dispatch_implementer_fresh_worktree`. Round 2+ does NOT inherit
+  Round 1's working-tree files — only the redacted reviewer feedback
+  (carried via prompt prefix). Each retry is an atomic re-implement
+  off the integration_target base, so a failed local fix in Round 1
+  cannot contaminate Round 2.
+- The PASS round's ctx (winner_ctx) is what Gate 7 MergeRunner uses;
+  Round 1 PASS yields `winner_ctx is ctx_round_1` (alias), Round N>=2
+  PASS yields the helper's fresh ctx. `_phase2_dispatch` returns
+  `(rc, winner_ctx, winner_facts)`; rc==0 ⇒ winner pair non-None
+  (assertion enforced).
+- FAIL-round worktrees are RETAINED as `RoundRecord` entries on
+  `state.failed_rounds` until task end (forensic / Phase 4 sediment
+  reads them); batch-cleaned at archive time. P0.1 keeps this
+  in-memory only — no journal mirror; cross-process recovery does
+  NOT reconstruct failed_rounds.
+- Infra failures inside the helper (worktree-create OSError,
+  subagent shim RuntimeError) raise `InfraFailureError` → distinct
+  `phase2_infra_failure` block (rc=3, no snapshot). Counter NOT
+  bumped — infra noise must not leak into a budget designed for
+  review-driven retries (J-class progress invariant).
 
 **Five dual-counter invariants** (PRD §R2 / ADR-1):
 

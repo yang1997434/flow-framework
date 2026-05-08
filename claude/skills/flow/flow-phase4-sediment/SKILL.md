@@ -43,6 +43,19 @@ Review task journey. Ask:
    → Write to `.flow/pitfalls/<slug>.md` from `templates/pitfall.md.template`
    - **Critical**: fill `trigger_paths` field (so future tasks auto-load this)
 
+4. **Retry-round wrong turns? (v0.8.3 P0.1)**
+   - Phase 2's retry loop logs each round (implementer + reviewer) as a row
+     in progress.md `## Execute Log`. After v0.8.3 P0.1, Round 2+ runs in a
+     FRESH worktree per round (`<slug>+t<n>+r<N>+<shortsha>`); the per-round
+     diff is recoverable from the worktree (until the task-end batch
+     ExitWorktree clears them).
+   - Sediment input for "走过的错路": read FAIL rounds via the Execute Log
+     rows + `git diff <ctx.original_base_commit>..HEAD` inside each
+     surviving FAIL worktree. Promote any RECURRING wrong design to a
+     `.flow/pitfalls/` entry — same kind biting twice is the bar for
+     promotion (one-off mistakes belong in the task's own progress.md, not
+     a global pitfall).
+
 ## Step 3 — Promotion candidates
 
 When promoting to vault (`~/data/knowledge-base/`), follow the frontmatter conventions in `~/.claude/rules/knowledge-base.md` (required fields: `title`, `date`, `type`, `tags`, `status`, optional `project`). Flow's templates already include these but vault writes from raw chat content must conform.

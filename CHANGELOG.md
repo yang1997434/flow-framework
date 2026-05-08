@@ -1,6 +1,57 @@
 # Changelog
 
-## [0.8.3] - 2026-05-08 (P0.0 hook fix + P0.4 + P0.5 sediment follow-ups)
+## [0.8.3] - 2026-05-08 (P0.0 hook fix + P0.1 fresh-per-round + P0.4 + P0.5)
+
+### Added (P0.1 — fresh-worktree-per-round implementer redispatch)
+
+- **Closes v0.8.2 T18 deferred stub**: `_prod_impl` previously returned
+  empty deltas on Round 2+ in the prod path, so reviewer feedback never
+  entered implementation. Round 2+ now genuinely re-dispatches the
+  implementer subagent.
+- **Fresh worktree per round** (`<slug>+t<n>+r<N>+<shortsha>`): Round 2+
+  starts from `integration_target` base — no inheritance of Round 1's
+  working-tree files. Round 1 keeps legacy naming (`<slug>+t<n>+<shortsha>`)
+  for backward compat. Codex round-1 review G2 + G3 closed: worktree id
+  collisions and double `auto_engaged` events impossible by design.
+- **Helper `_dispatch_implementer_fresh_worktree`**: bypasses
+  `auto_dispatch_task` on retry rounds (skips lock + auto_engaged event
+  + manifest verify). Calls `create_task_worktree(round_num=N)` +
+  `_invoke_subagent_dispatch` + `derive_task_facts` directly.
+- **`InfraFailureError`** for worktree-create / subagent crash on retry
+  rounds → routes to `phase2_infra_failure` block (rc=3) WITHOUT bumping
+  retry counters. Codex round-1 D §1: J-class progress invariant
+  preserved — infra noise never smuggled into review-driven counters.
+- **Winner ctx propagation**: `_phase2_dispatch` signature extended to
+  `-> (rc, winner_ctx, winner_facts)`. `_cmd_auto_execute` uses winner
+  pair to construct `MergeRunner` + `Gate8VerificationRunner`. Round 1
+  PASS aliases the seeded ctx; Round 2+ PASS uses the fresh helper-
+  produced ctx. Hard invariant: rc==0 ⇒ winner pair non-None.
+- **`RoundRecord(worktree_id, path, branch, round_num)`** lightweight
+  frozen dataclass tracks FAIL rounds on `state.failed_rounds` (in-
+  memory only — no journal mirror in P0.1; documented contract).
+  Phase 4 sediment skill updated to reference recovery via Execute Log
+  rows + per-worktree diff.
+- **`WorktreeContext.round_num`** first-class field (default 1) so
+  cleanup / journal queries don't string-parse worktree id.
+- **Two-phase commit on round 2+ state mutation**: helper computes new
+  ctx + facts FIRST; only on success does `_prod_impl` append prev
+  `RoundRecord` and swap `current_round_*`. Mid-helper raise leaves
+  state coherent (codex round-1 P0 §2).
+- **Round-cap default 3 → 2**: each retry round is materially more
+  expensive (real subagent dispatch + fresh worktree); contract
+  override path preserved for callers that want longer convergence.
+- **Task brief renderer (`_render_task_brief`)**: replaces
+  `task_brief=""` bug at the prefix-build site (`build_implementer_prompt`
+  was getting an empty brief — Round 2+ subagents would have had no
+  task context). Reads `task_dir/prd.md`, falls back to a bullet-
+  rendered acceptance-criteria list.
+- **Tests**: 21 new tests across 3 files — 16 unit in
+  `test_v083_p01_implementer_redispatch.py` + 3 mini-integration in
+  `test_fresh_worktree_per_round.py` + 2 production-adapter
+  integration in `test_v083_p01_prod_adapter_integration.py` (codex
+  review round 2 J §3+§4 follow-up: real `_phase2_dispatch` Round 2+
+  PASS path + InfraFailureError → phase2_infra_failure block). Total
+  suite 990 PASS (969 + 21 new).
 
 ### Fixed (P0.4 — sediment follow-up)
 
