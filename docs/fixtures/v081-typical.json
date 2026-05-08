@@ -1,0 +1,55 @@
+{
+  "contract_schema_version": 1,
+  "autonomy_mode": "auto",
+  "created_at": "2026-05-07T00:00:00Z",
+  "staleness_ttl_days": 7,
+  "scope": {
+    "allowed": ["scripts/**", "tests/**", "docs/**"],
+    "forbidden": ["VERSION", "CHANGELOG.md", "claude/capabilities/defaults.json"]
+  },
+  "known_forks": [
+    {
+      "q": "Use shell=True for subprocess calls?",
+      "decision": "no",
+      "rationale": "Argument-list form only; no string interpolation into shell."
+    }
+  ],
+  "escalation_triggers": [
+    {
+      "name": "spec_change",
+      "examples_yes": ["user changed acceptance criterion mid-task"],
+      "examples_no": ["minor refactor inside an allowed file"]
+    }
+  ],
+  "irreversible_actions": ["push_main", "release_tag", "schema_migration"],
+  "budget": {
+    "max_task_count": 10,
+    "max_files_changed": 30,
+    "max_new_deps": 0,
+    "max_retry_per_task": 3,
+    "max_elapsed_min": 90,
+    "max_codex_rounds_per_task": 3
+  },
+  "acceptance_criteria": [
+    {
+      "description": "Smoke + unit suite green",
+      "type": "smoke",
+      "method": "cmd",
+      "command": "bash tests/smoke/run.sh",
+      "timeout_sec": 600
+    },
+    {
+      "description": "Behavior: flow doctor reports clean",
+      "type": "behavior",
+      "method": "cmd",
+      "command": "flow doctor",
+      "timeout_sec": 60
+    }
+  ],
+  "notification": {
+    "throttle_min": 5,
+    "tier2_enabled": true
+  },
+  "afk_timeout_min": 60,
+  "afk_on_timeout": "wait"
+}

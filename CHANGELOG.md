@@ -1,5 +1,43 @@
 # Changelog
 
+## v0.8.1 — 2026-05-07
+
+**Autonomy enabled.** The execution refusal in v0.8.0 is replaced with a
+hardened 8-gate safety stack:
+
+- **Contract schema**: 6 new fields (`max_codex_rounds_per_task`,
+  `notification.throttle_min`, `notification.tier2_enabled`,
+  `idempotent_cmd_allowlist`, `post_merge_regression_optional`,
+  criterion-level `idempotent` / `timeout_sec` / `post_merge_skip`).
+  Schema version stays at `1` (additive); v0.8.0 readers ignore new
+  fields with warning.
+- **8-gate runner**: baseline / subagent / manifest verify / codex
+  review / acceptance criteria / regression smoke / local merge /
+  post-merge verify (in ephemeral verification worktree).
+- **Atomic merge**: 9-step transactional sequence with explicit gap-
+  by-gap crash recovery.
+- **Notification**: 3-tier with throttle + Tier 2 disable + OSC 9
+  auto-detect + archive on resume.
+- **Crash recovery**: 5-state classifier (pre-lock / lock+dead-pid /
+  auto_engaged / mid-merge / verification-orphan).
+- **Staleness**: 5 explicit triggers (base branch / lockfile / prd
+  mtime / dep version / baseline fail) wired into `flow doctor`.
+- **Nested-autonomy**: `FLOW_AUTONOMY_PARENT_PID` env-var mechanical
+  guard at orchestrator entry.
+
+**Validation**: full suite 798 cases passing (717 smoke + 81 unit);
+`flow doctor` clean; `flow_selftest.py` ALL CHECKS PASSED; 3 contract
+fixtures (`docs/fixtures/v081-{minimal,typical,advanced}.json`)
+validate; v0.8.0 forward-compat smoke green.
+
+**Deferred to v0.8.2**: AFK detector loop (T17), budget runtime
+enforcement (T18), Phase 2 retry loop, staleness checks inside the
+dispatch loop, Tier 3 notification command execution. All four parse
+forward-compat in v0.8.1 contracts so migration is monotonic.
+
+No backward-incompatible changes. v0.6/0.7 plans without contracts
+continue to run interactively.
+
 ## v0.8.0 — 2026-05-06
 
 ### Major: Autonomous mode foundation (execution gated to v0.8.1)

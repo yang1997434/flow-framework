@@ -1,0 +1,103 @@
+{
+  "contract_schema_version": 1,
+  "autonomy_mode": "auto",
+  "created_at": "2026-05-07T00:00:00Z",
+  "staleness_ttl_days": 5,
+  "scope": {
+    "allowed": ["scripts/**", "tests/**", "claude/skills/**"],
+    "forbidden": [
+      "VERSION",
+      "CHANGELOG.md",
+      "claude/capabilities/defaults.json",
+      ".github/workflows/**"
+    ]
+  },
+  "known_forks": [
+    {
+      "q": "Promote capability stub to real implementation?",
+      "decision": "yes",
+      "rationale": "v0.8.1 ships the runner; promotion is the v0.8.1 ship gate."
+    },
+    {
+      "q": "Add new third-party dependency?",
+      "decision": "no",
+      "rationale": "max_new_deps=0; route through Phase 1 if proven necessary."
+    }
+  ],
+  "escalation_triggers": [
+    {
+      "name": "scope_drift",
+      "examples_yes": ["touch a forbidden file", "add an undeclared module"],
+      "examples_no": ["adding a test file under tests/smoke/"]
+    },
+    {
+      "name": "irreversible_action",
+      "examples_yes": ["push_main", "release_tag"],
+      "examples_no": ["local commit on a feature branch"]
+    }
+  ],
+  "irreversible_actions": [
+    "push_main",
+    "release_tag",
+    "schema_migration",
+    "lockfile_major_change",
+    "public_docs_change",
+    "delete_local_work",
+    "overwrite_checkpoint",
+    "public_api_change"
+  ],
+  "budget": {
+    "max_task_count": 25,
+    "max_files_changed": 80,
+    "max_new_deps": 0,
+    "max_retry_per_task": 3,
+    "max_elapsed_min": 240,
+    "max_codex_rounds_per_task": 3
+  },
+  "acceptance_criteria": [
+    {
+      "description": "Full smoke suite green",
+      "type": "smoke",
+      "method": "cmd",
+      "command": "bash tests/smoke/run.sh",
+      "timeout_sec": 900
+    },
+    {
+      "description": "Unit suite green",
+      "type": "unit",
+      "method": "cmd",
+      "command": "python3 -m unittest discover -s tests/unit -p 'test_*.py'",
+      "timeout_sec": 300,
+      "idempotent": {
+        "value": true,
+        "rationale": "Pure unittest run; no external state mutation.",
+        "timeout_sec": 300,
+        "side_effect_class": "read_only"
+      }
+    },
+    {
+      "description": "Behavior: doctor runs clean",
+      "type": "behavior",
+      "method": "cmd",
+      "command": "flow doctor",
+      "timeout_sec": 60
+    },
+    {
+      "description": "Regression: v0.8.0 forward-compat",
+      "type": "regression",
+      "method": "cmd",
+      "command": "python3 -m unittest tests.smoke.test_v080_unknown_field_compat",
+      "timeout_sec": 60,
+      "post_merge_skip": false
+    }
+  ],
+  "notification": {
+    "throttle_min": 5,
+    "tier2_enabled": true,
+    "command": null
+  },
+  "afk_timeout_min": 120,
+  "afk_on_timeout": "abort",
+  "idempotent_cmd_allowlist": ["pytest", "unittest", "python3 -m unittest"],
+  "post_merge_regression_optional": false
+}

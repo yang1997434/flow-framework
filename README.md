@@ -6,7 +6,7 @@
 
 A composable framework that wraps your existing skill ecosystem (superpowers / impeccable / gstack / pr-review-toolkit / planning-with-files / Trellis-style file persistence) into a coherent 4-phase workflow with automatic memory promotion and pitfall capture.
 
-**Status**: v0.7.0. Production-ready core: 4-phase workflow, capability registry, and dependency-aware parallel subagent dispatch.
+**Status**: v0.8.1. Autonomy enabled — contract schema + 8-gate safety stack execute end-to-end. v0.7 4-phase workflow + capability registry + parallel subagent dispatch all unchanged.
 
 ## What it does
 
@@ -24,11 +24,13 @@ A composable framework that wraps your existing skill ecosystem (superpowers / i
 **v0.7+ feature highlights**:
 
 - **v0.7+: dependency-aware parallel subagent dispatch** — declare per-task `writes:` glob in plans; framework verifies disjointness, runs independent tasks in parallel waves with sequential cross-wave integration. See `docs/superpowers/specs/2026-05-05-v0.7-parallel-dispatch-design.md`.
-- **v0.8.0 — Autonomous mode foundation**: `contract.json` schema for per-task
-  autonomy configuration (scope, budget, acceptance criteria, irreversible
-  actions). New CLI: `flow contract --init / --validate`, `flow orchestrator
-  --dry-run`. Execution is gated until v0.8.1 ships the safety stack. See
-  `docs/v0.8-migration.md`.
+- **v0.8.1 — Autonomy enabled**: Set `autonomy_mode: auto` in your contract
+  to enable orchestrator-driven execution. The 8-gate safety stack ships in
+  v0.8.1: worktree-per-task isolation, manifest enforcement, codex review,
+  acceptance criteria, atomic merge, post-merge verify, AFK + budget caps
+  (schema-only; runtime in v0.8.2), crash recovery, and nested-autonomy
+  abort. Read `docs/v0.8.1-autonomy-enabled.md` for the full migration
+  guide; `docs/v0.8-migration.md` covers the v0.8.0 contract groundwork.
 
 ## Quick start
 
@@ -116,4 +118,4 @@ MIT (this framework). Underlying tools have their own licenses.
 
 ## Status
 
-v0.7.0. Capability registry stable (35 caps); v0.6.x phase orchestration battle-tested; v0.7 wave-dispatch landed for parallel implementer dispatch with disjointness verification. See `CHANGELOG.md` for release history.
+v0.8.1. Capability registry stable (37 caps incl. `autonomy_orchestrator` + `acceptance_verify` promoted); v0.7 wave-dispatch + disjointness verification stable; v0.8.1 autonomy executes end-to-end behind an 8-gate safety stack. See `CHANGELOG.md` for release history.
