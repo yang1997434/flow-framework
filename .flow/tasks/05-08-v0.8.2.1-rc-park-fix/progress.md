@@ -118,8 +118,12 @@ grep-based AC 的措辞必须考虑**自指**：当 AC 用 grep 检查"代码里
 
 ## Files Touched
 
-_Updated 2026-05-08 06:51 (last 20 unique edits)_:
+_Updated 2026-05-08 06:53 (last 20 unique edits)_:
 
+- `/home/yangpeng/.claude/projects/-data-Claude-flow-framework/memory/MEMORY.md`
+- `/home/yangpeng/.claude/projects/-data-Claude-flow-framework/memory/session_latest.md`
+- `/home/yangpeng/.claude/projects/-data-Claude-flow-framework/memory/feedback_codex_cli_0_128_args.md`
+- `/home/yangpeng/.claude/projects/-data-Claude-flow-framework/memory/feedback_codex_plan_pass_essential.md`
 - `.flow/tasks/05-08-v0.8.2.1-rc-park-fix/progress.md`
 - `.flow/pitfalls/subagent-misread-brief-do-not-add-modules.md`
 - `tests/smoke/test_exit_codes_module.py`
@@ -131,15 +135,11 @@ _Updated 2026-05-08 06:51 (last 20 unique edits)_:
 - `/tmp/codex-prompt-v0821-r3.txt`
 - `/tmp/codex-prompt-v0821-r2.txt`
 - `/tmp/codex-prompt-v0821.txt`
-- `/home/yangpeng/.claude/projects/-data-Claude-flow-framework/memory/session_latest.md`
 - `.flow/pitfalls/hook-blocks-after-reviewer-pass.md`
 - `/tmp/flow_pause_save.py`
 - `.flow/tasks/05-08-v0.8.2-p0-core/progress.md`
-- `/home/yangpeng/.claude/projects/-data-Claude-flow-framework/memory/MEMORY.md`
 - `/home/yangpeng/.claude/projects/-data-Claude-flow-framework/memory/feedback_model_alias_subscription_verify.md`
 - `/home/yangpeng/.claude/settings.json`
-- `CHANGELOG.md`
-- `VERSION`
 
 ## Commits
 
@@ -148,3 +148,5 @@ _Updated 2026-05-08 06:51 (last 20 unique edits)_:
 - [2026-05-08 06:48] `6c3e0fe` release(v0.8.2.1): exit-code registry + AFK park rc=5 — patch ship
 
 - [2026-05-08 06:51] `ac96927` chore(v0.8.2.1-sediment): pitfall 2nd instance + Phase 4 verify+sediment
+
+- [2026-05-08 06:51] `7c30370` chore(v0.8.2.1): mark task phase=sediment status=done
