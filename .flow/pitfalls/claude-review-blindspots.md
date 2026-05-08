@@ -9,6 +9,9 @@ trigger_paths:
   - "**/orchestrat*.py"
 severity: high
 recurrence_risk: high — applies to every T3-T22 task in v0.8.1
+status: promoted
+promoted_to: ~/data/knowledge-base/pitfalls/claude-review-blindspots.md
+promoted_date: 2026-05-07
 ---
 
 # Claude review 链路 4 大盲点
