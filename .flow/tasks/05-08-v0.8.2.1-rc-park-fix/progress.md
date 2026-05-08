@@ -1,7 +1,7 @@
 ---
 slug: v0.8.2.1-rc-park-fix
-status: active   # active | paused | blocked | done
-phase: implement    # triage | research | implement | check | verify | sediment
+status: done   # active | paused | blocked | done
+phase: sediment    # triage | research | implement | check | verify | sediment
 # blocked_by: list of task slugs this task depends on. Used by `flow task status`
 # to draw the dependency graph (parent slugs must finish first). Default: empty.
 # Example:
@@ -118,9 +118,10 @@ grep-based AC 的措辞必须考虑**自指**：当 AC 用 grep 检查"代码里
 
 ## Files Touched
 
-_Updated 2026-05-08 06:50 (last 20 unique edits)_:
+_Updated 2026-05-08 06:51 (last 20 unique edits)_:
 
 - `.flow/tasks/05-08-v0.8.2.1-rc-park-fix/progress.md`
+- `.flow/pitfalls/subagent-misread-brief-do-not-add-modules.md`
 - `tests/smoke/test_exit_codes_module.py`
 - `.claude/worktrees/agent-a556c761520580339/tests/smoke/test_exit_codes_module.py`
 - `.claude/worktrees/agent-a556c761520580339/scripts/flow_orchestrator.py`
@@ -139,10 +140,11 @@ _Updated 2026-05-08 06:50 (last 20 unique edits)_:
 - `/home/yangpeng/.claude/settings.json`
 - `CHANGELOG.md`
 - `VERSION`
-- `.claude/worktrees/feat+v0.8.2-p0-core/tests/smoke/test_phase2_retry_loop.py`
 
 ## Commits
 
 - [2026-05-08 05:43] `495f4e0` wip(v0.8.2.1): pre-fork PRD commit + 3-round codex plan-pass GREEN
 
 - [2026-05-08 06:48] `6c3e0fe` release(v0.8.2.1): exit-code registry + AFK park rc=5 — patch ship
+
+- [2026-05-08 06:51] `ac96927` chore(v0.8.2.1-sediment): pitfall 2nd instance + Phase 4 verify+sediment
