@@ -56,9 +56,19 @@ def _setup_project(tmp: Path) -> Path:
 
 
 def _isolated_runtime_env(runtime_root: Path) -> dict:
-    """Env that pins FLOW_HOME so hook nudge state stays in tempdir."""
+    """Env that pins FLOW_HOME so hook nudge state stays in tempdir.
+
+    Also pins FLOW_CONTEXT_LIMIT=200000 so context_estimator's
+    settings.json env-alias rung (added in the 1M-misdetection bugfix)
+    cannot make these tests host-dependent. Without the pin, a host
+    that has ANTHROPIC_DEFAULT_SONNET_MODEL=...[1m] in settings.json
+    would cause _make_transcript(500_000, sonnet) to compute 12.5%
+    instead of the 62.5% these fixtures need to clear the 50% nudge
+    threshold.
+    """
     env = os.environ.copy()
     env["FLOW_HOME"] = str(runtime_root)
+    env["FLOW_CONTEXT_LIMIT"] = "200000"
     # Detach heartbeat fast; tests don't care about autosave.
     return env
 

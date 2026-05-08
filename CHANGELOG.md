@@ -24,8 +24,14 @@ hardened 8-gate safety stack:
   mtime / dep version / baseline fail) wired into `flow doctor`.
 - **Nested-autonomy**: `FLOW_AUTONOMY_PARENT_PID` env-var mechanical
   guard at orchestrator entry.
+- **context_estimator 1M-mode fix**: `_resolve_limit` priority chain
+  (`FLOW_CONTEXT_LIMIT` env > `~/.claude/settings.json::env::
+  ANTHROPIC_DEFAULT_<BASE>_MODEL` ending `[1m]` > `MODEL_LIMITS` table
+  > 200k default). Fixes 5x context-percent inflation on 1M-mode
+  sessions whose transcripts record bare `claude-opus-4-7`. 16 new
+  unit cases in `tests/unit/test_context_estimator_1m_resolution.py`.
 
-**Validation**: full suite 798 cases passing (717 smoke + 81 unit);
+**Validation**: full suite 814 cases passing (717 smoke + 97 unit);
 `flow doctor` clean; `flow_selftest.py` ALL CHECKS PASSED; 3 contract
 fixtures (`docs/fixtures/v081-{minimal,typical,advanced}.json`)
 validate; v0.8.0 forward-compat smoke green.

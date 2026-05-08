@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
-"""Smoke tests for v0.5 context_estimator."""
+"""Smoke tests for v0.5 context_estimator.
+
+Note: tests that depend on a specific MODEL_LIMITS value MUST pin
+FLOW_CONTEXT_LIMIT in the env (highest priority rung in
+`_resolve_limit`), otherwise host machine settings.json env aliases
+(e.g. ``ANTHROPIC_DEFAULT_SONNET_MODEL=...[1m]``) leak into the
+estimator and change the answer. Added 2026-05-07 alongside the
+1M-misdetection bugfix.
+"""
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
@@ -38,7 +48,13 @@ class EstimatePct(unittest.TestCase):
             with p.open("w") as f:
                 while p.stat().st_size < 100_000:
                     f.write(line)
-            pct, conf = estimate_context_pct(p)
+            # Pin limit to 200k; otherwise host settings.json with
+            # ANTHROPIC_DEFAULT_SONNET_MODEL=...[1m] would upgrade to 1M
+            # and the assertion range below would not hold.
+            with mock.patch.dict(os.environ,
+                                 {"FLOW_CONTEXT_LIMIT": "200000"},
+                                 clear=False):
+                pct, conf = estimate_context_pct(p)
             # 100KB / 4 = 25k tokens; sonnet limit 200k → ~12-13%
             self.assertIsNotNone(pct)
             self.assertGreaterEqual(pct, 10)
