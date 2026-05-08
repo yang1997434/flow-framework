@@ -12,7 +12,12 @@ Covers:
   * F3 (codex round-1): CAPABILITY_FILE resolves via ``__file__`` (module
     path), not cwd — survives ``os.chdir`` to arbitrary tmp dirs
   * F4 (codex round-1): worktree path with spaces / metachars is shell-
-    quoted via ``shlex.quote`` before format()
+    quoted via ``shlex.quote`` before format() — exposed as the
+    ``{worktree_quoted}`` placeholder
+  * P2 (codex round-2): preserve ``{worktree}`` raw semantics so
+    operator templates that already wrap in shell quotes (e.g.
+    ``--worktree "{worktree}"``) keep working; opt-in safety via
+    ``{worktree_quoted}``
 
 Out-of-scope (manual / v0.8.2): end-to-end orchestrator -> shim wiring
 through a real Claude CLI invocation. The orchestrator-side import is
@@ -243,18 +248,24 @@ class TestSubagentDispatchShim(unittest.TestCase):
         finally:
             os.chdir(orig_cwd)
 
-    # ── F4 (codex round-1): worktree path quoted via shlex.quote ─────
-    def test_worktree_path_with_spaces_quoted(self):
-        """R-class: a worktree path containing spaces must NOT cause
-        argv splitting when interpolated into a shell=True template."""
+    # ── F4 (codex round-1) + P2 (codex round-2): worktree placeholders ─
+    # Round-1 silently swapped ``{worktree}`` -> shlex.quote(...), which
+    # broke any template that already used outer shell quotes (the inner
+    # single quotes were preserved literally). Round-2 P2 fix splits raw
+    # vs quoted into two named placeholders so existing templates keep
+    # working and the safe form is opt-in.
+    def test_worktree_quoted_placeholder_is_shlex_quoted(self):
+        """R-class: ``{worktree_quoted}`` must shlex.quote() the path so
+        a template containing spaces does NOT cause argv splitting under
+        shell=True."""
         spaced_dir = self.tmp / "has space" / "wt"
         spaced_dir.mkdir(parents=True)
         marker = self.tmp / "spaces-out"
-        # Template echoes worktree to a file; if not quoted, "has space"
-        # would split into two argv tokens and the captured value would
-        # be partial / wrong.
+        # Template echoes worktree_quoted to a file; if not quoted,
+        # "has space" would split into two argv tokens and the captured
+        # value would be partial / wrong.
         os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
-            f"echo {{worktree}} > {marker.as_posix()}"
+            f"echo {{worktree_quoted}} > {marker.as_posix()}"
         )
         ctx = _Ctx(spaced_dir, slug="demo", task_id="T0")
         from flow_subagent_dispatch import invoke
@@ -265,13 +276,11 @@ class TestSubagentDispatchShim(unittest.TestCase):
         # passes the whole path as one arg — exactly the property we want).
         self.assertEqual(out, str(spaced_dir))
 
-    def test_worktree_path_with_metachar_neutralized_by_quoting(self):
-        """R-class: a worktree path containing shell metachars (``;``,
-        ``$()``, ``&&``) must be quoted by ``shlex.quote`` so the
-        metachar can't be parsed by the shell. We create a REAL
-        directory whose name contains ``;`` — without quoting, the
-        shell would split into two commands. With quoting, echo prints
-        the literal path (including ``;``).
+    def test_worktree_quoted_neutralizes_metachars(self):
+        """R-class: ``{worktree_quoted}`` must neutralize shell metachars
+        (``;``, ``$()``, ``&&``). We create a REAL directory whose name
+        contains ``;`` — without quoting, the shell would split into two
+        commands. With quoting, echo prints the literal path.
 
         Real ext4/btrfs filesystems do allow ``;`` in path components
         (only ``/`` and NUL are forbidden), so this is testable on a
@@ -284,7 +293,7 @@ class TestSubagentDispatchShim(unittest.TestCase):
         # we capture has no ambiguity with cwd.
         marker = self.tmp / "metachar-out"
         os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
-            f"echo {{worktree}} > {marker.as_posix()}"
+            f"echo {{worktree_quoted}} > {marker.as_posix()}"
         )
         ctx = _Ctx(evil_dir, slug="demo", task_id="T0")
         from flow_subagent_dispatch import invoke
@@ -303,6 +312,62 @@ class TestSubagentDispatchShim(unittest.TestCase):
         self.assertIn(";evil", out)
         self.assertIn("$(whoami)", out)
         self.assertIn("&&true", out)
+
+    # ── P2 (codex round-2): {worktree} raw semantics preserved ──────
+    def test_worktree_placeholder_is_raw(self):
+        """``{worktree}`` must interpolate the RAW worktree path
+        (no shlex.quote() injected). Documented operator contract:
+        backward-compatible — operators that already wrap in shell
+        quotes keep working without double-quoting."""
+        marker = self.tmp / "raw-out"
+        # Path with NO spaces / metachars so an unquoted echo is safe;
+        # this isolates the "is the placeholder raw?" assertion from
+        # the quoting-required-for-spaces case.
+        plain_dir = self.tmp / "plain_wt"
+        plain_dir.mkdir()
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+            f"echo {{worktree}} > {marker.as_posix()}"
+        )
+        ctx = _Ctx(plain_dir, slug="demo", task_id="T0")
+        from flow_subagent_dispatch import invoke
+        invoke(ctx)
+        self.assertTrue(marker.is_file())
+        out = marker.read_text(encoding="utf-8").strip()
+        # The raw path is echoed verbatim; NO single quotes injected.
+        self.assertEqual(out, str(plain_dir))
+        self.assertNotIn(
+            "'", out,
+            "{worktree} must be RAW — shlex.quote() injection would "
+            "leak literal single quotes (codex round-2 P2 regression)",
+        )
+
+    def test_template_using_outer_quotes_with_raw_placeholder_works(self):
+        """P2 backward-compat: an operator template that wraps
+        ``{worktree}`` in shell double-quotes (e.g.
+        ``--worktree "{worktree}"``) must work with a path containing
+        spaces — exactly because ``{worktree}`` is raw and the operator
+        controls quoting. If round-1's shlex.quote() injection had
+        survived, the inner single-quotes would have leaked into the
+        output."""
+        spaced_dir = self.tmp / "has space" / "outer-quoted"
+        spaced_dir.mkdir(parents=True)
+        marker = self.tmp / "outer-quoted-out"
+        # Template uses outer double quotes around {worktree} — operator
+        # idiom for "I know my path may have spaces, I'm handling
+        # quoting myself".
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+            f'echo "{{worktree}}" > {marker.as_posix()}'
+        )
+        ctx = _Ctx(spaced_dir, slug="demo", task_id="T0")
+        from flow_subagent_dispatch import invoke
+        invoke(ctx)
+        self.assertTrue(marker.is_file())
+        out = marker.read_text(encoding="utf-8").strip()
+        # Single line, the FULL path with the space preserved, NO
+        # spurious single-quote chars (which would have appeared if
+        # shlex.quote() had been silently injected into {worktree}).
+        self.assertEqual(out, str(spaced_dir))
+        self.assertNotIn("'", out)
 
 
 if __name__ == "__main__":

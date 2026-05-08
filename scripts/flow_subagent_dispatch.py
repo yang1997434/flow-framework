@@ -24,6 +24,26 @@ malformed manifest leak into a compound command. We validate the
 character set up front and raise ``ValueError`` rather than risk
 ``rm -rf $HOME``-style surprises if a future contract spec relaxes the
 slug regex.
+
+Template placeholders (codex round-2 P2 — preserve quoted templates):
+    {slug}             — task slug, validated [A-Za-z0-9._+\\-]
+    {task_id}          — task id, validated [A-Za-z0-9._+\\-]
+    {worktree}         — RAW worktree path. Backward-compatible with
+                         operator templates that already wrap the
+                         placeholder in shell quotes (e.g.
+                         ``--worktree "{worktree}"``). Use this when
+                         your template controls quoting itself.
+    {worktree_quoted}  — shlex.quote()-wrapped worktree path. RECOMMENDED
+                         default for shell=True templates without their
+                         own quoting (e.g.
+                         ``--worktree {worktree_quoted}``).
+
+    History: round-1 silently swapped {worktree} -> shlex.quote(...),
+    which broke any template that already used outer quotes — the inner
+    single quotes injected by shlex.quote() were preserved literally and
+    the subagent received ``'/path with space'`` (with quote chars). The
+    fix splits raw vs quoted into two named placeholders so existing
+    templates keep working and the safe form is opt-in.
 """
 from __future__ import annotations
 
@@ -114,9 +134,13 @@ def _resolve_cmd_template() -> str:
                     return cmd
     raise RuntimeError(
         f"subagent dispatch not configured: export {ENV_VAR} env var "
-        f"with the subagent invocation template "
-        f"(e.g. 'claude -p flow:flow-phase2-execute --slug {{slug}} "
-        f"--task {{task_id}} --worktree {{worktree}}'). "
+        f"with the subagent invocation template. Template placeholders: "
+        f"{{slug}}, {{task_id}} (validated alnum+._+-); {{worktree}} "
+        f"(raw path, backward-compatible — wrap in your own shell quotes "
+        f"if needed) and {{worktree_quoted}} (shlex.quote()-wrapped, "
+        f"RECOMMENDED for shell=True). Example: "
+        f"'claude -p flow:flow-phase2-execute --slug {{slug}} "
+        f"--task {{task_id}} --worktree {{worktree_quoted}}'. "
         f"v0.8.1 ships the dispatch shim infrastructure but the "
         f"capability default (autonomy_orchestrator.dispatch_cmd) is "
         f"intentionally absent — the SKILL handle is NOT a shell "
@@ -164,15 +188,25 @@ def invoke(
     if task_id:
         _validate_ident("task_id", task_id)
 
-    # R-class hardening (codex round-1 F4): worktree path is NOT covered
-    # by ``_validate_ident`` (path may legitimately contain ``/`` and
-    # platform-specific chars). Quote it before interpolation so spaces,
-    # ``;``, ``$()``, etc. cannot leak into shell-token boundaries when
-    # the template runs under shell=True.
+    # R-class hardening (codex round-1 F4 + round-2 P2): worktree path
+    # is NOT covered by ``_validate_ident`` (path may legitimately
+    # contain ``/`` and platform-specific chars). Two named placeholders
+    # to preserve operator-supplied quoting semantics:
+    #   {worktree}        — raw path; backward-compatible with templates
+    #                       that already wrap in shell quotes
+    #                       (e.g. ``--worktree "{worktree}"``).
+    #   {worktree_quoted} — shlex.quote()-wrapped; RECOMMENDED default
+    #                       for unquoted templates running under
+    #                       shell=True.
+    # Round-1 unconditionally substituted shlex.quote(...) into
+    # {worktree}, which broke quoted templates: outer quotes preserved
+    # the inner single-quotes literally and the subagent received a
+    # bogus path with quote chars.
     cmd_str = template.format(
-        worktree=shlex.quote(worktree_path),
         slug=slug,
         task_id=task_id,
+        worktree=worktree_path,
+        worktree_quoted=shlex.quote(worktree_path),
     )
 
     # Merge in the orchestrator-supplied env (carries
