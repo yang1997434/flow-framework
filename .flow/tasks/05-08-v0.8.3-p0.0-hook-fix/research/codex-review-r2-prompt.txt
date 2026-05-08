@@ -1,0 +1,42 @@
+# Round 2 review — fix for the high-severity bug you flagged
+
+You flagged Step 7 `_consume_marker()` swallowing OSError → marker not removed → single-use broken. Fix applied:
+
+```python
+def _consume_marker() -> bool:
+    """Single-use: atomically remove marker after validation.
+
+    Returns True if marker was successfully consumed (or was already gone),
+    False if unlink failed for any reason other than FileNotFoundError.
+    A False return means single-use cannot be guaranteed; caller must BLOCK.
+    """
+    try:
+        MARKER_PATH.unlink()
+        return True
+    except FileNotFoundError:
+        return True  # already gone — race-tolerant, idempotent
+    except OSError:
+        return False  # cannot guarantee single-use; caller must BLOCK
+
+
+# main() Step 7:
+if not _consume_marker():
+    _emit_block(
+        "cannot consume marker (unlink failed); refusing to PASS",
+        "Single-use marker semantics could not be guaranteed. Inspect "
+        f"{MARKER_PATH} permissions and retry after re-running the reviewer flow.",
+    )
+return 0
+```
+
+Test added (`test_19_unlink_failure_BLOCKS`): chmod marker dir to read-only → unlink raises PermissionError → hook emits BLOCK with reason "cannot consume marker". Test passes.
+
+Suite: 965 tests (944 baseline + 21 new), all PASS.
+
+## Audit ask
+
+1-line verdict: GREEN (fix closes finding) / YELLOW (note residual concern) / RED (still broken).
+
+If non-G, specify the residual concern in 1 line.
+
+No new findings.

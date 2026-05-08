@@ -1,0 +1,221 @@
+# Round 2: Revised design responding to your Round 1 RED verdict
+
+You found 6+ critical bypasses in round 1. Below is the full revised design. Please attack it again with the same rigor. **Do not** restate Round 1 issues — focus on (a) whether each Round 1 issue is now closed, (b) any NEW bypasses introduced by the revisions, (c) anything you now realize was missed in Round 1.
+
+## Revised design (D''+A2)
+
+### Step 1 — Pre-screen regex
+
+**Old**: `(^|[^A-Za-z])git[ \t]+commit([ \t]|$)` (require contiguous `git commit`).
+
+**New**: command must contain BOTH word-boundary `\bgit\b` AND word-boundary `\bcommit\b` somewhere — not necessarily adjacent. `git[\\ \t\n].*commit` style is fine if cheaper.
+
+Rationale: `git -c x=y commit` has both words; `g\it com\mit` after de-quoting will have both; `G=git C=commit; $G $C` triggers via the literal token `commit` in the assignment value. We accept that pre-screen is now coarse — ~5 % of bash commands hit `git` and a tiny fraction also hit `commit`, but the cost is one extra `bashlex.parse()` call (~100 ms cold) which is acceptable.
+
+Commands that miss the pre-screen by construction (no `git` token AND no `commit` token anywhere): exit 0 PASS without further work.
+
+### Step 2 — bashlex parse + recursive AST walk
+
+```python
+GIT_GLOBAL_OPTS_WITH_OPERAND = {"-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+GIT_GLOBAL_OPTS_INLINE_PREFIX = ("--git-dir=", "--work-tree=", "--namespace=", "--exec-path=")
+COMMIT_BLOCKING_OPTS = {"-a", "--all", "--include", "--only", "--patch"}
+
+def is_git_commit_invocation(argv: list[str]) -> tuple[bool, str | None]:
+    """argv = list of dequoted word strings.
+    Returns (is_commit, reason_for_block_or_None).
+    """
+    # 1. Strip leading assignments  (PATH=. FOO=bar git commit)
+    i = 0
+    while i < len(argv) and "=" in argv[i] and argv[i].split("=", 1)[0].isidentifier():
+        i += 1
+    argv = argv[i:]
+    if not argv:
+        return False, None
+
+    # 2. Resolve command name
+    cmd0 = argv[0]
+    name = os.path.basename(cmd0)  # /usr/bin/git → git ; \git → \git ; bashlex word should be already dequoted but we re-strip leading backslash
+    if name.startswith("\\"):
+        name = name[1:]
+    if name != "git":
+        return False, None
+
+    # 3. Skip git global options
+    i = 1
+    while i < len(argv):
+        opt = argv[i]
+        if opt in GIT_GLOBAL_OPTS_WITH_OPERAND:
+            i += 2
+            continue
+        if opt.startswith(GIT_GLOBAL_OPTS_INLINE_PREFIX):
+            i += 1
+            continue
+        if opt.startswith("-"):
+            # unknown global option: treat as 1-arg
+            i += 1
+            continue
+        break
+
+    # 4. Subcommand
+    if i >= len(argv) or argv[i] != "commit":
+        return False, None
+
+    # 5. Check commit options for "expand-tree" forms — these capture content
+    # not present in the index; write-tree marker is therefore insufficient.
+    rest = argv[i+1:]
+    for tok in rest:
+        if tok in COMMIT_BLOCKING_OPTS:
+            return True, f"commit option {tok} commits non-index content; review marker insufficient"
+        if tok.startswith("--patch") or tok == "-p":
+            return True, "commit -p commits interactively-selected hunks"
+    # pathspec (positional non-option arg) also captures non-index content
+    saw_dashdash = False
+    for tok in rest:
+        if tok == "--":
+            saw_dashdash = True
+            continue
+        if saw_dashdash or (not tok.startswith("-")):
+            return True, "commit with pathspec captures non-index content"
+    # --amend exempt (pre-existing behavior)
+    if "--amend" in rest:
+        return False, "amend"  # explicit pass
+
+    return True, None  # plain commit, marker check applies
+
+
+def walk_for_git_commit(node) -> tuple[bool, str | None]:
+    """Recursively walk bashlex AST. Returns (found, reason)."""
+    if isinstance(node, list):
+        for n in node:
+            found, why = walk_for_git_commit(n)
+            if found:
+                return True, why
+        return False, None
+
+    kind = getattr(node, "kind", None)
+
+    # Command nodes — check argv
+    if kind == "command":
+        argv = []
+        for p in getattr(node, "parts", []):
+            if getattr(p, "kind", None) == "word":
+                argv.append(getattr(p, "word", ""))
+        return is_git_commit_invocation(argv)
+
+    # Composite kinds — recurse
+    for child_attr in ("parts", "list", "commands"):
+        children = getattr(node, child_attr, None)
+        if children:
+            for c in children:
+                found, why = walk_for_git_commit(c)
+                if found:
+                    return True, why
+    return False, None
+```
+
+This handles:
+- `git -c user.name=x commit -m x` → BLOCK (skip `-c x`, sees commit)
+- `git --git-dir=.git commit -m x` → BLOCK
+- `/usr/bin/git commit -m x` → BLOCK (basename)
+- `\git commit -m x` → BLOCK (strip leading backslash)
+- `PATH=. git commit` → BLOCK (skip leading assignment)
+- `(git commit -m x)` → BLOCK (subshell child)
+- `false || git commit -m x` → BLOCK (list child)
+- `echo foo | git commit -F -` → BLOCK (pipeline child)
+- `git commit -m x &` → BLOCK (background child)
+- `git commit -a -m x` → BLOCK with reason "commit -a captures non-index content"
+- `git commit -- README.md` → BLOCK with reason "pathspec"
+- `git commit --amend` → PASS (exempt)
+- `git status` → PASS (subcommand != commit)
+
+### Step 3 — Parse error → FAIL CLOSED
+
+If bashlex.parse(cmd) raises ANY exception → BLOCK with reason "Cannot safely analyze command shape; please simplify command (e.g. avoid quoted heredocs containing git commands; pre-stage and run plain `git commit`)".
+
+Rationale: command reached Step 3 only because pre-screen saw both `git` AND `commit` words. Parse failure on such a command is suspicious; safer to fail closed than guess. Round 1 C.1/C.2 fallback bypass is now closed because there is no fallback.
+
+Cost: legitimate commands that contain BOTH `git` and `commit` words AND have a quoted heredoc body will be blocked. Workaround: run `git commit` as a separate Bash call (the natural pattern) or remove the unrelated `git` occurrence. The pre-screen ensures only ~0.1% of commands hit this fail-closed path.
+
+### Step 4 — Marker validation
+
+Marker file: `~/.claude/hooks/.review-passed.json` (renamed from `.review-passed` to signal new schema).
+
+Schema (v=1):
+```json
+{
+  "schema_version": 1,
+  "repo_id": "<absolute path of git common dir, e.g. /data/Claude/flow-framework/.git>",
+  "tree_sha": "<output of git -C <repo> write-tree>",
+  "ts": 1234567890,
+  "single_use": true
+}
+```
+
+Hook validation:
+1. Read marker JSON. Reject if missing / unparsable / `schema_version != 1`.
+2. Reject if `time.time() - mtime > 1800` seconds.
+3. Compute current `repo_id_now = git rev-parse --git-common-dir` (absolute). Reject if `marker.repo_id != repo_id_now`.
+4. Compute current `tree_sha_now = git write-tree` (timeout 5s; on error/timeout BLOCK with reason "cannot validate index state"). Reject if `marker.tree_sha != tree_sha_now`.
+5. On all checks pass → atomically `os.unlink(marker)` and exit 0 PASS.
+
+Marker writer (helper called by reviewer flow):
+```python
+def write_marker(repo_id: str, tree_sha: str) -> None:
+    payload = {
+        "schema_version": 1,
+        "repo_id": repo_id,
+        "tree_sha": tree_sha,
+        "ts": int(time.time()),
+        "single_use": True,
+    }
+    tmp = MARKER_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+    os.replace(tmp, MARKER_PATH)  # atomic
+```
+
+### Step 5 — K_CLASS_SENTINEL_PROHIBITION revision
+
+Old text: "Do NOT touch ~/.claude/hooks/.review-passed".
+
+New text:
+> **K-class red line — code review marker integrity**
+>
+> Subagents and main session must NEVER directly create / modify / delete / chmod / set-mtime on:
+> - `~/.claude/hooks/.review-passed.json` (and any sibling marker file with prefix `.review-passed`)
+> - `~/.claude/hooks/_vendor/` (vendored shell parser)
+> - `~/.claude/hooks/pre-commit-review.{sh,py}` (the hook itself)
+>
+> Subagents and main session must NEVER attempt to bypass code review by:
+> 1. Wrapping `git commit` in any structure that hides it from the hook (compound commands, subshells, background jobs, pipelines, command/process substitutions, eval, exec, alias, function indirection).
+> 2. Splitting / quoting / escaping the literal command name to defeat detection (e.g. `g\it com\mit`, `gi""t com""mit`, `$G $C`, `\git`).
+> 3. Indirect invocation (e.g. `python -c "subprocess.run(['git','commit',...])"`).
+> 4. Direct manipulation of marker / hook / vendor files (write, append, copy, chmod, touch, rename, atomic replace).
+> 5. Use of `--no-verify` / git-config bypasses.
+>
+> Approved flow: reviewer agent runs → reviewer agent calls marker writer helper → main session runs plain `git commit -m "..."` (no compound, no `-a`, no pathspec) → hook validates and consumes marker.
+
+## Audit asks for Round 2
+
+For each fix below, give:
+- VERDICT: closed (round-1 issue closed) | partial (closed but with caveat) | not-closed (still bypassable)
+- If partial / not-closed: 1-line repro
+- If you spot any NEW issue introduced by the revision: list it with severity + repro
+
+Round 1 issues to verify closed:
+- A.1, A.2, A.3 (pre-screen bypasses)
+- B.1, B.2, B.3 (AST traversal completeness)
+- C.1, C.2, C.3 (parse error fallback safety)
+- D.1, D.2, D.3 (marker semantics)
+- E.1, E.2, E.3 (vendoring)
+- F.1, F.2, F.3 (performance)
+- G.1, G.2, G.3 (K-class brief)
+
+NEW attack surface to consider:
+- Step 2 walker `is_git_commit_invocation`: any way to make argv mismatch (e.g. `gi*` glob expansion, brace expansion)?
+- Step 3 fail-closed: any way to make bashlex parse SUCCEED with the AST hiding the real commit (e.g. `eval "git $cmd"` where bashlex sees just `eval STRING`)?
+- Step 4 marker: any way to fake `git rev-parse --git-common-dir` (env var, symlink, repo nesting)?
+- Step 5 brief: still under-/over-restrictive?
+
+Final verdict: GREEN / YELLOW / RED, terse.

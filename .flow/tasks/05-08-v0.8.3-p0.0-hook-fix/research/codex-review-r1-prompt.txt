@@ -1,0 +1,77 @@
+# Mandatory codex review — v0.8.3 P0.0 hook fix implementation
+
+You consulted on this design across rounds 1–5 (session continued). This is the implementation review (Phase 3 mandatory opus gate).
+
+The Round 5 Y verdict acknowledged this final spec (D''''+SoleRoot+WrapperDetect):
+
+```
+Step 1: pre-screen — both `\bgit\b` AND `\bcommit\b` words must appear (no match → PASS)
+Step 2: 1MB size cap (over → BLOCK)
+Step 3: bashlex.parse — exception → BLOCK fail-closed
+Step 4: sole-root simple command — trees==1 AND trees[0].kind=='command' (else BLOCK)
+Step 5: strict white-list:
+  5a: node.assignments empty (use node.assignments attr; fallback scan parts kind==assignment)
+  5b: word.parts contains no commandsubstitution / processsubstitution
+  5c: argv-position resolution
+       - argv[0]!='git' → wrapper detection (any word containing both 'git' and 'commit'
+         substrings → BLOCK; else PASS)
+       - argv[0]=='git' AND argv[1]!='commit' → if '-c' in argv[1:] BLOCK alias-injection;
+         else PASS
+       - argv[0]=='git' AND argv[1]=='commit' → continue
+  5d: argv[2:] strict whitelist:
+       {-m TEXT / -F PATH / --message=TEXT / --file=PATH / --amend / --no-edit / --no-gpg-sign /
+        --allow-empty-message}; must include at least one of -m/-F/--message/--file/--amend
+Step 6: marker JSON v=1 validation:
+  {schema_version=1, repo_id=Path(common_dir).resolve, head_oid, tree_sha, ts}
+  - reject: missing / non-JSON / schema_version != 1
+  - reject: now-mtime > 1800s OR now-payload.ts > 1800s
+  - reject: payload.repo_id != current `git rev-parse --git-common-dir | resolve`
+  - reject: payload.head_oid != current `git rev-parse HEAD`
+  - reject: payload.tree_sha != current `git write-tree`
+  - on git-command failure (CalledProcessError / TimeoutExpired): BLOCK
+Step 7: atomic unlink marker (single-use), return 0 PASS
+```
+
+Note Step 1 pre-screen was tightened from `\bgit\b` to `\bgit\b AND \bcommit\b` after smoke-testing exposed false BLOCK on benign `git status && git log`. The R5 caveat #1 (echo "git commit" / ls /tmp/git-commit-logs false-positive) still holds; intentional.
+
+## Implementation files
+
+Below is the verbatim Python source of the production files. Verify the implementation matches the spec.
+
+(See `/tmp/codex-review-r1-context.txt` for the full hook + marker_writer + K_CLASS source. It was bundled by the user via `cat`. Read that file with your file tool.)
+
+## Test results
+
+- 18 hook unit tests in `tests/hooks/test_pre_commit_review.py`: all PASS
+- 4 hook smoke tests in `/tmp/hook-quick-test.py`: all PASS (incl. `git status && git log` PASS, `touch && git commit` BLOCK)
+- Full suite: 964 unittest tests (944 baseline + 20 new), all PASS, 65s wallclock
+
+## Audit asks (verdict-only style — no new design)
+
+A. Does the implementation **match the Round 5 spec**? Specifically:
+   - Step 1 pre-screen: tightened to `\bgit\b AND \bcommit\b` — is this still consistent with Round 5 caveat acceptance?
+   - Step 4 sole-root check: implemented as `len(trees) == 1 AND trees[0].kind == 'command'` — is this the correct shape check?
+   - Step 5a env assignments: implementation uses `getattr(node, 'assignments', None)` AND scans `parts[i].kind == 'assignment'` (defensive both). Is this redundant or correct?
+   - Step 5c wrapper detection: implementation uses `"git" in w AND "commit" in w` substring check on every argv word, plus literal `commit` in argv check. Does this match Round 5 patch text?
+   - Step 6 marker `head_oid` binding: implemented. Step 6 timeout handling: implemented (CalledProcessError + TimeoutExpired both → BLOCK). OK?
+
+B. Implementation bugs (specifically the Python source):
+   - Memory leaks / zombie subprocess?
+   - Exception in `_emit_block` after `sys.exit(0)` — does control return wrongly?
+   - JSON output: is the wire format correct for Claude Code PreToolUse hook (`hookSpecificOutput.permissionDecision="deny"` + `permissionDecisionReason` + `additionalContext`)?
+   - File write race in marker writer (atomic os.replace, but what about partial reads of the .tmp file)?
+   - Symlink handling: hook is symlinked from `~/.claude/hooks/` to dotfiles. `Path(__file__).resolve()` is used — does this point at the dotfiles target as expected?
+
+C. Process / artifact concerns:
+   - The hook supersedes the .sh thin shim. Is the shim's `exec python3 "$(dirname "$0")/pre-commit-review.py"` correct when `$0` is the symlink (not resolved)?
+   - bashlex 0.18 vendored at GitHub commit `3f6b76c4c8462f4b90d9b1c73a555c45cde42f62`. Source URL recorded. LICENSE present. OK?
+   - K_CLASS forensic anchor preserved as substring "2 real bugs in v0.8.1 hidden by hook bypass". Pinned tests still pass. OK?
+
+## Output
+
+Reply with:
+1. A 5–10 row checklist of spec-match items (✓ matches / ✗ deviates with line-1 fix).
+2. A 0–5 row checklist of implementation bugs found (severity + 1-line fix).
+3. Final verdict: G (proceed to commit) / Y (proceed but note caveats) / R (specific bug must fix first).
+
+Stay terse — Phase 3 gate, not new design.

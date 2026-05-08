@@ -1,0 +1,282 @@
+# Round 3: Critique of your Round 2 + revised white-list design
+
+I'm pushing back on some of Round 2's findings using empirical bashlex 0.18 probing. I want you to react to the **critique** AND attack the **revised white-list design** — but stay focused on the threat model below, not adversarial-grade bypasses.
+
+## Threat model (explicit)
+
+**In scope**:
+- LLM agents (Claude / sub-agents / autonomy orchestrator) accidentally bypassing review through wrappers, env, compound commands, heredocs, or unfamiliar git invocation forms.
+- LLM agents misreading the K-class brief and constructing legal-looking commands that defeat the hook.
+
+**Out of scope (do NOT enumerate further)**:
+- Active human adversary with shell access intentionally constructing token-splitting bypasses (`G=gi; T=t; $G$T $C$M`, `g{it} c{ommit}`, `$'\x67\x69\x74'`).
+- Reasoning: the user owns ~/.claude/hooks/, can edit the hook itself. Hook is not a security boundary against the user.
+- Pre-existing user `git config` (e.g. `alias.ci=commit`). User responsibility to avoid configuring bypassing aliases.
+- Filesystem-level integrity (LLM with write access to ~/.claude/hooks/_vendor/* directly editing parser source). Out of scope same as above.
+
+## Empirical bashlex 0.18 facts (probed today, /tmp/bashlex-probe.py)
+
+This corrects several of your Round 2 claims:
+
+| Input command | bashlex argv | bashlex assignments |
+|---|---|---|
+| `git commit -m foo` | `[git, commit, -m, foo]` | `[]` |
+| `git"" commit -m foo` | `[git, commit, -m, foo]` | `[]` |
+| `g\it commit -m foo` | `[git, commit, -m, foo]` | `[]` |
+| `gi""t commit -m foo` | `[git, commit, -m, foo]` | `[]` |
+| `\git commit -m foo` | `[git, commit, -m, foo]` | `[]` |
+| `git $IFS commit -m foo` | `[git, $IFS, commit, -m, foo]` | `[]` |
+| `git$EMPTY commit -m foo` | `[git$EMPTY, commit, -m, foo]` | `[]` |
+| `: "$(git commit -m foo)"` | `[:, $(git commit -m foo)]` | `[]` (substitution stays embedded in the word) |
+| `command git commit -m foo` | `[command, git, commit, -m, foo]` | `[]` |
+| `env git commit -m foo` | `[env, git, commit, -m, foo]` | `[]` |
+| `eval "git commit -m foo"` | `[eval, git commit -m foo]` | `[]` |
+| `bash -c "git commit -m foo"` | `[bash, -c, git commit -m foo]` | `[]` |
+| `GIT_INDEX_FILE=/tmp/idx git commit -m foo` | `[git, commit, -m, foo]` | `[GIT_INDEX_FILE=/tmp/idx]` |
+| `PATH=. git commit -m foo` | `[git, commit, -m, foo]` | `[PATH=.]` |
+| `git -c user.name=x commit -m foo` | `[git, -c, user.name=x, commit, -m, foo]` | `[]` |
+| `git -C repo commit -m foo` | `[git, -C, repo, commit, -m, foo]` | `[]` |
+| `git --git-dir=.git commit -m foo` | `[git, --git-dir=.git, commit, -m, foo]` | `[]` |
+| `git commit -am foo` | `[git, commit, -am, foo]` | `[]` |
+| `git commit -amx` | `[git, commit, -amx]` | `[]` |
+| `/usr/bin/git commit -m foo` | `[/usr/bin/git, commit, -m, foo]` | `[]` |
+| `(git commit -m foo)` | (subshell child) `[git, commit, -m, foo]` | `[]` |
+| `false \|\| git commit -m foo` | (list) two command nodes; one is `[false]`, one is `[git, commit, -m, foo]` | `[]` |
+| `echo x \| git commit -F -` | (pipeline) two command nodes | `[]` |
+| `git commit -m foo &` | (with `&`) `[git, commit, -m, foo]` | `[]` |
+| `g{it} c{ommit} -m x` | `[g{it}, c{ommit}, -m, x]` (NOT expanded) | `[]` |
+| `git ci -m x` | `[git, ci, -m, x]` (alias not expanded) | `[]` |
+
+**Conclusions**:
+- bashlex DOES dequote static quoting (`""`, `\g`, `gi""t`) → your Round 2 B.1' claim "bashlex words are not safely dequoted" is FALSE for static quoting.
+- bashlex DOES NOT expand runtime constructs (`$VAR`, `$(...)`, `${...}`, brace expansion, ANSI `$'...'`) — argv contains the literal pre-expansion form.
+- bashlex separates leading env assignments into `node.assignments` so argv is clean.
+- Command substitution `$(...)` stays embedded in the word, not exposed as argv entries — walker must recurse word.parts to find substitution AST nodes.
+
+## My critique of your Round 2 findings
+
+| Round 2 finding | My response |
+|---|---|
+| A.1' `$G$T $C$M` | OUT OF SCOPE (adversarial). Also: under white-list, argv[0]='$G$T' literal != 'git' → BLOCK regardless. |
+| A.2' brace `g{it}` / ANSI `$'\x67'` | OUT OF SCOPE (adversarial). Also: bashlex argv[0]='g{it}' literal != 'git' → BLOCK. |
+| A.3' git aliases (`git ci`) | OUT OF SCOPE (user environment). Hook does not read user `git config`. White-list requires literal `commit` subcommand; if user uses alias, the hook BLOCKS — user must use plain `git commit`. |
+| B.1' word dequoting | FALSE empirically. bashlex DOES dequote static quoting. Closed. |
+| B.1' `git$IFS commit` | argv `[git, $IFS, commit]` → argv[1]='$IFS' ≠ 'commit' → white-list BLOCK ✅ |
+| B.1' `git$EMPTY commit` | argv[0]='git$EMPTY' ≠ 'git' → white-list BLOCK ✅ |
+| B.2' `: "$(git commit)"` | TRUE — walker must recurse into word.parts substitution children. Will fix. |
+| B.3' `command git commit` | argv[0]='command' → white-list argv[0] ≠ 'git' → BLOCK ✅ |
+| B.3' `eval "git commit"` | argv[0]='eval' → BLOCK ✅ |
+| B.3' `bash -c "git commit"` | argv[0]='bash' → BLOCK ✅ |
+| B.3' `env git commit` | argv[0]='env' → BLOCK ✅ |
+| C.1' fail-closed not reached | Premise (Step 1 gap) is OUT OF SCOPE. Closed under threat model. |
+| C.2' parse success not safety (`eval`) | argv[0]='eval' under white-list → BLOCK ✅ |
+| D.1' env (`GIT_INDEX_FILE=...`) | bashlex puts env in `node.assignments` → white-list rejects non-empty assignments → BLOCK ✅ |
+| D.1' `git -C /other/repo commit` | argv `[git, -C, repo, commit, ...]` → argv[1]='-C' ≠ 'commit' → BLOCK ✅ |
+| D.2' multi-use `--allow-empty` | white-list args don't allow `--allow-empty` → BLOCK; even if allowed, marker is single-use (unlink on validate). ✅ |
+| D.3' pathspec parser bug | DROP the bug entirely — white-list does NOT need a pathspec parser. Any args outside white-list → BLOCK. ✅ |
+| D.3' `-amx` compact short opts | argv `[..., -amx]` not in white-list → BLOCK ✅ |
+| E.1' vendor pin SHA | TRUE valid concern. Will pin commit SHA + record checksum + vendor LICENSE. |
+| E.2' transitive deps | Will probe + verify bashlex has no transitive deps; otherwise vendor closure. |
+| E.3' hook integrity | OUT OF SCOPE (filesystem trust boundary). |
+| F.1' heredoc false positive | Acceptable — heredoc with `git commit` text in body is rare and recoverable (split into separate Bash calls). |
+| F.2' size cap | TRUE — will add hard cap (e.g. 1MB) → BLOCK over cap. |
+| G.1' hook maintenance conflict | TRUE — will add explicit exception for user-authorized hook maintenance. |
+| G.2' indirect invocation enforcement | White-list closes most (eval / bash -c / wrappers all argv[0]≠git). |
+| G.3' "git-config bypasses" vague | TRUE — will name `--no-verify`, `core.hooksPath`, `alias.*`. |
+
+## Revised white-list design (D'''+W)
+
+### Step 1: Pre-screen
+
+Cheap regex: `\bgit\b` — if no `git` word in command, exit 0 PASS.
+
+(Removed `commit` requirement: walker now decides subcommand, not pre-screen.)
+
+Cost: any command containing `git` (e.g. `git status`, `git push`) pays bashlex import (~100ms). Acceptable per F.3 ("correctness should win").
+
+### Step 2: Pre-screen for command size
+
+If command bytes > 1MB → BLOCK with reason "command too large to analyze; simplify" (F.2 fix).
+
+### Step 3: bashlex parse
+
+Try `bashlex.parse(command)`. On any exception:
+- If pre-screen said "git word present" → BLOCK with reason "Cannot safely analyze; please simplify (e.g. avoid quoted heredocs containing git words; pre-stage and run plain `git commit` separately)".
+
+### Step 4: Recursive AST walk for any commit invocation
+
+```python
+def find_commit_invocation(node) -> tuple[str, ...] | None:
+    """Return tuple of argv if any node in tree is `git commit ...`, else None.
+    Recursive — handles list/pipeline/subshell/background/word substitutions."""
+
+    if isinstance(node, list):
+        for n in node:
+            r = find_commit_invocation(n)
+            if r: return r
+        return None
+
+    kind = getattr(node, "kind", None)
+    if kind == "command":
+        # collect argv from word parts
+        argv = [getattr(p, "word", "") for p in getattr(node, "parts", [])
+                if getattr(p, "kind", None) == "word"]
+        # check assignments — non-empty means env-prefixed: BLOCK regardless of subcommand
+        assigns = [getattr(p, "word", "") for p in getattr(node, "parts", [])
+                   if getattr(p, "kind", None) == "assignment"]
+        # also recurse into word.parts for embedded command substitutions
+        for p in getattr(node, "parts", []):
+            for sub in getattr(p, "parts", []) or []:
+                r = find_commit_invocation(sub)
+                if r: return r
+        # is this command a git invocation?
+        if argv and is_git_command_name(argv[0]):
+            # is it `git commit`? (literal subcommand match, no alias resolution)
+            if len(argv) >= 2 and argv[1] == "commit":
+                return ("__plain__", *argv, *(f"ENV={a}" for a in assigns))
+            # `git -c X commit` / `git -C X commit` etc. — argv[1]=='-c' / '-C': also treat as commit
+            # (we BLOCK these regardless — captured below)
+            for i, w in enumerate(argv[1:], start=1):
+                if w == "commit":
+                    return ("__nonplain__", *argv, *(f"ENV={a}" for a in assigns))
+        return None
+
+    # composite kinds — recurse
+    for child_attr in ("parts", "list", "commands"):
+        children = getattr(node, child_attr, None) or []
+        for c in children:
+            r = find_commit_invocation(c)
+            if r: return r
+    return None
+
+
+def is_git_command_name(w: str) -> bool:
+    """Match `git` as a literal command name, allowing common path prefixes."""
+    if w == "git":
+        return True
+    if w.endswith("/git") and not any(c in w for c in "$`(){}[]?*"):
+        return True
+    return False
+```
+
+### Step 5: White-list validation on commit invocation argv
+
+If find_commit_invocation returned a tuple:
+
+```python
+APPROVED_OPTIONS = {
+    "-m", "--message",
+    "-F", "--file",
+    "--amend",
+    "--no-edit",
+    "--no-gpg-sign",
+    "--allow-empty-message",
+}
+
+def is_white_listed(token, argv) -> tuple[bool, str | None]:
+    """Determine if the captured commit invocation is in the white list."""
+    flavor, *rest = token  # flavor is "__plain__" or "__nonplain__"
+
+    # Reject env-prefixed commits (assignments captured as ENV=...)
+    if any(a.startswith("ENV=") for a in rest):
+        return False, "env-prefixed commit not allowed (use plain git commit after `unset` if needed)"
+
+    # Reject any non-plain shape (--git-dir, -c, -C, /path/git, git$VAR, etc.)
+    if flavor == "__nonplain__":
+        return False, "git global options or non-`git` argv[0] not allowed; use plain `git commit` in target repo"
+
+    # `rest` is `[git, commit, ...]` for __plain__ — strip and inspect args
+    args = list(rest[2:])
+    # `--amend` may appear with no other args; that's fine
+    if args == ["--amend"] or args == ["--amend", "--no-edit"]:
+        return True, None
+    # otherwise must use one of: -m TEXT / --message=TEXT / --message TEXT / -F PATH / --file=PATH / --file PATH
+    has_message = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-m", "-F", "--message", "--file"):
+            if i + 1 >= len(args):
+                return False, f"option {a} missing argument"
+            i += 2
+            has_message = True
+            continue
+        if a.startswith("--message=") or a.startswith("--file="):
+            i += 1
+            has_message = True
+            continue
+        if a in APPROVED_OPTIONS:
+            i += 1
+            continue
+        return False, f"option {a!r} not in approved white-list"
+
+    if not has_message and "--amend" not in args:
+        return False, "commit must include -m/--message/-F/--file or be --amend"
+
+    return True, None
+```
+
+### Step 6: Marker validation (when white-list passes)
+
+Marker file: `~/.claude/hooks/.review-passed.json` (single-use).
+
+```json
+{
+  "schema_version": 1,
+  "repo_id": "<absolute path of git common dir>",
+  "tree_sha": "<git write-tree output at review time>",
+  "ts": <unix timestamp>
+}
+```
+
+Hook validation:
+1. Read JSON. BLOCK on parse / missing / `schema_version != 1`.
+2. BLOCK if `time.time() - mtime > 1800` seconds.
+3. BLOCK if `marker.repo_id != $(git rev-parse --git-common-dir | xargs realpath)`. (Note: hook computes against the CWD it runs in, which is the same CWD as the git commit invocation, since assignments and -C/-c are blocked at white-list step.)
+4. BLOCK if `marker.tree_sha != $(timeout 5 git write-tree)`. On write-tree error/timeout → BLOCK with reason "cannot validate index".
+5. On all checks pass → atomically `os.unlink(marker)` (single-use) → exit 0 PASS.
+
+### Step 7: K_CLASS_SENTINEL_PROHIBITION text (final)
+
+```
+**K-class red line — code review marker integrity**
+
+Subagents and main session must NEVER:
+1. Wrap, hide, or indirect-invoke `git commit` in any way that defeats the
+   hook (compound commands, subshells, background, pipelines, command/process
+   substitutions, eval, `bash -c`, `python -c`, command/env wrappers).
+2. Run a non-plain `git commit` form: `-a/--all`, `--include`, `--only`,
+   `-p/--patch`, pathspec, `-c <key>=<val>`, `-C <path>`, `--git-dir=...`,
+   `--work-tree=...`, prefix env assignments (`PATH=. git commit`, etc.),
+   or use git aliases (`git ci`).
+3. Manipulate marker / hook / vendor files: write, append, copy, chmod, touch,
+   rename, atomic-replace `~/.claude/hooks/.review-passed.json`,
+   `~/.claude/hooks/_vendor/*`, `~/.claude/hooks/pre-commit-review.{sh,py}`.
+4. Use `--no-verify`, `core.hooksPath` override, `-c alias.*=`, or any other
+   git-config-based hook bypass.
+
+Approved flow: reviewer agent runs → reviewer agent writes marker via the helper
+→ main session runs PLAIN `git commit -m "..."` (or `-F`, or `--amend`) in the
+target repo's CWD → hook validates and consumes marker.
+
+Exception: when the user explicitly authorizes hook/vendor maintenance work
+(this v0.8.3 task is an example), the K-class file-modification prohibition is
+lifted for that scope only, with user attestation in PRD.
+```
+
+## Audit asks for Round 3
+
+For each of (1) my critique table above, (2) the white-list design (Steps 1–7):
+
+A. Tell me where my critique is wrong (with bashlex empirical evidence I should be aware of, NOT speculation).
+
+B. Identify any IN-SCOPE bypass (LLM-accidental, not adversarial) that white-list misses. For each:
+   - 1-line repro
+   - Severity (high / medium / low)
+   - Suggested narrowing of white-list
+
+C. Identify any implementation bug in the pseudocode (Steps 4–6) — specifically `find_commit_invocation`, `is_white_listed`, marker check.
+
+D. Final verdict: GREEN / YELLOW / RED.
+
+Stay focused. Round 1 + Round 2 already covered adversarial; this round is in-scope-only. I will NOT extend white-list to handle adversarial token splitting.

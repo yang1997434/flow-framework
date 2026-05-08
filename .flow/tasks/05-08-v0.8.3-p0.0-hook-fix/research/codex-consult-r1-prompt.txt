@@ -1,0 +1,105 @@
+# Cross-model design consult: v0.8.3 P0.0 hook block-after-PASS root cause fix
+
+You are reviewing a design decision (Phase 1 ADR) before implementation. Find blind spots, attack the design, list concrete bypasses or correctness gaps. **Do not** rewrite the whole plan — just enumerate issues with severity (critical / high / medium / low / nit) and short reproduction sketches.
+
+## Context
+
+A pre-commit Claude Code hook (`PreToolUse:Bash` filter) is meant to BLOCK any `git commit` invocation unless a recent code-review marker file is fresh. Current implementation:
+
+```bash
+# pre-commit-review.sh (current)
+COMMAND="$(jq -r '.tool_input.command' < "$INPUT")"
+if ! printf '%s\n' "$COMMAND" | grep -qE '^\s*git\s+commit'; then exit 0; fi
+if printf '%s\n' "$COMMAND" | grep -qE '^\s*git\s+commit\s+--amend'; then exit 0; fi
+MARKER=~/.claude/hooks/.review-passed
+if [[ -f "$MARKER" ]] && [[ $(($(date +%s) - $(stat -c %Y "$MARKER"))) -lt 1800 ]]; then
+  rm -f "$MARKER"  # single-use
+  exit 0
+fi
+echo '{"action":"block","reason":"Code review required..."}' >&2
+exit 0
+```
+
+Two real bugs observed in production:
+
+- **false-negative**: `touch /tmp/x && git commit -m bypass` — `grep -E '^\s*git\s+commit'` only matches if the *first non-whitespace tokens* are `git commit`. A leading no-op (`touch && ...`, `echo x && ...`) lets the command sneak through with hook returning exit 0 (treated as PASS).
+- **false-positive**: `python3 <<EOF\n...some line containing git commit text...\nEOF`. `grep -qE '^...'` matches `^` at the start of *every line* in the multi-line command (`tool_input.command` is the whole heredoc body). Heredoc body containing the words "git commit" → BLOCK fires for legitimate commands.
+
+## Proposed fix: D'+A 4-step path
+
+1. **Pre-screen regex on whole command**: `(^|[^A-Za-z])git[ \t]+commit([ \t]|$)`. No match → exit 0 (PASS) without further work. Skips bashlex import for ~99% of commands.
+2. **bashlex parse + AST walk**: vendored bashlex 0.18 (~228KB Python source committed at `~/.claude/hooks/_vendor/bashlex/`). Walk AST, return True iff some top-level command node has `parts[0].word == 'git' && parts[1].word == 'commit'`.
+3. **ParsingError fallback**: bashlex 0.18 cannot parse `<<'EOF'` (quoted heredoc — fails with `here-document delimited by end-of-file`). On any parse exception, fall back to first-line check `^\s*git\s+commit\b`. This is Option E equivalent.
+4. **Marker validation**: marker file is JSON `{"schema_version": 1, "sha": "<git write-tree output>", "ts": <unix>}`. BLOCK if missing OR mtime > 1800s OR sha != current `git write-tree` output OR schema_version != 1. `--amend` exempt.
+
+## Spike data (research/spike-bashlex-perf.py)
+
+- bashlex 0.18 cold import: **97ms** (occupies 97% of typical hook 100ms budget)
+- bashlex unquoted heredoc parse:
+  - 1KB: 0.39ms
+  - 50KB: 11.4ms
+  - 200KB: 44.5ms
+- bashlex quoted heredoc `<<'EOF'`: **3/3 PARSE_ERROR** (regardless of size)
+- Pre-screen regex on whole command: < 5ms (no Python startup)
+
+## Specific audit asks
+
+Please attack each angle:
+
+### A. Pre-screen regex bypasses
+Word boundary `(^|[^A-Za-z])git[ \t]+commit([ \t]|$)`. Can an LLM construct a command that:
+- ACTUALLY executes `git commit` as a top-level command, AND
+- Defeats the pre-screen (no match), so bashlex never runs
+
+Examples to consider: tab-vs-space, newline separator (`git\ncommit`?), backslash-newline continuation (`git \\\n commit`), variable expansion (`G=commit; git $G`), `eval`, `exec`, alias, function wrapping, full path (`/usr/bin/git commit`), shell variable assignments (`PATH=. git commit`).
+
+### B. AST traversal completeness
+The walker checks `parts[0].word == 'git' && parts[1].word == 'commit'`. Cases that may evade:
+- `git -c user.name=x commit` — parts[1] is `-c` not `commit`
+- `git --git-dir=/foo commit` — same
+- `/usr/bin/git commit` — parts[0].word is `/usr/bin/git` not `git`
+- `\git commit` — POSIX backslash-quoting, parts[0].word may be `git`
+- Aliased: `gc='git commit'; gc -m foo` — parts[0].word is `gc`
+- Function: `gc() { git commit "$@"; }; gc -m foo`
+- Subshell: `(git commit -m foo)` — top-level is the subshell node, not `git`
+- Pipeline tail: `echo foo | git commit -F -` — pipeline child, not top-level simple command (depends on AST shape)
+- Background: `git commit -m foo &`
+- Conditional: `false || git commit -m foo`
+- Process substitution: `git commit -F <(echo msg)` — parts include process_sub redirect
+
+For each, what should the hook DO (BLOCK vs PASS)?
+
+### C. ParsingError fallback safety
+After bashlex fails on `<<'EOF'`, hook falls back to first-line `^\s*git\s+commit\b`. Risks:
+- Malicious heredoc body could have `git commit` as a line — but first-line is `python3 <<'EOF'`, no match → PASS. Is there a real exploit path here? (Hint: LLM is bound by R4 K-class brief, but assume adversarial construction.)
+- Multi-line first line via `git \\\n commit` — first-line check fails. Bashlex would parse but if it fails differently the fallback is wrong.
+
+### D. Marker semantics
+- `git write-tree` requires a clean index state and a valid `.git`. What if commit is run from sub-worktree, detached HEAD, bare repo, mid-rebase? Hook needs robust failure mode (default BLOCK if write-tree fails?).
+- mtime check: 30 min TTL is per-marker file. After PASS, marker is consumed (`rm -f`). Should marker be **single-use** or **multi-use until expiry**? Current proposal doesn't say explicitly.
+- Race: if reviewer writes marker, then user adds new file before commit, write-tree changes → marker.sha mismatch → BLOCK. Good. But what if user `git add -p` partially after review — marker still matches the partial-add tree but reviewer reviewed full diff?
+- TOCTOU: between marker check and actual commit, another tool could mutate index. Practically irrelevant?
+
+### E. Vendoring + supply chain
+- bashlex 0.18 last PyPI release ~2017. We vendor from GitHub master. Is there a supply-chain risk in shipping a frozen 228KB dep into `.claude/hooks/_vendor/`?
+- bashlex itself uses `ply` (yacc-like)? Check whether vendoring needs to bring transitive deps. Spike script ran from cloned repo as `sys.path` addition — did Python find all deps inside?
+- Hook startup: `sys.path.insert(0, vendor_dir)` then `import bashlex`. Risk of shadowing user's own bashlex? Minimal.
+
+### F. Performance under realistic worst-case
+- 200KB heredoc test was synthetic (lots of print lines). Real Claude Code commands could include very large diff blobs in `git commit -m "$(cat <<EOF ... 500KB ... EOF)"` style. Spike didn't test 500KB+ unquoted (only 200KB).
+- Hook total budget: 10s. With cold import 97ms + parse 100ms + write-tree 50ms = 250ms — well under. But Python interpreter startup itself adds another ~30ms on cold disk. Still fine.
+
+### G. K-class brief language
+The orchestrator prompt has `K_CLASS_SENTINEL_PROHIBITION` text telling subagents not to `touch ~/.claude/hooks/.review-passed`. Plan adds a new bullet: "禁止 `<noop> && git commit ...` 模式". Concern: subagents misread "禁止 noop" as "no-op of any kind", causing them to over-restrict legitimate `cd path && git commit -m foo` (cd is also no-op for this regex). Phrasing matters.
+
+## Output format
+
+For each angle (A–G), give:
+- 1–3 specific concrete issues (or "no issue found")
+- Severity: critical / high / medium / low / nit
+- For each issue, 1-line repro or attack sketch
+- For each issue, 1-line recommended fix or "accept as known limitation"
+
+End with an overall verdict: GREEN (proceed to implement) / YELLOW (proceed but address listed issues) / RED (rethink).
+
+Be terse. No filler.

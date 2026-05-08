@@ -1,0 +1,50 @@
+# Round 5: Single-patch verdict
+
+You flagged A.1/B.2 as not-closed: Step 5c's `if argv[0] != "git": exit 0` lets wrappers PASS (`command git commit`, `eval "git commit"`, etc.).
+
+## Patch (replaces Step 5c entirely)
+
+```python
+# 5c. argv-position branch resolution
+
+# (a) argv[0] is not literal "git" — detect wrapper / interpreter
+if argv[0] != "git":
+    # Any word in argv containing both "git" and "commit" substrings → wrapper attempt
+    for w in argv:
+        if "git" in w and "commit" in w:
+            BLOCK("git commit detected via wrapper / interpreter argument; use plain `git commit`")
+    # Any standalone argv token that is exactly "commit" alongside "git" elsewhere → wrapper
+    if "commit" in argv and any(("git" == x or x.endswith("/git")) for x in argv):
+        BLOCK("git commit detected via command/env/wrapper; use plain `git commit`")
+    # Otherwise truly not a git operation
+    exit 0  # PASS
+
+# (b) argv[0] == "git"
+if len(argv) >= 2 and argv[1] != "commit":
+    # Any -c presence (alias injection)
+    if "-c" in argv[1:]:
+        BLOCK("`git -c ...` form not allowed (alias injection risk)")
+    exit 0  # PASS — non-commit git command (status/log/push/etc.)
+
+# (c) argv[0]=="git" and argv[1]=="commit" — fall through to Step 5d arg validation
+```
+
+This catches:
+- `command git commit -m x` → argv `[command, git, commit, -m, x]` — `commit` in argv AND `git` in argv → BLOCK
+- `env git commit -m x` → same shape → BLOCK
+- `eval "git commit -m x"` → argv `[eval, git commit -m x]` — argv[1] string contains both `git` and `commit` → BLOCK
+- `bash -c "git commit -m x"` → argv `[bash, -c, git commit -m x]` — argv[2] string contains both → BLOCK
+- `nice git commit -m x` → same as command/env → BLOCK
+
+False positive risk:
+- `echo "git commit and push"` → argv `[echo, git commit and push]` — argv[1] contains both → BLOCK. **Acceptable** (rare; user can split into separate Bash call).
+- `ls /tmp/git-commit-logs` → argv `[ls, /tmp/git-commit-logs]` — argv[1] contains both `git` and `commit` substrings → BLOCK. **Acceptable** (rare; user can quote-strip or split).
+
+## Output
+
+Reply ONLY with:
+1. Updated 9-row table (A.1, B.2 → closed?).
+2. Single-letter verdict: G / Y / R.
+3. If Y: 1-bullet caveat. If R: specific gap.
+
+No new findings.

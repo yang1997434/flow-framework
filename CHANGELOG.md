@@ -1,5 +1,54 @@
 # Changelog
 
+## [0.8.3] - 2026-05-08 (P0.0 hook fix)
+
+### Fixed
+
+- **Pre-commit review hook double-direction bug** (pitfall
+  `hook-blocks-after-reviewer-pass.md`):
+  - **false-negative**: `<noop> && git commit ...` (e.g. `touch /tmp/x && git
+    commit`) no longer bypasses the hook. v0.8.2 T6.3 incident closed.
+  - **false-positive**: heredoc bodies / multi-line commands containing the
+    text `git commit` no longer trigger BLOCK on legitimate work. v0.8.2
+    /flow:pause incident closed.
+
+### Added
+
+- `~/.claude/hooks/pre-commit-review.py` — full Python rewrite implementing
+  the **D''''+SoleRoot+WrapperDetect** 7-step path (vendored bashlex AST
+  analysis + sole-root simple-command requirement + strict argv white-list +
+  content-hash + HEAD-bound marker).
+- `~/.claude/hooks/_marker_writer.py` — atomic marker writer helper called
+  by reviewer flow.
+- `~/.claude/hooks/_vendor/bashlex/` — vendored bashlex 0.18 (frozen at
+  GitHub commit `3f6b76c`, ~228KB) + `_selftest.py` for `python -S`
+  isolated import smoke test.
+- `tests/hooks/test_pre_commit_review.py` — 18-case acceptance matrix
+  (sole-root / wrapper / substitution / `-c` injection / env-prefix /
+  HEAD binding / single-use unlink / `--amend` exempt / etc.).
+
+### Changed
+
+- Marker schema **v=1**: now JSON `{schema_version, repo_id, head_oid,
+  tree_sha, ts}` at `~/.claude/hooks/.review-passed.json`. The legacy
+  empty `.review-passed` file is treated as absent. Marker is bound to
+  current repo + HEAD + index — branch switch / `git add -p` / repo
+  cross-use all invalidate it. Single-use (atomic unlink on PASS).
+- `K_CLASS_SENTINEL_PROHIBITION` (`scripts/dispatch_template.py`): expanded
+  from 5-line "do not touch marker" to 4-clause prohibition (wrap/non-plain/
+  marker-mutate/git-config-bypass) + hook-maintenance exception. Forensic
+  anchor preserved.
+
+### Process
+
+- Phase 1 used **5 rounds of cross-model codex consult** (~80K tokens,
+  session `019e078a-...`). Final verdict: Y (YELLOW with one acceptable
+  caveat — non-git commands whose argv text contains both `git` and
+  `commit` substrings will be BLOCKed; rare and recoverable). Full
+  artifacts in `.flow/tasks/05-08-v0.8.3-p0.0-hook-fix/research/`.
+- Threat model explicitly limited to **LLM accidental bypass**, not
+  adversarial users with shell access (the user owns `~/.claude/hooks/`).
+
 ## [0.8.2.1] - 2026-05-08
 
 ### Fixed

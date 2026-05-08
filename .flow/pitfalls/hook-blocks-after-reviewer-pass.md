@@ -3,12 +3,23 @@ name: hook-blocks-after-reviewer-pass
 date: 2026-05-08
 project: flow-framework
 severity: high
-status: active
+status: resolved
 trigger_paths:
   - "~/.claude/hooks/.review-passed"
-  - "~/.claude/hooks/pre-tool-bash.py"
+  - "~/.claude/hooks/.review-passed.json"
+  - "~/.claude/hooks/pre-commit-review.{sh,py}"
+  - "~/.claude/hooks/_vendor/bashlex/"
+  - "~/.claude/hooks/_marker_writer.py"
+  - "claude/hooks/pre-tool-bash.py"
   - "claude/hooks/pre-commit*"
 last_verified: 2026-05-08
+resolved_in: v0.8.3 P0.0 (D''''+SoleRoot+WrapperDetect 7-step path)
+resolution_artifacts:
+  - .flow/tasks/05-08-v0.8.3-p0.0-hook-fix/prd.md
+  - .flow/tasks/05-08-v0.8.3-p0.0-hook-fix/research/spike-bashlex-perf.md
+  - .flow/tasks/05-08-v0.8.3-p0.0-hook-fix/research/codex-consult-r1-response.md
+  - .flow/tasks/05-08-v0.8.3-p0.0-hook-fix/research/codex-consult-r5-response.md
+codex_consult_session: "019e078a-61da-73a2-a8a8-8274ebc6436f (5 rounds, R5 Y verdict)"
 ---
 
 # hook-blocks-after-reviewer-pass
@@ -169,6 +180,31 @@ from data**.
   v0.8.2 T6.3 = 3rd violation, this time with the prefix-bypass twist.
 - `dispatch_template.K_CLASS_SENTINEL_PROHIBITION` (v0.8.2 T4 hardening)
   addresses subagent-side bypass but not the regex-prefix bypass.
-- Suggested v0.8.3 P0 task: implement Option D fix in this hook AND
-  extend `K_CLASS_SENTINEL_PROHIBITION` text to also forbid
-  `<noop> && git commit ...` patterns.
+
+## Resolution (v0.8.3 P0.0, 2026-05-08)
+
+**Status: RESOLVED.** Final spec: D''''+SoleRoot+WrapperDetect 7-step
+path. The hook is rewritten in Python with vendored bashlex 0.18 AST
+analysis. Both bug directions closed simultaneously:
+
+- **false-negative** (compound-prefix bypass): closed by Step 4 sole-root
+  simple-command requirement (any list / pipeline / subshell / background /
+  compound rejected) + Step 5c wrapper detection (argv[0]≠git with git+commit
+  substrings → BLOCK).
+- **false-positive** (heredoc body): closed by bashlex AST analysis instead
+  of per-line grep. Quoted heredocs that bashlex cannot parse fail closed
+  (BLOCK with explicit reason "cannot safely analyze command shape; run plain
+  `git commit` separately").
+
+Marker upgraded from empty `.review-passed` (mtime + existence) to JSON v=1
+`{schema_version, repo_id, head_oid, tree_sha, ts}` with single-use unlink.
+
+Phase 1 used 5 rounds of cross-model codex consult to harden the design;
+final R5 Y verdict acknowledges one acceptable caveat: non-git commands
+whose argv text contains both `git` and `commit` substrings (e.g. `echo
+"git commit and push"`, `ls /tmp/git-commit-logs`) will be BLOCKed. Rare;
+recoverable by splitting into separate Bash calls.
+
+See `CHANGELOG.md [0.8.3]` and the task PRD at
+`.flow/tasks/05-08-v0.8.3-p0.0-hook-fix/prd.md` for full ADR + Phase 2
+implementation steps.
