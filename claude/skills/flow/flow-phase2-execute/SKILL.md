@@ -164,13 +164,22 @@ SKILL — the orchestrator has the authority.
 subsequent path to interactive mode MUST go through
 `block + user choice`. NEVER silently switch — this includes crash
 recovery on next-startup. If `flow orchestrator --auto-execute <slug>`
-exits non-zero, follow `blocked.md` instructions for the user choice.
+exits with rc 3/4, follow `blocked.md` instructions for the user
+choice. rc=2 is recoverable park (no `blocked.md` written) — see exit
+code table below.
 
 Exit codes:
 
 - `0` = clean completion, OR contract missing → interactive fallback
   (legal pre-lock — user never opted in this attempt).
+- `2` = **AFK idle park** (v0.8.2 T6.2): wait-mode AFK timeout fired
+  without 24h hard cap. Recoverable: NO `blocked.md`, NO hard-stop
+  snapshot, NO merge. Operator runs `/flow:resume` to continue.
 - `3` = block raised (`blocked.md` written; user resume needed).
+  Includes terminal hard-stop reasons: `budget_hit`, `retry_cap`,
+  `codex_review_cap`, `afk_aborted`, `afk_hard_cap`. All write a
+  unified `HardStopSnapshot` (schema v1) with reason + last-gate
+  context.
 - `4` = `aborted_nested` (nested-autonomy attempt detected).
 
 ## Step 1 — Determine dispatch strategy

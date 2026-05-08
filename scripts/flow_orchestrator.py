@@ -4978,10 +4978,12 @@ def dispatch_with_retry(
         if afk_state == "timeout":
             # T6.1 P1.1 — three distinct outcomes:
             #   - mode='wait'  + idle timeout     -> "afk_idle_park"
-            #     (RECOVERABLE: no snapshot, rc=0, no notifier; caller
-            #     park hand-off lives outside the loop. The deterministic
-            #     test path returns immediately so the loop CANNOT
-            #     fall through into another impl/review cycle).
+            #     (RECOVERABLE: no snapshot, rc=2 [translated by
+            #     `_phase2_dispatch`], no notifier, no merge; caller
+            #     park hand-off lives outside the loop. Operator runs
+            #     /flow:resume to continue. The deterministic test path
+            #     returns immediately so the loop CANNOT fall through
+            #     into another impl/review cycle).
             #   - mode='abort' + idle timeout     -> "afk_aborted"
             #     (TERMINAL: snapshot, rc=3, notifier).
             #   - any mode     + 24h hard cap     -> "afk_hard_cap"
@@ -5419,10 +5421,15 @@ def _cmd_auto_execute(slug: str) -> int:
       0 = all manifests merged + verified, OR contract missing →
           interactive fallback, OR pre-lock recovery → fail-closed
           interactive (legal silent — user never opted in this attempt).
+      2 = AFK idle park (v0.8.2 T6.2): wait-mode AFK timeout without
+          24h hard cap. Recoverable — no blocked.md, no snapshot, no
+          merge. Operator runs /flow:resume to continue. Distinct from
+          rc=3 terminal blocks.
       3 = block raised at any phase (recovery / dispatch / gate 1-6 /
-          merge / gate 8 / wave halt). Distinct from exit 4 (S5
-          nested-autonomy aborted_nested) and exit 2 (v0.8.0 stub —
-          no longer reachable on auto-execute path).
+          merge / gate 8 / wave halt) OR Phase 2 terminal hard-stop
+          (budget_hit / retry_cap / codex_review_cap / afk_aborted /
+          afk_hard_cap — all write unified HardStopSnapshot v1).
+          Distinct from exit 4 (S5 nested-autonomy aborted_nested).
 
     Staleness gate (T20) is OUT-OF-LOOP for v0.8.1 — operator runs
     `flow doctor <slug>` manually before invoking --auto-execute.
