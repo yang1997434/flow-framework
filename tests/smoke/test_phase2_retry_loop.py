@@ -415,7 +415,7 @@ class TestCmdAutoExecuteUsesRetryLoop(unittest.TestCase):
 
             fo.GateRunner.run_phase2 = _trapped_run_phase2  # type: ignore
             try:
-                rc = _phase2_dispatch(
+                rc, _, _ = _phase2_dispatch(
                     slug="t3-1-wireup",
                     task_dir=task_dir,
                     contract=contract,
@@ -486,7 +486,7 @@ class TestCmdAutoExecuteUsesRetryLoop(unittest.TestCase):
             notifier = _SpyNotifier()
             contract = self._make_contract()
 
-            rc = _phase2_dispatch(
+            rc, _, _ = _phase2_dispatch(
                 slug="t3-1-terminal",
                 task_dir=task_dir,
                 contract=contract,
@@ -715,7 +715,7 @@ class TestT61LastHaltedGateInSnapshot(unittest.TestCase):
             notifier = _SpyNotifier()
             from flow_orchestrator import _phase2_dispatch as _disp
             contract = TestCmdAutoExecuteUsesRetryLoop()._make_contract()
-            rc = _disp(
+            rc, _, _ = _disp(
                 slug="t61-gate-context",
                 task_dir=task_dir,
                 contract=contract,
@@ -825,7 +825,7 @@ class TestT821Phase2DispatchParkReturnsRc5(unittest.TestCase):
 
             fo._resolve_afk_monitor = _patched_resolve_afk  # type: ignore
             try:
-                rc = _phase2_dispatch(
+                rc, _, _ = _phase2_dispatch(
                     slug="t62-park",
                     task_dir=task_dir,
                     contract=self._make_contract(),
@@ -881,7 +881,10 @@ class TestT821CmdAutoExecuteHonorsParkRc5(unittest.TestCase):
         orig_phase2 = fo._phase2_dispatch
 
         def _fake_phase2(**_kw):
-            return PARKED_RECOVERABLE
+            # v0.8.3 P0.1 — _phase2_dispatch return signature is now
+            # (rc, winner_ctx, winner_facts); park path returns
+            # (rc=5, None, None).
+            return PARKED_RECOVERABLE, None, None
 
         # Monkeypatch MergeRunner so any accidental merge attempt is
         # captured as a test failure (D-class regression detector).
@@ -1110,7 +1113,10 @@ class TestT821CmdAutoExecuteHonorsParkRc5(unittest.TestCase):
                        lambda **kw: SimpleNamespace(
                            fire_block=lambda **k: None,
                        ))
-                _patch(fo, "_phase2_dispatch", lambda **_kw: PARKED_RECOVERABLE)
+                _patch(
+                    fo, "_phase2_dispatch",
+                    lambda **_kw: (PARKED_RECOVERABLE, None, None),
+                )
 
                 with contextlib.redirect_stderr(buf):
                     rc = fo._cmd_auto_execute("t62-park-msg")

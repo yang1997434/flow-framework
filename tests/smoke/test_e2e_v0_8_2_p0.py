@@ -433,7 +433,7 @@ class TestE2EKClassProhibitionInImplementerPrompt(unittest.TestCase):
                 )
 
             notifier = _SpyNotifier()
-            rc = _phase2_dispatch(
+            rc, _, _ = _phase2_dispatch(
                 slug="e2e-kclass",
                 task_dir=task_dir,
                 contract=_make_contract(),
@@ -521,7 +521,7 @@ class TestE2EReviewerFeedbackRedactedBeforeImplementer(unittest.TestCase):
                 )
 
             notifier = _SpyNotifier()
-            rc = _phase2_dispatch(
+            rc, _, _ = _phase2_dispatch(
                 slug="e2e-redact",
                 task_dir=task_dir,
                 contract=_make_contract(),
@@ -649,7 +649,7 @@ class TestE2EPassPathShortCircuits(unittest.TestCase):
                     )
 
                 notifier = _SpyNotifier()
-                rc = _phase2_dispatch(
+                rc, _, _ = _phase2_dispatch(
                     slug="e2e-pass-b",
                     task_dir=task_dir2,
                     contract=_make_contract(),
