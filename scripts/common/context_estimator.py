@@ -297,16 +297,23 @@ def _read_settings_env_var(env_key: str):
 # v0.8.2 T1 — budget slack helper.
 #
 # Pure stateless function used by `budget_counter` (and any caller that
-# wants the same 90 / 100 trip-wire policy) to classify a usage value
+# wants the same 80 / 100 trip-wire policy) to classify a usage value
 # against a limit. Lives here so the estimator's ±20 % coarse warning
 # (see module docstring) and the slack policy live in the same file —
 # changing one without the other should fail review.
+#
+# T6.1 P2.2 — warn at 80 % (was 90 %). The estimator self-declares
+# ±20 % coarseness; with 20 % undercounting, an "85 % used" estimate
+# could already be at 102 % real → past hard limit before any warning.
+# 80 % gives operators ~20 % headroom matching that error band.
 # ---------------------------------------------------------------------------
 def slack_state(used: float, limit: float) -> Literal["ok", "warn", "hit"]:
     """Classify `used` vs `limit` into an `ok`/`warn`/`hit` band.
 
     - ``hit`` when ``used >= 1.0 * limit``
-    - ``warn`` when ``used >= 0.9 * limit`` (but not yet hit)
+    - ``warn`` when ``used >= 0.8 * limit`` (but not yet hit). The 80 %
+      threshold gives ~20 % headroom for estimator coarseness — see
+      module docstring §accuracy.
     - ``ok`` otherwise
 
     A non-positive `limit` is treated as an unset/unbounded limit and
@@ -317,6 +324,6 @@ def slack_state(used: float, limit: float) -> Literal["ok", "warn", "hit"]:
         return "ok"
     if used >= 1.0 * limit:
         return "hit"
-    if used >= 0.9 * limit:
+    if used >= 0.8 * limit:
         return "warn"
     return "ok"

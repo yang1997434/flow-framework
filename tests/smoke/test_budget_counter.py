@@ -127,13 +127,19 @@ class TestFiveCounters(unittest.TestCase):
 
 
 class TestSlackHelper(unittest.TestCase):
-    """R2.3 — slack_state at 90% / 100% boundaries."""
+    """R2.3 — slack_state at 80% / 100% boundaries.
+
+    T6.1 P2.2: warn threshold lowered from 90% to 80% to give 20%
+    headroom matching the context_estimator's self-declared ±20%
+    coarseness. A "85% used" estimate could already be at 102% real
+    if undercounted by 20%.
+    """
 
     def test_slack_state_below_warn_is_ok(self):
-        self.assertEqual(slack_state(89.0, 100.0), "ok")
+        self.assertEqual(slack_state(79.0, 100.0), "ok")
 
-    def test_slack_state_at_90_pct_is_warn(self):
-        self.assertEqual(slack_state(90.0, 100.0), "warn")
+    def test_slack_state_at_80_pct_is_warn(self):
+        self.assertEqual(slack_state(80.0, 100.0), "warn")
 
     def test_slack_state_between_warn_and_hit(self):
         self.assertEqual(slack_state(95.0, 100.0), "warn")

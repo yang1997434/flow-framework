@@ -4660,14 +4660,27 @@ def _resolve_afk_monitor(contract: Contract, start_iso: str):
 
 
 _BLINDSPOT_INDEX_LINE_RE = re.compile(
-    # Lines that look like a blindspot-class trigger header:
-    #   "A. ..." | "Class A: ..." | "[A] ..." | "(A) ..."
-    # Letters A-T (the 18-class registry). Match at line start.
+    # Lines that look like a blindspot-class trigger header. T6.1 P2.1:
+    # extended to cover the em-dash / colon / paren / hyphen variants
+    # that the dispatch_template reviewer prompt actually emits
+    # (e.g. "A — Python falsy/truthy traps"). Letters A-T (the 18-class
+    # registry). Anchored at line start so a stray "a function" body
+    # token doesn't match.
+    #
+    # Forms recognised (case-sensitive uppercase A-T):
+    #   "A. ..."            "A — ..."           "Class A — ..."
+    #   "A: ..."            "A) ..."            "Class A: ..."
+    #   "[A] ..."           "(A) ..."           "Class A) ..."
+    #                                            "Class A - ..."
     r"^\s*(?:"
-    r"[A-T]\.\s"           # "A. ..."
-    r"|Class\s+[A-T]\s*:"  # "Class A: ..."
-    r"|\[[A-T]\]\s"        # "[A] ..."
-    r"|\([A-T]\)\s"        # "(A) ..."
+    r"[A-T]\.\s"                 # "A. ..."
+    r"|[A-T]\s*[—–-]\s"          # "A — ..." | "A - ..." | "A – ..."
+    r"|[A-T]:\s"                 # "A: ..."
+    r"|[A-T]\)\s"                # "A) ..."
+    r"|Class\s+[A-T]\s*[:.\)]"   # "Class A:" | "Class A." | "Class A)"
+    r"|Class\s+[A-T]\s*[—–-]\s"  # "Class A —" | "Class A -" | "Class A –"
+    r"|\[[A-T]\]\s"              # "[A] ..."
+    r"|\([A-T]\)\s"              # "(A) ..."
     r")",
     re.MULTILINE,
 )
@@ -4729,6 +4742,13 @@ class RetrySessionState:
 
     I-class guard: a fresh instance is required per dispatch. Counters
     do NOT persist across dispatches even within the same task.
+
+    T6.1 P1.3: ``last_halted_at_gate`` and ``last_gate_details`` carry
+    the most recent reviewer-side gate failure context (set by the
+    review adapter when it returns "fail"/"rejected_with_rationale").
+    On retry_cap / codex_review_cap terminals the snapshot's ``extra``
+    field is populated with these so operator triage doesn't lose
+    which gate failed and why. Reset to None per dispatch session.
     """
     task_slug: str
     dispatch_retry_rounds: int = 0
@@ -4737,6 +4757,9 @@ class RetrySessionState:
     # Cached reviewer feedback from the previous round; consumed by the
     # next implementer dispatch as a prompt prefix (transparency rule).
     last_reviewer_feedback: Optional[str] = None
+    # T6.1 P1.3 — last halted gate context (kept for snapshot.extra).
+    last_halted_at_gate: Optional[str] = None
+    last_gate_details: Optional[dict] = None
 
 
 @dataclass
@@ -4894,9 +4917,12 @@ def dispatch_with_retry(
 
     Returns ``(outcome, snapshot)`` where:
 
-      - outcome ∈ {"pass", "budget_hit", "retry_cap", "review_cap",
-        "afk_hard_cap"}
-      - snapshot is a ``HardStopSnapshot`` for any non-pass outcome,
+      - outcome ∈ {"pass", "afk_idle_park", "afk_aborted",
+        "afk_hard_cap", "budget_hit", "retry_cap", "review_cap"}
+      - snapshot is a ``HardStopSnapshot`` for any non-pass,
+        non-park outcome (T6.1 P1.1: ``afk_idle_park`` is RECOVERABLE
+        — no snapshot, no notifier, rc=0; caller stays parked
+        outside the loop awaiting next activity / hard cap),
         or ``None`` for "pass".
 
     State machine (B-class):
@@ -4921,16 +4947,36 @@ def dispatch_with_retry(
             snap = afk.to_snapshot(state.task_slug, now, reason="hard_cap")
             return "afk_hard_cap", snap
         if afk_state == "timeout":
-            # mode='abort' -> snapshot; mode='wait' -> None (parked).
-            # In production wait-mode parking, the caller stays in this
-            # function awaiting the next activity tick. For the retry-
-            # loop deterministic path: return abort snapshot if we got
-            # one; otherwise treat as no-op continue.
-            snap = afk.to_snapshot(
-                state.task_slug, now, reason="timeout"
-            )
-            if snap is not None:
-                return "afk_hard_cap", snap
+            # T6.1 P1.1 — three distinct outcomes:
+            #   - mode='wait'  + idle timeout     -> "afk_idle_park"
+            #     (RECOVERABLE: no snapshot, rc=0, no notifier; caller
+            #     park hand-off lives outside the loop. The deterministic
+            #     test path returns immediately so the loop CANNOT
+            #     fall through into another impl/review cycle).
+            #   - mode='abort' + idle timeout     -> "afk_aborted"
+            #     (TERMINAL: snapshot, rc=3, notifier).
+            #   - any mode     + 24h hard cap     -> "afk_hard_cap"
+            #     handled in the branch above.
+            if afk.mode == "wait":
+                return "afk_idle_park", None
+            # abort mode: must produce a snapshot (per AfkMonitor
+            # contract: mode='abort'+timeout -> non-None).
+            snap = afk.to_snapshot(state.task_slug, now, reason="timeout")
+            return "afk_aborted", snap
+
+        # ── T6.1 P1.2 — tick active_wallclock_minutes from clock ──
+        # The loop never auto-advances this counter in production
+        # (impl deltas only carry tokens / cost). Without an explicit
+        # tick the budget never trips. Source-of-truth is
+        # AfkMonitor's PausedClock; convert seconds → minutes.
+        if "active_wallclock_minutes" in budget:
+            try:
+                budget["active_wallclock_minutes"].value = (
+                    afk.clock.active_seconds(now) / 60.0
+                )
+            except (AttributeError, ValueError):
+                # Test fakes may inject a stripped budget shape; skip.
+                pass
 
         # ── Pre-tick: budget gates (any tripped -> terminal) ──────
         tripped = _first_tripped_counter(budget)
@@ -4941,18 +4987,30 @@ def dispatch_with_retry(
             return "budget_hit", snap
 
         # ── Pre-tick: round caps ──────────────────────────────────
+        # T6.1 P1.3 — surface the last halted gate name + details into
+        # the snapshot.extra so operator triage doesn't degrade to a
+        # bare "phase2_retry_cap". The state attrs are populated by
+        # the review adapter when it returns a non-pass verdict.
         if state.dispatch_retry_rounds >= config.max_dispatch_retry_rounds:
             now = now_iso_fn()
+            extra = {"max": config.max_dispatch_retry_rounds}
+            if state.last_halted_at_gate is not None:
+                extra["last_halted_at_gate"] = state.last_halted_at_gate
+            if state.last_gate_details is not None:
+                extra["last_gate_details"] = state.last_gate_details
             snap = _build_round_cap_snapshot(
-                "retry_cap", state.task_slug, now,
-                extra={"max": config.max_dispatch_retry_rounds},
+                "retry_cap", state.task_slug, now, extra=extra,
             )
             return "retry_cap", snap
         if state.codex_review_rounds >= config.max_codex_review_rounds:
             now = now_iso_fn()
+            extra = {"max": config.max_codex_review_rounds}
+            if state.last_halted_at_gate is not None:
+                extra["last_halted_at_gate"] = state.last_halted_at_gate
+            if state.last_gate_details is not None:
+                extra["last_gate_details"] = state.last_gate_details
             snap = _build_round_cap_snapshot(
-                "codex_review_cap", state.task_slug, now,
-                extra={"max": config.max_codex_review_rounds},
+                "codex_review_cap", state.task_slug, now, extra=extra,
             )
             return "review_cap", snap
 
@@ -5208,9 +5266,14 @@ def _phase2_dispatch(
             if verdict.status == "pass":
                 return "pass"
             # Cache reviewer feedback so the next implementer round
-            # gets it as prompt prefix (transparency rule).
+            # gets it as prompt prefix (transparency rule). T6.1 P1.3:
+            # ALSO cache the gate name + details on state so the
+            # round-cap snapshot can surface them in extra (operator
+            # triage no longer degrades to bare "phase2_retry_cap").
             gr = verdict.gate_result
             details = (gr.details if gr is not None else None) or {}
+            state.last_halted_at_gate = verdict.halted_at_gate
+            state.last_gate_details = dict(details) if details else {}
             state.last_reviewer_feedback = (
                 f"phase 2 halted at {verdict.halted_at_gate}: "
                 f"{details}"
@@ -5235,6 +5298,13 @@ def _phase2_dispatch(
     if outcome == "pass":
         return 0
 
+    # T6.1 P1.1 — wait-mode AFK idle park is RECOVERABLE: no snapshot,
+    # no notifier, rc=0 (caller's outer driver re-enters when activity
+    # resumes or the 24h hard cap fires; the loop's job is to NOT keep
+    # dispatching while parked).
+    if outcome == "afk_idle_park":
+        return 0
+
     # ── Non-pass terminal: persist snapshot + fire block ───────────
     if snap is not None:
         snap_path = task_dir / "hard-stop.json"
@@ -5250,6 +5320,7 @@ def _phase2_dispatch(
         "retry_cap": "phase2_retry_cap",
         "review_cap": "phase2_review_cap",
         "afk_hard_cap": "phase2_afk_hard_cap",
+        "afk_aborted": "phase2_afk_aborted",
     }.get(outcome, "phase2_halted")
     issue_id = (
         snap.counter_name
@@ -5259,6 +5330,14 @@ def _phase2_dispatch(
     why = f"phase 2 retry-loop terminal: {outcome}"
     if snap is not None and snap.value is not None and snap.limit is not None:
         why += f" ({snap.counter_name}={snap.value}/{snap.limit})"
+    # T6.1 P1.3 — surface last halted gate context in the operator
+    # message for retry_cap / review_cap (the snapshot.extra carries
+    # the same — this string makes it visible without parsing JSON).
+    if snap is not None and snap.extra:
+        gate = snap.extra.get("last_halted_at_gate")
+        if gate:
+            details = snap.extra.get("last_gate_details") or {}
+            why += f" (last halted at gate={gate}: {details})"
     notifier.fire_block(
         block_type=block_type,
         phase=2,
