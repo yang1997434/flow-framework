@@ -44,7 +44,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 # Model context window sizes (tokens). Update as new models ship.
 MODEL_LIMITS: dict[str, int] = {
@@ -291,3 +291,32 @@ def _read_settings_env_var(env_key: str):
     if env_block is None:
         return None
     return env_block.get(env_key)
+
+
+# ---------------------------------------------------------------------------
+# v0.8.2 T1 — budget slack helper.
+#
+# Pure stateless function used by `budget_counter` (and any caller that
+# wants the same 90 / 100 trip-wire policy) to classify a usage value
+# against a limit. Lives here so the estimator's ±20 % coarse warning
+# (see module docstring) and the slack policy live in the same file —
+# changing one without the other should fail review.
+# ---------------------------------------------------------------------------
+def slack_state(used: float, limit: float) -> Literal["ok", "warn", "hit"]:
+    """Classify `used` vs `limit` into an `ok`/`warn`/`hit` band.
+
+    - ``hit`` when ``used >= 1.0 * limit``
+    - ``warn`` when ``used >= 0.9 * limit`` (but not yet hit)
+    - ``ok`` otherwise
+
+    A non-positive `limit` is treated as an unset/unbounded limit and
+    always returns ``"ok"`` — callers wanting a stricter policy must
+    validate before calling.
+    """
+    if limit <= 0:
+        return "ok"
+    if used >= 1.0 * limit:
+        return "hit"
+    if used >= 0.9 * limit:
+        return "warn"
+    return "ok"
