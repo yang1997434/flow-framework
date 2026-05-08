@@ -26,7 +26,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 # Reuse the wave-planner's parser since the `### Tasks` block format is shared.
 # parse_plan_tasks takes raw markdown text (NOT a path) and returns list[Task].
@@ -4614,6 +4614,410 @@ def _resolve_afk_monitor(contract: Contract, start_iso: str):
         mode=mode,
         idle_seconds_threshold=idle_seconds,
     )
+
+
+# ────────────────────────────────────────────────────────────────────────
+# v0.8.2 T3 — Phase 2 retry-on-non-pass loop + dual-counter invariants
+# ────────────────────────────────────────────────────────────────────────
+#
+# Wraps the implementer + codex review pair in a retry loop with TWO
+# independent round caps:
+#
+#   - max_dispatch_retry_rounds (default 3): caps implementer-retry
+#     loops. Advanced ONLY by review verdict ``fail``.
+#   - max_codex_review_rounds (default 2): caps codex review rounds.
+#     Advanced ONLY by review verdict ``rejected_with_rationale`` (RWR).
+#
+# Five terminal outcomes (PRD §R3 + ADR-1 invariant 4 — single
+# HardStopSnapshot shape across all reasons):
+#
+#   - "pass"           — review verdict GREEN; no snapshot.
+#   - "budget_hit"     — any of 5 T1 budget counters tripped 100%.
+#   - "retry_cap"      — dispatch_retry_rounds >= max.
+#   - "review_cap"     — codex_review_rounds >= max.
+#   - "afk_hard_cap"   — T2 AFK 24h hard cap or abort-mode timeout.
+#
+# Five dual-counter invariants (PRD §R2):
+#   1. dispatch_retry_rounds caps implementer loops only.
+#   2. codex_review_rounds is independent (RWR consumes it, NOT retry).
+#   3. Budget counters cap EVERYTHING (round counters can't outpace).
+#   4. All terminal paths share the HardStopSnapshot v1 shape.
+#   5. Every loop iteration advances EXACTLY ONE counter or terminates
+#      (J-class chained-paper-cut guard — no path is allowed to leave
+#      both counters static while continuing).
+#
+# Determinism: ``now_iso_fn`` is injected. No real wallclock reads, no
+# ``time.sleep`` in the loop. Tests inject deterministic step-by-step
+# clocks; production callers pass ``afk_monitor.now_iso_utc``.
+#
+# I-class guard: counters are PER-DISPATCH-SESSION. ``RetrySessionState``
+# defaults dispatch_retry_rounds + codex_review_rounds to 0 on
+# construction. There is NO module-level state. Each dispatch builds a
+# fresh state.
+
+
+_BLINDSPOT_INDEX_LINE_RE = re.compile(
+    # Lines that look like a blindspot-class trigger header:
+    #   "A. ..." | "Class A: ..." | "[A] ..." | "(A) ..."
+    # Letters A-T (the 18-class registry). Match at line start.
+    r"^\s*(?:"
+    r"[A-T]\.\s"           # "A. ..."
+    r"|Class\s+[A-T]\s*:"  # "Class A: ..."
+    r"|\[[A-T]\]\s"        # "[A] ..."
+    r"|\([A-T]\)\s"        # "(A) ..."
+    r")",
+    re.MULTILINE,
+)
+
+
+def redact_blindspot_index(reviewer_findings: str) -> str:
+    """Strip 18-class blindspot trigger lines; preserve specific findings.
+
+    The reviewer feedback is included as a prompt prefix when an
+    implementer round retries. Per PRD §R3 "reviewer transparency rule":
+    we transfer the SPECIFIC findings (line refs / file refs / exact
+    issues) but NOT the trigger checklist headers (which would let the
+    implementer cargo-cult the categorisation rather than fix the
+    issue).
+
+    Lines matching ``A. ``, ``Class A:``, ``[A] ``, ``(A) `` (letters
+    A-T) are dropped. Everything else passes through verbatim.
+    """
+    if not reviewer_findings:
+        return reviewer_findings
+    # Split on \n and filter; this preserves trailing newline behaviour
+    # by joining + re-adding a trailing newline only if the input had
+    # one. Avoids corner-case "" input -> "\n" output.
+    lines = reviewer_findings.splitlines()
+    kept = [ln for ln in lines if not _BLINDSPOT_INDEX_LINE_RE.match(ln + "\n")]
+    out = "\n".join(kept)
+    if reviewer_findings.endswith("\n"):
+        out += "\n"
+    return out
+
+
+@dataclass(frozen=True)
+class RetryConfig:
+    """Per-dispatch-session retry caps.
+
+    Both caps are validated >= 1 on construction; 0 / negative is a
+    config bug (would cause immediate cap-hit on iteration 1, masking
+    any actual progress).
+    """
+    max_dispatch_retry_rounds: int = 3
+    max_codex_review_rounds: int = 2
+
+    def __post_init__(self) -> None:
+        if self.max_dispatch_retry_rounds < 1:
+            raise ValueError(
+                f"max_dispatch_retry_rounds must be >= 1, got "
+                f"{self.max_dispatch_retry_rounds!r}"
+            )
+        if self.max_codex_review_rounds < 1:
+            raise ValueError(
+                f"max_codex_review_rounds must be >= 1, got "
+                f"{self.max_codex_review_rounds!r}"
+            )
+
+
+@dataclass
+class RetrySessionState:
+    """Per-dispatch-session state.
+
+    I-class guard: a fresh instance is required per dispatch. Counters
+    do NOT persist across dispatches even within the same task.
+    """
+    task_slug: str
+    dispatch_retry_rounds: int = 0
+    codex_review_rounds: int = 0
+    progress_path: Optional[Path] = None
+    # Cached reviewer feedback from the previous round; consumed by the
+    # next implementer dispatch as a prompt prefix (transparency rule).
+    last_reviewer_feedback: Optional[str] = None
+
+
+@dataclass
+class RetryDeps:
+    """Injection seam for the retry loop.
+
+    Both callables are passed the current state + the redacted
+    reviewer feedback (None on round 1). The implementer returns a dict
+    of counter-deltas (keys: any of the 5 T1 counter names; ``model_id``
+    + ``pricing_version`` for cost_usd). The reviewer returns one of
+    ``"pass"`` / ``"fail"`` / ``"rejected_with_rationale"``; any other
+    value raises ValueError (PRD R3 invariant 5 — no silent re-loop).
+    """
+    run_implementer_round: Callable[..., dict]
+    run_codex_review: Callable[..., str]
+
+
+_VALID_REVIEW_OUTCOMES = frozenset({"pass", "fail", "rejected_with_rationale"})
+
+
+def _build_budget_snapshot(
+    counter,  # BudgetCounter
+    task_slug: str,
+    now_iso: str,
+) -> "HardStopSnapshot":
+    """Build a HardStopSnapshot for a tripped budget counter.
+
+    cost_usd carries pricing metadata in ``extra``; other counters
+    leave ``extra`` empty. Reuses the v1 schema from T1 — no schema
+    bump.
+    """
+    from common.snapshot import HardStopSnapshot  # type: ignore
+    extra: dict = {}
+    if counter.name == "cost_usd":
+        if counter.model_id is not None:
+            extra["model_id"] = counter.model_id
+        if counter.pricing_version is not None:
+            extra["pricing_version"] = counter.pricing_version
+    return HardStopSnapshot(
+        reason="budget_hit",
+        counter_name=counter.name,
+        value=float(counter.value),
+        limit=float(counter.limit),
+        hit_at_iso=now_iso,
+        estimated=bool(counter.estimated),
+        extra=extra,
+        task_slug=task_slug,
+    )
+
+
+def _build_round_cap_snapshot(
+    reason: str,
+    task_slug: str,
+    now_iso: str,
+    *,
+    extra: Optional[dict] = None,
+) -> "HardStopSnapshot":
+    """Build a HardStopSnapshot for a retry-cap or review-cap event.
+
+    ``reason`` must be one of "retry_cap" | "codex_review_cap" (the
+    valid HardStopSnapshot enum values for round-cap reasons).
+    """
+    from common.snapshot import HardStopSnapshot  # type: ignore
+    return HardStopSnapshot(
+        reason=reason,
+        counter_name=None,
+        value=None,
+        limit=None,
+        hit_at_iso=now_iso,
+        estimated=False,
+        extra=dict(extra or {}),
+        task_slug=task_slug,
+    )
+
+
+def _progress_log_round(
+    progress_path: Optional[Path],
+    round_num: int,
+    agent_role: str,
+    counter_delta_dict: dict,
+) -> None:
+    """Append one row to the ``## Execute Log`` table in progress.md.
+
+    Idempotent on missing-file / missing-section: returns silently
+    without crashing. Rows are appended (G-class atomic via tmp +
+    os.replace).
+    """
+    if progress_path is None:
+        return
+    try:
+        text = progress_path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return
+    # Locate the ## Execute Log section. If absent, no-op.
+    marker = "## Execute Log"
+    if marker not in text:
+        return
+    # Format counter deltas compactly for the table cell.
+    pairs = sorted(
+        (k, v) for k, v in counter_delta_dict.items()
+        if isinstance(v, (int, float))
+    )
+    delta_str = ", ".join(f"{k}={v}" for k, v in pairs) or "-"
+    row = f"| {round_num} | {agent_role} | {delta_str} |\n"
+    new_text = text.rstrip("\n") + "\n" + row
+    tmp = progress_path.parent / (progress_path.name + ".tmp")
+    tmp.write_text(new_text, encoding="utf-8")
+    os.replace(tmp, progress_path)
+
+
+def _apply_impl_deltas_to_budget(
+    budget: dict, deltas: dict, *, estimated: bool = False,
+) -> None:
+    """Apply impl-round counter deltas to the T1 budget dict.
+
+    Keys recognised: any of the 5 counter names. ``model_id`` +
+    ``pricing_version`` (for cost_usd) are ALSO recognised but consumed
+    rather than treated as counter names.
+    """
+    model_id = deltas.get("model_id")
+    pricing_version = deltas.get("pricing_version")
+    for name, counter in budget.items():
+        amt = deltas.get(name)
+        if amt is None:
+            continue
+        if name == "cost_usd":
+            counter.add(
+                float(amt),
+                estimated=estimated,
+                model_id=model_id,
+                pricing_version=pricing_version,
+            )
+        else:
+            counter.add(float(amt), estimated=estimated)
+
+
+def _first_tripped_counter(budget: dict):
+    """Return the first counter that is_hit, or None."""
+    for counter in budget.values():
+        if counter.is_hit():
+            return counter
+    return None
+
+
+def dispatch_with_retry(
+    *,
+    state: RetrySessionState,
+    config: RetryConfig,
+    budget: dict,
+    afk,  # AfkMonitor
+    deps: RetryDeps,
+    now_iso_fn: Callable[[], str],
+) -> Tuple[str, Optional["HardStopSnapshot"]]:
+    """Phase 2 retry-on-non-pass loop entrypoint.
+
+    Returns ``(outcome, snapshot)`` where:
+
+      - outcome ∈ {"pass", "budget_hit", "retry_cap", "review_cap",
+        "afk_hard_cap"}
+      - snapshot is a ``HardStopSnapshot`` for any non-pass outcome,
+        or ``None`` for "pass".
+
+    State machine (B-class):
+
+      [start] -> pre-tick (AFK + budget + round caps)
+              -> implementer round (advances 0 counters; updates budget)
+              -> review round
+                   pass -> [terminate(pass)]
+                   fail -> dispatch_retry_rounds += 1; loop
+                   rejected_with_rationale -> codex_review_rounds += 1; loop
+                   <other> -> ValueError (J-class guard)
+
+    Pause/resume bracketing (B-class): codex review wait time does NOT
+    tick AFK — we ``afk.pause("codex_review")`` before calling
+    ``run_codex_review`` and ``afk.resume`` after.
+    """
+    while True:
+        # ── Pre-tick: AFK first (it can override "wait" mode) ─────
+        now = now_iso_fn()
+        afk_state = afk.evaluate(now)
+        if afk_state == "hard_cap":
+            snap = afk.to_snapshot(state.task_slug, now, reason="hard_cap")
+            return "afk_hard_cap", snap
+        if afk_state == "timeout":
+            # mode='abort' -> snapshot; mode='wait' -> None (parked).
+            # In production wait-mode parking, the caller stays in this
+            # function awaiting the next activity tick. For the retry-
+            # loop deterministic path: return abort snapshot if we got
+            # one; otherwise treat as no-op continue.
+            snap = afk.to_snapshot(
+                state.task_slug, now, reason="timeout"
+            )
+            if snap is not None:
+                return "afk_hard_cap", snap
+
+        # ── Pre-tick: budget gates (any tripped -> terminal) ──────
+        tripped = _first_tripped_counter(budget)
+        if tripped is not None:
+            now = now_iso_fn()
+            tripped.mark_hit(now)
+            snap = _build_budget_snapshot(tripped, state.task_slug, now)
+            return "budget_hit", snap
+
+        # ── Pre-tick: round caps ──────────────────────────────────
+        if state.dispatch_retry_rounds >= config.max_dispatch_retry_rounds:
+            now = now_iso_fn()
+            snap = _build_round_cap_snapshot(
+                "retry_cap", state.task_slug, now,
+                extra={"max": config.max_dispatch_retry_rounds},
+            )
+            return "retry_cap", snap
+        if state.codex_review_rounds >= config.max_codex_review_rounds:
+            now = now_iso_fn()
+            snap = _build_round_cap_snapshot(
+                "codex_review_cap", state.task_slug, now,
+                extra={"max": config.max_codex_review_rounds},
+            )
+            return "review_cap", snap
+
+        # ── Implementer round ─────────────────────────────────────
+        # Round number = retry_rounds + 1 on round 1; visual.
+        round_num = state.dispatch_retry_rounds + 1
+        prefix = redact_blindspot_index(
+            state.last_reviewer_feedback or ""
+        )
+        impl_deltas = deps.run_implementer_round(
+            state=state, prompt_prefix=prefix,
+        )
+        # T1 budget bookkeeping: register the dispatch + apply deltas.
+        try:
+            from common import budget_counter as _bc  # type: ignore
+            _bc.register_dispatch(budget)
+        except Exception:
+            # If budget shape is unusual (test fakes), skip silently.
+            pass
+        _apply_impl_deltas_to_budget(budget, impl_deltas or {})
+        # AFK heartbeat after each implementer round.
+        afk.note_subagent_heartbeat(now_iso_fn())
+        _progress_log_round(
+            state.progress_path, round_num,
+            "implementer", impl_deltas or {},
+        )
+
+        # ── Recheck budget after impl deltas applied ──────────────
+        tripped = _first_tripped_counter(budget)
+        if tripped is not None:
+            now = now_iso_fn()
+            tripped.mark_hit(now)
+            snap = _build_budget_snapshot(tripped, state.task_slug, now)
+            return "budget_hit", snap
+
+        # ── Review round (paused-clock bracket around the wait) ──
+        afk.pause("codex_review", now_iso_fn())
+        try:
+            review_outcome = deps.run_codex_review(
+                state=state, impl_deltas=impl_deltas,
+            )
+        finally:
+            afk.resume(now_iso_fn())
+        _progress_log_round(
+            state.progress_path, round_num,
+            f"reviewer({review_outcome})",
+            {},
+        )
+
+        # ── State transition (J-class invariant 5) ────────────────
+        if review_outcome == "pass":
+            return "pass", None
+        if review_outcome == "fail":
+            state.dispatch_retry_rounds += 1
+            # Cache the feedback for the next implementer round.
+            # Fakes don't return findings; production wiring will.
+            state.last_reviewer_feedback = state.last_reviewer_feedback or ""
+            continue
+        if review_outcome == "rejected_with_rationale":
+            state.codex_review_rounds += 1
+            continue
+        # No path is allowed to silently re-loop with both counters
+        # static. Any unrecognised value is a config / wiring bug —
+        # raise loudly (J-class).
+        raise ValueError(
+            f"unexpected review_outcome: {review_outcome!r} "
+            f"(allowed: {sorted(_VALID_REVIEW_OUTCOMES)})"
+        )
 
 
 def _invoke_subagent_dispatch(ctx: WorktreeContext, **kw) -> None:

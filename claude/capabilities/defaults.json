@@ -207,7 +207,7 @@
     "_v0_8_phase2_additions": "Phase 2 capabilities added in v0.8.0 (autonomy orchestrator)",
     "autonomy_orchestrator": {
       "default": "flow:flow-phase2-execute",
-      "description": "Phase 2 — autonomous orchestrator (v0.8.1 promoted: worktree-per-task dispatch + 8-gate runner + Notifier + crash recovery). v0.8.1 ships dispatch SHIM infrastructure only; production subagent invocation requires operator to export FLOW_SUBAGENT_DISPATCH_CMD env var (no built-in default — the SKILL handle is not a shell command and would fail rc=127 if executed). Production wire-up of the Claude CLI invocation template is v0.8.2 scope.",
+      "description": "Phase 2 — autonomous orchestrator (v0.8.2 active: worktree-per-task dispatch + 8-gate runner + Notifier + crash recovery + retry-on-non-pass loop with dual-counter caps and AFK/budget enforcement). Production subagent invocation requires operator to export FLOW_SUBAGENT_DISPATCH_CMD env var (no built-in default — the SKILL handle is not a shell command and would fail rc=127 if executed). v0.8.2 adds the runtime retry loop (`max_dispatch_retry_rounds=3`, `max_codex_review_rounds=2`) and the single HardStopSnapshot terminal path shared across budget_hit / retry_cap / codex_review_cap / afk_timeout reasons.",
       "skip_if_not_available": false,
       "v0_8_1_promoted": true,
       "backed_by": "scripts/flow_orchestrator.py:auto_dispatch_task",

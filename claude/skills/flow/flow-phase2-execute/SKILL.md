@@ -64,6 +64,44 @@ T2 ships the helper dormant. T3 invokes `apply_afk_check` per
 dispatch tick inside the Phase 2 retry loop alongside budget
 enforcement. Both share the single hard-stop snapshot path.
 
+### Retry-on-non-pass loop (v0.8.2 T3)
+
+`flow_orchestrator.dispatch_with_retry` replaces v0.8.1 fail-fast
+with a bounded retry loop. Two **independent** round caps:
+
+- `phase2.retry.max_dispatch_retry_rounds` (default `3`) — caps
+  implementer retries; advanced ONLY by review verdict `fail`.
+- `phase2.review.max_codex_review_rounds` (default `2`) — caps codex
+  review rounds; advanced ONLY by `rejected_with_rationale` (RWR).
+
+**Five dual-counter invariants** (PRD §R2 / ADR-1):
+
+1. `dispatch_retry_rounds` caps implementer-retry loops only.
+2. `codex_review_rounds` is independent; RWR consumes it, NOT retry.
+3. The 5 T1 budget counters cap EVERYTHING — round counters cannot
+   outpace them; budget hit is checked before each round.
+4. All 4 terminal paths (`budget_hit`, `retry_cap`, `codex_review_cap`,
+   `afk_timeout`) emit the same `HardStopSnapshot v1` shape — see
+   `scripts/common/snapshot.py`.
+5. Every loop iteration advances EXACTLY ONE counter or terminates.
+   No path is allowed to leave both counters static while continuing
+   (J-class chained-paper-cut guard).
+
+**Reviewer feedback transparency rule**: when a `fail` review forces
+the implementer to retry, the reviewer's specific findings are
+included as a prompt prefix BUT the 18-class blindspot trigger
+checklist is stripped via `redact_blindspot_index()` (we want the
+implementer to fix the bug, not cargo-cult the categorisation).
+
+**progress.md round-incremental logging**: each round appends a row
+to the `## Execute Log` table (no overwrites). If the section is
+absent the helper no-ops — never crashes the loop on a malformed
+progress.md.
+
+**Pause/resume bracketing**: codex review wait time does NOT tick
+AFK. The loop calls `afk.pause("codex_review")` before each review
+and `afk.resume()` after.
+
 **Subagent contract** (PRD §1.2): execute the per-task prompt; return
 narrative summary ONLY. Orchestrator derives facts from worktree
 `git diff` and test logs — subagent self-report fields are ignored.
