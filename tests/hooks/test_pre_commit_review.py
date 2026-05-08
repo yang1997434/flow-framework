@@ -271,6 +271,32 @@ class PreCommitReviewHook(unittest.TestCase):
         out, _, _ = self._run_hook("git commit -m foo README")
         self._assert_block(out, "white-list")
 
+    def test_20a_git_dash_C_path_commit_BLOCKS(self):
+        """v0.8.3 P0.4 fix — `git -C /path commit` must BLOCK (was bypassing)."""
+        self._stage_change()
+        self._write_marker()
+        out, _, _ = self._run_hook("git -C /tmp/x commit -m foo")
+        self._assert_block(out, "global options before")
+
+    def test_20b_git_git_dir_commit_BLOCKS(self):
+        """v0.8.3 P0.4 fix — `git --git-dir=.git commit` must BLOCK."""
+        self._stage_change()
+        self._write_marker()
+        out, _, _ = self._run_hook("git --git-dir=.git commit -m foo")
+        self._assert_block(out, "global options before")
+
+    def test_20c_git_work_tree_commit_BLOCKS(self):
+        """v0.8.3 P0.4 fix — `git --work-tree=. commit` must BLOCK."""
+        self._stage_change()
+        self._write_marker()
+        out, _, _ = self._run_hook("git --work-tree=. commit -m foo")
+        self._assert_block(out, "global options before")
+
+    def test_20d_git_status_with_dash_C_PASSES(self):
+        """v0.8.3 P0.4 — non-commit git with -C still passes (commit not in argv[2:])."""
+        out, _, _ = self._run_hook("git -C /tmp/x status")
+        self._assert_pass(out)
+
     def test_19_unlink_failure_BLOCKS(self):
         """When marker unlink fails (e.g. read-only parent dir), hook must BLOCK
         to preserve single-use semantics rather than silently PASS."""

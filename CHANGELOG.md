@@ -1,6 +1,21 @@
 # Changelog
 
-## [0.8.3] - 2026-05-08 (P0.0 hook fix)
+## [0.8.3] - 2026-05-08 (P0.0 hook fix + P0.4 + P0.5 sediment follow-ups)
+
+### Fixed (P0.4 — sediment follow-up)
+
+- **Hook `git -C /path commit` bypass** discovered in P0.0 sediment notes:
+  argv[1]='-C' caused 5c branch to PASS without checking that `commit`
+  appears later in argv. Forms newly BLOCKed (4 new pytest cases):
+  - `git -C /path commit -m foo`
+  - `git --git-dir=.git commit -m foo`
+  - `git --work-tree=. commit -m foo`
+  - `git -c k=v commit -m foo` (already caught by `-c` check; now also by
+    earlier `commit in argv[2:]` check)
+- **Dotfiles `.gitignore` (P0.5)**: added `claude/hooks/_vendor/**/__pycache__/`
+  + `*.pyc` patterns; removed 11 stray `.pyc` files accidentally committed in
+  v0.8.3 P0.0 dotfiles commit `7326607`. Also gitignores
+  `.review-passed.json` (new marker file) + `pre-commit-review.sh.bak.*`.
 
 ### Fixed
 
