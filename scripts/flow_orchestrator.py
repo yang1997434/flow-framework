@@ -720,6 +720,7 @@ def auto_dispatch_task(
     contract_hash: str,
     integration_target: str = "master",
     notifier: Optional["Notifier"] = None,  # type: ignore[name-defined]
+    prompt_prefix: str = "",
 ) -> "DispatchOutcome":
     """T10 orchestration shell + T11 manifest enforcement.
 
@@ -897,7 +898,22 @@ def auto_dispatch_task(
     # interpolate ``--task `` (empty arg). Test fixtures that set
     # ``ctx.task_id`` directly still work (kwarg None → getattr fallback)
     # but production now goes through the canonical path.
-    dispatch_fn(ctx, subagent_env=subagent_env, task_id=manifest.id)
+    #
+    # v0.8.3 P0.2: ``prompt_prefix`` (the K-class sentinel prohibition +
+    # any reviewer-feedback prefix) flows through to the shim as an
+    # explicit kwarg. Round 1 always uses ``round_num=1`` so the file
+    # transport lands at ``+r1`` (round 2+ is owned by
+    # ``_dispatch_implementer_fresh_worktree``). Default ``""`` is
+    # backward-compatible: the shim treats empty as "no prefix file" and
+    # the operator template's ``{prompt_prefix_file}`` substitutes to
+    # an empty string.
+    dispatch_fn(
+        ctx,
+        subagent_env=subagent_env,
+        task_id=manifest.id,
+        prompt_prefix=prompt_prefix,
+        round_num=1,
+    )
     # Authoritative facts come from disk, not the dispatch return value.
     facts = derive_task_facts(ctx)
 
@@ -5402,11 +5418,18 @@ def _dispatch_implementer_fresh_worktree(
     subagent_env = os.environ.copy()
     subagent_env[AUTONOMY_PARENT_PID_ENV] = str(os.getpid())
     try:
+        # v0.8.3 P0.2: forward `round_num` to the shim so the
+        # prompt_prefix file lands at `<repo_root>/.flow/.runtime/
+        # <slug>+<task_id>+r<N>/dispatch_prefix.txt`. Without this,
+        # round 2+ would clobber Round 1's `+r1` file and the operator
+        # template would `cat` round 1's prefix into the round 2
+        # prompt — defeating the round-discriminated forensic purpose.
         _invoke_subagent_dispatch(
             ctx,
             subagent_env=subagent_env,
             task_id=task_id,
             prompt_prefix=prompt_prefix,
+            round_num=round_num,
         )
     except RuntimeError as e:
         # Attach ctx to the exception so the retry-loop caller can
@@ -5968,6 +5991,21 @@ def _cmd_auto_execute(slug: str) -> int:
             return 0
         # v.action == "proceed"
 
+        # ── v0.8.3 P0.2: build the K-class sentinel prefix here ─────────
+        # AFTER ``_task_already_completed`` skip + the recovery dispatcher
+        # decided ``proceed`` (codex R2 P1#2: building the prefix on
+        # already-completed / fail-closed-interactive paths would create
+        # an unused runtime file + obscure forensic). The brief reuses
+        # ``_render_task_brief`` (the same helper Round 2+ uses) so the
+        # subagent sees identical task context across rounds.
+        round1_prefix = build_implementer_prompt(
+            task_brief=_render_task_brief(
+                task_dir=task_dir, criteria=criteria,
+            ),
+            is_first_pass=True,
+            is_doc_only=False,
+        )
+
         # ── T10 / T11: dispatch subagent + verify manifest ─────────────
         outcome = auto_dispatch_task(
             slug=slug,
@@ -5981,6 +6019,7 @@ def _cmd_auto_execute(slug: str) -> int:
             contract_hash=contract_hash,
             integration_target=integration_target,
             notifier=notifier,
+            prompt_prefix=round1_prefix,
         )
         if outcome.status == "blocked":
             print(

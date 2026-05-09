@@ -370,5 +370,380 @@ class TestSubagentDispatchShim(unittest.TestCase):
         self.assertNotIn("'", out)
 
 
+# ── v0.8.3 P0.2: prompt_prefix file-based transport ──────────────────
+#
+# These tests pin the wire-up of the K-class sentinel prohibition (and
+# any future ``prompt_prefix`` content) from
+# ``build_implementer_prompt`` through the dispatch shim into the
+# subagent prompt. The transport is a file under
+# ``<repo_root>/.flow/.runtime/<slug>+<task_id>+r<round>/dispatch_prefix.txt``
+# (NOT inside the worktree — see PRD AC §1 for the manifest_violation
+# avoidance rationale). Operator templates reference the file via the
+# new ``{prompt_prefix_file}`` placeholder; fail-closed when the
+# placeholder is missing AND the prefix is non-empty.
+
+class TestPromptPrefixWireUp(unittest.TestCase):
+    """v0.8.3 P0.2 — prompt_prefix file-based transport."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="flow-p02-shim-"))
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        # Construct a fake repo_root + worktree layout matching the
+        # production convention (`<repo_root>/.claude/worktrees/<id>/`).
+        # The shim derives `repo_root = worktree_path.parents[2]`.
+        self.repo_root = self.tmp / "repo"
+        wt_parent = self.repo_root / ".claude" / "worktrees"
+        wt_parent.mkdir(parents=True)
+        self.worktree = wt_parent / "demo+t0+abc1234"
+        self.worktree.mkdir()
+        self.ctx = _Ctx(
+            worktree_path=self.worktree, slug="demo", task_id="T0",
+        )
+        self._orig_env = os.environ.get("FLOW_SUBAGENT_DISPATCH_CMD")
+        os.environ.pop("FLOW_SUBAGENT_DISPATCH_CMD", None)
+        sys.modules.pop("flow_subagent_dispatch", None)
+
+    def tearDown(self):
+        os.environ.pop("FLOW_SUBAGENT_DISPATCH_CMD", None)
+        if self._orig_env is not None:
+            os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = self._orig_env
+
+    # ── AC §1: prefix file lands at the right path (NOT in worktree) ──
+    def test_invoke_writes_prefix_file_at_repo_root_runtime(self):
+        marker = self.tmp / "out"
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+            f"cat {{prompt_prefix_file}} > {marker.as_posix()}"
+        )
+        from flow_subagent_dispatch import invoke
+        invoke(
+            self.ctx,
+            prompt_prefix="HELLO_PREFIX_BODY",
+            round_num=1,
+        )
+        expected = (
+            self.repo_root / ".flow" / ".runtime"
+            / "demo+T0+r1" / "dispatch_prefix.txt"
+        )
+        self.assertTrue(
+            expected.is_file(),
+            f"prefix file not at {expected}; tree contents: "
+            f"{list(self.repo_root.rglob('*'))}",
+        )
+        # Critically NOT inside the worktree (would trigger
+        # manifest_violation row 4).
+        for p in self.worktree.rglob("*"):
+            self.assertNotEqual(p.name, "dispatch_prefix.txt")
+        # And `cat` round-trip wrote the same body.
+        self.assertEqual(
+            marker.read_text(encoding="utf-8"), "HELLO_PREFIX_BODY",
+        )
+
+    # ── AC §2: substitution actually replaces the placeholder ────────
+    def test_invoke_substitutes_prefix_file_placeholder(self):
+        marker = self.tmp / "subst-out"
+        # The template uses a no-op shell command + echo of the placeholder
+        # so we can inspect the substituted value without depending on
+        # `cat` reading from disk (which would mask substitution bugs
+        # behind the file actually existing).
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+            f"echo {{prompt_prefix_file}} > {marker.as_posix()}"
+        )
+        from flow_subagent_dispatch import invoke
+        invoke(self.ctx, prompt_prefix="X", round_num=1)
+        out = marker.read_text(encoding="utf-8").strip()
+        # Path is shlex.quote()-wrapped; on a path with no metachars
+        # the wrapping is a no-op (the string equals the raw path).
+        self.assertTrue(
+            out.endswith("dispatch_prefix.txt"),
+            f"substituted value did not end with dispatch_prefix.txt: {out!r}",
+        )
+        # And it's an absolute path containing /.flow/.runtime/.
+        self.assertIn("/.flow/.runtime/", out)
+        # And it points at the file we wrote.
+        path = Path(out.strip("'\""))
+        self.assertTrue(path.is_file())
+
+    # ── AC §3: fail-closed on missing placeholder + non-empty prefix ──
+    def test_invoke_raises_when_prefix_nonempty_template_lacks_placeholder(self):
+        from flow_subagent_dispatch import invoke
+
+        # Sub-assertion 1: literally absent.
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = "true"
+        with self.assertRaises(RuntimeError) as cm:
+            invoke(self.ctx, prompt_prefix="non-empty", round_num=1)
+        self.assertIn("prompt_prefix_file", str(cm.exception))
+
+        # Sub-assertion 2: appears as substring in a comment-style
+        # context (not a real format field). string.Formatter().parse()
+        # does NOT see this as a field.
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+            "echo hi  # placeholder once was {{prompt_prefix_file}}"
+        )
+        with self.assertRaises(RuntimeError):
+            invoke(self.ctx, prompt_prefix="non-empty", round_num=1)
+
+        # Sub-assertion 3: doubled braces escape — `{{prompt_prefix_file}}`
+        # produces literal `{prompt_prefix_file}` after format(); it is
+        # NOT a format field.
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+            "echo {{prompt_prefix_file}}"
+        )
+        with self.assertRaises(RuntimeError):
+            invoke(self.ctx, prompt_prefix="non-empty", round_num=1)
+
+        # Sub-assertion 4: a template whose name resembles but is not
+        # the placeholder must NOT satisfy the check.
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+            "echo {prompt_prefix_filex}"
+        )
+        with self.assertRaises((RuntimeError, KeyError)):
+            invoke(self.ctx, prompt_prefix="non-empty", round_num=1)
+
+    # ── R2 P0: shell-comment fail-closed extension (codex caught) ────
+    # Formatter().parse() sees `# {prompt_prefix_file}` as a real format
+    # field — but the subprocess shell treats `#...` as a line comment
+    # and never reads the placeholder. We add a regex pre-check that
+    # rejects this exact form (single-line and multi-line "# on first
+    # line" variants).
+    def test_invoke_raises_on_shell_comment_placeholder(self):
+        from flow_subagent_dispatch import invoke
+
+        # Single line: `true # {prompt_prefix_file}` — `#` consumes the
+        # rest of the line under shell parsing.
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+            "true # {prompt_prefix_file}"
+        )
+        with self.assertRaises(RuntimeError) as cm:
+            invoke(self.ctx, prompt_prefix="non-empty", round_num=1)
+        self.assertIn("comment", str(cm.exception).lower())
+
+        # Multi-line: comment on first line, real command on second
+        # (still a silent drop because the placeholder line never
+        # executes).
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+            "cmd # {prompt_prefix_file}\nother --slug {slug}"
+        )
+        with self.assertRaises(RuntimeError):
+            invoke(self.ctx, prompt_prefix="non-empty", round_num=1)
+
+        # Tab before `#` should also count.
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+            "true\t#\t{prompt_prefix_file}"
+        )
+        with self.assertRaises(RuntimeError):
+            invoke(self.ctx, prompt_prefix="non-empty", round_num=1)
+
+    def test_invoke_known_bypass_string_literal_subprocess(self):
+        """Operator-responsibility scope: a placeholder embedded inside
+        a subprocess string literal (e.g. ``python -c 'x="{prompt_prefix_file}"'``)
+        passes our fail-closed check. The Formatter sees a real field;
+        the heuristic doesn't recognize a shell comment; the shell
+        substitutes the path into the inner string. The subprocess
+        never `cat`s it. This is a documented bypass — the pitfall +
+        SKILL.md recommend the canonical ``$(cat {prompt_prefix_file})``
+        form. We pin it here so future readers know the scope.
+        """
+        marker = self.tmp / "string-literal-out"
+        # The python -c form keeps the placeholder as an inert string;
+        # we just write SOMETHING to the marker so the subprocess returns 0.
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+            f"python3 -c 'x = \"{{prompt_prefix_file}}\"; "
+            f"open(\"{marker.as_posix()}\", \"w\").write(\"ok\")'"
+        )
+        from flow_subagent_dispatch import invoke
+        # MUST NOT raise — bypass is the operator's responsibility.
+        invoke(self.ctx, prompt_prefix="non-empty", round_num=1)
+        self.assertTrue(marker.is_file())
+
+    # ── R3 P0: bare-form enforcement closes Formatter conv/spec bypass ──
+    # Codex R2 caught: ``Formatter().parse()`` returns the same field
+    # name for ``{prompt_prefix_file}``, ``{prompt_prefix_file!s}``, and
+    # ``{prompt_prefix_file:>10}``. Our shell-comment scanner matches
+    # the literal token only, so ``true # {prompt_prefix_file!s}``
+    # would pass the field check, evade the comment scanner, and be
+    # silently dropped at runtime. Fix: reject any non-bare form. There
+    # is no legitimate reason to apply conversion or format-spec to a
+    # quoted file path — collapsing to one canonical spelling keeps the
+    # literal-token shell-comment scanner sound.
+    def test_invoke_raises_on_format_conversion_form(self):
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = "true {prompt_prefix_file!s}"
+        from flow_subagent_dispatch import invoke
+        with self.assertRaises(RuntimeError) as cm:
+            invoke(self.ctx, prompt_prefix="non-empty", round_num=1)
+        self.assertIn("bare", str(cm.exception).lower())
+        # Also `!r` and `!a`.
+        for conv in ("r", "a"):
+            os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+                f"true {{prompt_prefix_file!{conv}}}"
+            )
+            with self.assertRaises(RuntimeError):
+                invoke(self.ctx, prompt_prefix="non-empty", round_num=1)
+
+    def test_invoke_raises_on_format_spec_form(self):
+        from flow_subagent_dispatch import invoke
+        # Empty spec: `{prompt_prefix_file:}`.
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = "true {prompt_prefix_file:}"
+        with self.assertRaises(RuntimeError) as cm:
+            invoke(self.ctx, prompt_prefix="non-empty", round_num=1)
+        self.assertIn("bare", str(cm.exception).lower())
+        # Non-empty spec: `{prompt_prefix_file:>10}`.
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+            "true {prompt_prefix_file:>10}"
+        )
+        with self.assertRaises(RuntimeError):
+            invoke(self.ctx, prompt_prefix="non-empty", round_num=1)
+
+    def test_invoke_raises_on_shell_comment_with_conversion_form(self):
+        """The combination bypass codex R2 caught:
+        ``# {prompt_prefix_file!s}`` must be rejected. The bare-form
+        gate fires BEFORE the shell-comment scanner reaches the
+        (now-impossible) variant token, so the literal-only scanner
+        stays sound."""
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+            "true # {prompt_prefix_file!s}"
+        )
+        from flow_subagent_dispatch import invoke
+        with self.assertRaises(RuntimeError) as cm:
+            invoke(self.ctx, prompt_prefix="non-empty", round_num=1)
+        # Bare-form gate fires first; structural fix beats heuristic.
+        self.assertIn("bare", str(cm.exception).lower())
+
+    # ── R2 P1#2: empty task_id with non-empty prefix fails closed ────
+    def test_invoke_raises_on_empty_task_id_with_prefix(self):
+        """Without a task_id the runtime dir collapses to
+        ``<repo>/.flow/.runtime/<slug>++r1/`` (or worse, a fallback
+        placeholder), which makes per-task evidence collide. When the
+        caller asks for prefix transport without supplying task_id
+        we MUST fail closed."""
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+            "true {prompt_prefix_file}"
+        )
+        from flow_subagent_dispatch import invoke
+        # ctx.task_id="" + no kwarg → empty task_id at runtime.
+        ctx = _Ctx(self.worktree, slug="demo", task_id="")
+        with self.assertRaises(RuntimeError) as cm:
+            invoke(ctx, prompt_prefix="non-empty", round_num=1)
+        self.assertIn("task_id", str(cm.exception))
+        # Empty prefix path stays backwards-compatible (no task_id required).
+        invoke(ctx, prompt_prefix="", round_num=1)
+
+    # ── AC §4: unknown kwargs raise (kills silent-drop class) ────────
+    def test_invoke_raises_on_unknown_kwargs(self):
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = "true"
+        from flow_subagent_dispatch import invoke
+        with self.assertRaises(TypeError):
+            invoke(self.ctx, future_kwarg_we_dont_know="oops")
+
+    # ── AC §5: type-validate prompt_prefix before any side effect ────
+    def test_invoke_raises_on_non_str_prefix(self):
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+            "true {prompt_prefix_file}"
+        )
+        from flow_subagent_dispatch import invoke
+        for bad in (None, b"bytes-not-str", 42, ["list"], {"d": 1}):
+            with self.assertRaises(TypeError):
+                invoke(self.ctx, prompt_prefix=bad, round_num=1)
+        # And no runtime dir was created (side-effect-free on type fail).
+        runtime_dir = self.repo_root / ".flow" / ".runtime"
+        self.assertFalse(runtime_dir.exists())
+
+    # ── AC §6: backwards compat — empty prefix → no file, no fail ────
+    def test_invoke_no_file_when_prefix_empty(self):
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = "true"
+        from flow_subagent_dispatch import invoke
+        invoke(self.ctx, prompt_prefix="", round_num=1)
+        runtime_dir = self.repo_root / ".flow" / ".runtime"
+        self.assertFalse(
+            runtime_dir.exists(),
+            "empty prefix must not create the runtime dir",
+        )
+        # And default (no kwarg passed) is also empty.
+        invoke(self.ctx)
+        self.assertFalse(runtime_dir.exists())
+
+    # ── AC §7: round_num discriminator is part of the path ──────────
+    def test_invoke_round_discriminator_in_path(self):
+        marker1 = self.tmp / "m1"
+        marker2 = self.tmp / "m2"
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+            f"cat {{prompt_prefix_file}} > {marker1.as_posix()}"
+        )
+        from flow_subagent_dispatch import invoke
+        invoke(self.ctx, prompt_prefix="round-one", round_num=1)
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = (
+            f"cat {{prompt_prefix_file}} > {marker2.as_posix()}"
+        )
+        invoke(self.ctx, prompt_prefix="round-two", round_num=2)
+        p1 = (self.repo_root / ".flow" / ".runtime"
+              / "demo+T0+r1" / "dispatch_prefix.txt")
+        p2 = (self.repo_root / ".flow" / ".runtime"
+              / "demo+T0+r2" / "dispatch_prefix.txt")
+        self.assertTrue(p1.is_file())
+        self.assertTrue(p2.is_file())
+        self.assertNotEqual(p1, p2)
+        self.assertEqual(p1.read_text(encoding="utf-8"), "round-one")
+        self.assertEqual(p2.read_text(encoding="utf-8"), "round-two")
+
+    # ── AC §8: byte-for-byte fidelity (codex R2 AC delta #1) ─────────
+    def test_invoke_prefix_file_byte_for_byte(self):
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = "true {prompt_prefix_file}"
+        from flow_subagent_dispatch import invoke
+        # Multi-line, includes special chars + a Chinese char + quotes.
+        body = (
+            "line one\n"
+            "line two with 中文 mixed in\n"
+            "trailing-quote: 'single' and \"double\"\n"
+            "no_trailing_newline_here"
+        )
+        invoke(self.ctx, prompt_prefix=body, round_num=1)
+        path = (self.repo_root / ".flow" / ".runtime"
+                / "demo+T0+r1" / "dispatch_prefix.txt")
+        on_disk = path.read_bytes()
+        # No BOM.
+        self.assertFalse(on_disk.startswith(b"\xef\xbb\xbf"))
+        # No CRLF — UTF-8 encoded LF only.
+        self.assertNotIn(b"\r\n", on_disk)
+        # Exact bytes equal UTF-8 of input (no trailing newline added).
+        self.assertEqual(on_disk, body.encode("utf-8"))
+
+    # ── AC §9: path-typo guard (codex R2 AC delta #2) ────────────────
+    def test_invoke_path_contains_dot_runtime(self):
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = "true {prompt_prefix_file}"
+        from flow_subagent_dispatch import invoke
+        invoke(self.ctx, prompt_prefix="x", round_num=1)
+        # Walk runtime dir; assert path on disk lives under ``.flow/.runtime``.
+        candidate = next(
+            (
+                p for p in self.repo_root.rglob("dispatch_prefix.txt")
+                if p.is_file()
+            ),
+            None,
+        )
+        self.assertIsNotNone(candidate)
+        self.assertIn("/.flow/.runtime/", str(candidate))
+
+    # ── AC §10: layout assertion (codex R2 P1#1) ─────────────────────
+    def test_invoke_raises_on_unexpected_worktree_layout(self):
+        os.environ["FLOW_SUBAGENT_DISPATCH_CMD"] = "true {prompt_prefix_file}"
+        from flow_subagent_dispatch import invoke
+
+        # Case 1: <repo>/.claude/wt/<id>/ — `wt` instead of `worktrees`.
+        bad_repo = self.tmp / "bad1"
+        bad_wt = bad_repo / ".claude" / "wt" / "demo+t0+abc"
+        bad_wt.mkdir(parents=True)
+        ctx = _Ctx(bad_wt, slug="demo", task_id="T0")
+        with self.assertRaises(RuntimeError) as cm:
+            invoke(ctx, prompt_prefix="x", round_num=1)
+        self.assertIn("layout", str(cm.exception).lower())
+
+        # Case 2: <repo>/.claude/worktrees/verify/<id>/ — extra nesting.
+        bad_repo2 = self.tmp / "bad2"
+        bad_wt2 = bad_repo2 / ".claude" / "worktrees" / "verify" / "demo+t0+abc"
+        bad_wt2.mkdir(parents=True)
+        ctx2 = _Ctx(bad_wt2, slug="demo", task_id="T0")
+        with self.assertRaises(RuntimeError):
+            invoke(ctx2, prompt_prefix="x", round_num=1)
+
+
 if __name__ == "__main__":
     unittest.main()
