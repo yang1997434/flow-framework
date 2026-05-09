@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.8.3.1] - 2026-05-08 (hotfix: AFK park rc=5 test time-bomb)
+
+### Fixed
+
+- **`tests/smoke/test_phase2_retry_loop.py:805-822`** — `test_phase2_dispatch_park_returns_rc5_no_merge`
+  was a time-bomb: hardcoded `start = datetime(2026, 5, 8, 0, 0, 0)`
+  combined with `hard_cap_seconds=99_999.0` (~27.7h) meant the test
+  PASSed only when run within ~27.7h of that hardcoded date. Once real
+  `now_iso_utc` (used inside production `_phase2_dispatch`) drifted
+  past the hard cap, `AfkMonitor.evaluate` produced `afk_hard_cap`
+  (terminal rc=3) instead of `afk_idle_park` (recoverable rc=5) —
+  the test asserted rc=5 and consistently failed forever after.
+  v0.8.3 shipped with this red unnoticed (the ship-time test run was
+  inside the 27.7h window). Fix: derive `start` from
+  `datetime.now(timezone.utc)` + raise `hard_cap_seconds` to
+  `99_999_999.0` (~3 years) — production code unchanged. Other
+  `99_999.0` uses (lines 545, 585) are paired with `_make_now_fn` mock
+  clocks and are safe.
+
+### Production code
+
+No change. Audit confirmed wait-mode AFK behaviour in
+`_phase2_dispatch` is correct — the bug was test-only.
+
 ## [0.8.3 P0.2] - 2026-05-08 (dispatch shim wire-up — prompt_prefix file transport)
 
 ### Fixed (P0.2 — dispatch shim silent-drop class)

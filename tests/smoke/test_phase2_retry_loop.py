@@ -802,13 +802,24 @@ class TestT821Phase2DispatchParkReturnsRc5(unittest.TestCase):
             import flow_orchestrator as fo
             from common.afk_monitor import AfkMonitor
 
-            start = datetime(2026, 5, 8, 0, 0, 0, tzinfo=timezone.utc)
+            # v0.8.3.1 hotfix: derive start from real now() (not
+            # hardcoded) AND set hard_cap_seconds to a safe 3-year
+            # ceiling. Previously the test used hardcoded 2026-05-08
+            # start + hard_cap_seconds=99_999.0 (~27.7h); when the test
+            # ran more than 27.7h after that hardcoded date, the real
+            # now_iso_utc inside _phase2_dispatch made active_seconds
+            # exceed the hard cap → afk_hard_cap fired (rc=3) instead
+            # of the wait-mode idle_park (rc=5) the test asserts. This
+            # was a time-bomb: tests passed for the first day, then
+            # silently regressed forever after — discovered on
+            # 2026-05-09 during v0.8.4 P0.6 ship.
+            start = datetime.now(timezone.utc)
             start_iso = _iso(start)
             wait_afk = AfkMonitor(
                 start_iso=start_iso,
                 mode="wait",
                 idle_seconds_threshold=1.0,
-                hard_cap_seconds=99_999.0,
+                hard_cap_seconds=99_999_999.0,  # ~3 years, time-bomb-proof
             )
             # Force the next evaluate to time out: roll last_activity
             # back by 999s so the next now() (still close to start) is
