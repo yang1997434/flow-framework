@@ -185,6 +185,78 @@ updates, sediment notes — opt out because the pre-commit review hook
 they would bypass does not run on doc-only paths anyway. The default
 is safe-by-default: prohibition prepended unless explicitly opted out.
 
+### Transport (v0.8.3 P0.2)
+
+The orchestrator passes the K-class prefix to the subagent via a
+**file** rather than an env var or argv. Path:
+
+```
+<repo_root>/.flow/.runtime/<slug>+<task_id>+r<round>/dispatch_prefix.txt
+```
+
+The path is exposed to operator dispatch templates as
+`{prompt_prefix_file}` (already `shlex.quote()`-wrapped — do NOT add
+shell quoting around it). The runtime dir lives OUTSIDE the worktree
+to avoid a `manifest_violation` row 4 block (`derive_task_facts` only
+enumerates files inside the worktree). It is gitignored at
+`.gitignore:21` (`.flow/.runtime/`).
+
+**Operator template — minimum that wires the K-class guard through**:
+
+```
+claude -p "$(cat {prompt_prefix_file})
+
+flow:flow-phase2-execute --slug {slug} --task {task_id} --worktree {worktree_quoted}"
+```
+
+**Critical**: merely mentioning `{prompt_prefix_file}` in the template
+is NOT enough. The operator must `cat` the file body into the actual
+prompt sent to the subagent (e.g. via `$(cat ...)` substitution).
+A template that only references the placeholder without reading the
+file silently drops the K-class guard. Codex round-1 adversarial
+review caught this exact mode.
+
+**Fail-closed (scope-honest, R2 + R3 fix)**: when a non-empty
+`prompt_prefix` is passed, `flow_subagent_dispatch.invoke` raises
+`RuntimeError` BEFORE any subprocess runs in the following cases:
+
+1. **Non-bare format variant** (R3 P0) — `{prompt_prefix_file!s}`,
+   `{prompt_prefix_file:>10}`, even the empty-spec form
+   `{prompt_prefix_file:}` are all rejected. Only the exact bare
+   spelling `{prompt_prefix_file}` is accepted. Why: the literal-
+   token shell-comment scanner (case 3 below) matches the bare token
+   only; variant forms would evade it. Collapsing the variant family
+   to one canonical spelling keeps the downstream literal scanner
+   sound.
+2. **Missing placeholder** — template has no real format-field named
+   `prompt_prefix_file` (uses `string.Formatter().parse()`, so
+   commented-out Python tokens, `{{...}}` Python escapes, and name
+   typos like `{prompt_prefix_filex}` all trigger the gate).
+3. **Shell-comment placement** — placeholder appears AFTER an unquoted
+   `# ...` on a shell line. The shell would treat the rest of the
+   line as a comment and never read the value. Crude regex check:
+   any line where `{prompt_prefix_file}` is preceded by whitespace +
+   `#` with no quote chars between.
+4. **Missing task_id** — `prompt_prefix` non-empty but `task_id`
+   empty. Without `task_id` the runtime dir collapses to
+   `<slug>++r1/`, causing per-task evidence collisions.
+
+**Known operator-responsibility bypass (NOT covered by fail-closed)**:
+embedding the placeholder inside a subprocess string literal (e.g.
+`python -c 'x="{prompt_prefix_file}"'`) passes both the bare-form
+gate (real field, no conversion/spec) AND the shell-comment check
+(no `#` marker), but the inner subprocess never `cat`s the file.
+Operators MUST follow the canonical `$(cat {prompt_prefix_file})`
+form. The fail-closed guarantee is a partial backstop, not an
+exhaustive contract — see `.flow/pitfalls/dispatch-shim-silent-kw-drop.md`.
+
+**Round discriminator**: the file path includes `+r<N>` so Round 1
+(`+r1`) and any subsequent round-2+ retry (`+r2`, `+r3`, …) write to
+distinct paths. Forensic recovery can replay any single round's
+prefix verbatim. Files persist for the task lifetime — cleanup is
+out-of-scope for P0.2 (operator may purge `.flow/.runtime/<slug>+*`
+at task end).
+
 **Subagent contract** (PRD §1.2): execute the per-task prompt; return
 narrative summary ONLY. Orchestrator derives facts from worktree
 `git diff` and test logs — subagent self-report fields are ignored.

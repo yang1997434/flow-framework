@@ -1,5 +1,153 @@
 # Changelog
 
+## [0.8.3 P0.2] - 2026-05-08 (dispatch shim wire-up — prompt_prefix file transport)
+
+### Fixed (P0.2 — dispatch shim silent-drop class)
+
+- **Closes the K-class sentinel guard wire-gap**: `build_implementer_prompt`
+  has prepended the K-class sentinel prohibition to every first-pass
+  code dispatch since v0.8.2 T4 / v0.8.3 P0.0, but the prefix was
+  silently swallowed at the dispatch shim boundary
+  (`flow_subagent_dispatch.invoke` accepted `prompt_prefix` via
+  `**_kw` while the operator template only knew
+  `{slug,task_id,worktree,worktree_quoted}`). Round 1 never even
+  passed it. The guard was effectively dead code in production.
+- **File-based transport** (`<repo_root>/.flow/.runtime/<slug>+<task_id>+r<round>/dispatch_prefix.txt`):
+  the orchestrator writes the prompt prefix to disk; operator templates
+  reference it via the new `{prompt_prefix_file}` placeholder
+  (already `shlex.quote()`-wrapped). Path lives outside the worktree
+  to avoid a `manifest_violation` row 4 block (`derive_task_facts`
+  only enumerates files inside the worktree). Already gitignored
+  at `.gitignore:21` (`.flow/.runtime/`).
+- **`invoke()` signature overhaul**: explicit `prompt_prefix: str = ""`
+  + `round_num: int = 1` kwargs; `**_kw` REMOVED so any unknown
+  kwarg raises `TypeError` (kills the silent-drop class — adding a
+  new parameter without wiring it now fails loud).
+- **Type validation before side effects** (codex P0#4): non-`str`
+  `prompt_prefix` (None, bytes, int, list, dict) raises `TypeError`
+  before the runtime dir / file is created.
+- **Fail-closed via `string.Formatter().parse()`** (codex P0#3): the
+  placeholder check inspects real format-field positions, not
+  substring matches. Commented-out tokens, doubled-brace escapes
+  `{{...}}`, and string literals do NOT count. Non-empty
+  `prompt_prefix` + missing placeholder → `RuntimeError` BEFORE
+  any subprocess runs.
+- **R2 fix — shell-comment fail-closed extension** (codex R1 caught
+  during R2 review): even when `{prompt_prefix_file}` is a real
+  format field, a shell-comment placement (`true # {prompt_prefix_file}`)
+  silently drops the K-class guard at the subprocess layer (the
+  shell parses `#` as a line comment). New per-line regex
+  `(?:^|\s)#[^\"']*$` rejects this form before substitution. Scope-
+  honest: covers shell-comment placement; does NOT cover
+  inner-subprocess string-literal embedding (e.g.
+  `python -c 'x="{prompt_prefix_file}"'`) — that is documented as a
+  known operator-responsibility bypass in SKILL.md transport
+  section + the `dispatch-shim-silent-kw-drop` pitfall.
+- **R2 fix — task_id required when prompt_prefix non-empty** (codex
+  R1 P1#2): empty `task_id` with non-empty `prompt_prefix` would
+  route ALL tasks to `<repo>/.flow/.runtime/<slug>++r1/`, causing
+  per-task evidence collisions across same-slug tasks. Now raises
+  `RuntimeError` with actionable message; the `'NOTASK'` fallback
+  identifier is removed.
+- **R3 fix — bare-form enforcement closes Formatter conversion/spec
+  bypass** (codex R2 P0): `Formatter().parse()` returns the same
+  `field_name` for `{prompt_prefix_file}`, `{prompt_prefix_file!s}`,
+  and `{prompt_prefix_file:>10}`, AND cannot distinguish `{x:}`
+  from `{x}` (both → `format_spec=''`). The literal-token shell-
+  comment scanner matches the bare form only, so a template like
+  `true # {prompt_prefix_file!s}` would pass the field check, evade
+  the comment scanner, and be silently dropped at runtime by the
+  shell. Two-layered fix: (a) `Formatter().parse()` walk rejects
+  any non-empty `format_spec` or non-`None` `conversion`; (b)
+  raw-template regex `\{prompt_prefix_file[^}]` rejects the empty-
+  spec `{x:}` form that parse() can't see. Collapses the variant
+  family to the bare spelling so the downstream literal scanner
+  stays sound.
+- **R3 fix — internal docstring honesty** (codex R2 P1): the
+  `_template_field_names` docstring used to claim string literals
+  "do NOT count" — contradicting the R2 doc honesty rewrite that
+  acknowledges string-literal-inside-subprocess as a documented
+  operator-responsibility bypass. Docstring now matches SKILL.md /
+  pitfall scope.
+- **Worktree layout assertion** (codex R2 P1#1): `invoke()` derives
+  `repo_root` by reversing `<repo_root>/.claude/worktrees/<id>/`;
+  unexpected layouts (`<repo>/.claude/wt/<id>`,
+  `<repo>/.claude/worktrees/verify/<id>`) raise `RuntimeError` with
+  an actionable message rather than misroute the prefix file.
+- **Round 1 wire-up**: `auto_dispatch_task` accepts an optional
+  `prompt_prefix=""` kwarg and forwards it to `dispatch_fn` with
+  `round_num=1`. `_cmd_auto_execute` builds the prefix immediately
+  before the dispatch call AFTER the task-already-completed skip
+  + recovery dispatcher returns `proceed` (codex R2 P1#2 — no
+  prefix-build side effect on skipped/aborted paths).
+- **Round 2+ wire-up**: `_dispatch_implementer_fresh_worktree` now
+  passes `round_num=N` to the shim so each retry round writes its
+  prefix to `+r<N>` (no clobber of round-1's `+r1` evidence).
+- **Byte-for-byte file fidelity** (codex R2 AC delta #1): the prefix
+  file is written via `write_bytes(prompt_prefix.encode("utf-8"))` —
+  no BOM, no CRLF translation, no trailing newline added.
+
+### Tests (P0.2 — 20 new after R3 fix; was 17 after R2, 12 after R1)
+
+- `tests/smoke/test_subagent_dispatch_shim.py` — 16 new units:
+  prefix file path location, placeholder substitution, fail-closed
+  on missing placeholder (4 sub-assertions: literal absent,
+  comment-style, `{{...}}`-escaped, name typo), shell-comment
+  placement (R2 fix — 3 sub-assertions: single-line, multi-line,
+  tab-prefixed), known string-literal-bypass (R2 fix — pinned as
+  documented bypass; MUST NOT raise), empty-task_id with prefix
+  (R2 fix — fail-closed required), bare-form variants rejected
+  (R3 fix — 3 tests: `{x!s}`/`{x!r}`/`{x!a}` conversion forms,
+  `{x:}` empty + `{x:>10}` non-empty spec, combined shell-comment
+  + conversion `# {x!s}`), unknown kwargs rejected,
+  non-str prefix rejected, empty-prefix backwards-compat,
+  round-discriminator path, byte-for-byte fidelity, path-typo guard,
+  worktree layout assertion.
+- `tests/smoke/test_v083_p02_dispatch_wireup.py` — 4 integration
+  tests against a real tmp git repo: Round 1 via
+  `auto_dispatch_task` (asserts NOT `manifest_violation`, prefix
+  file content embeds K-class text, file path NOT in
+  `TaskFacts.changed_files`/`newly_added_files`); Round 2 via
+  `_dispatch_implementer_fresh_worktree` (asserts `+r2` path +
+  reviewer-feedback content present); R2 P1#1 happy-path through
+  `_cmd_auto_execute` itself (proves the prefix-build site is
+  reached + forwards correctly); R2 P1#1 skip path (proves no
+  prefix file is written when `_task_already_completed` returns
+  True — codex R2 P1#2 ordering invariant).
+- Total smoke 880 (up from baseline 860; net +20 P0.2 — no regressions).
+
+### Breaking change (operator)
+
+- **Operator dispatch templates with non-empty prefix MUST add the
+  `{prompt_prefix_file}` placeholder** AND actually `cat` its body
+  into the prompt sent to the subagent. The default capability
+  config ships `dispatch_cmd` absent (operator supplies via
+  `FLOW_SUBAGENT_DISPATCH_CMD` env var), so zero real users
+  affected by the absence of a default — but anyone with an
+  existing template will hit the fail-closed `RuntimeError` on
+  next dispatch until they update.
+- Recommended template:
+  ```
+  claude -p "$(cat {prompt_prefix_file})
+
+  flow:flow-phase2-execute --slug {slug} --task {task_id} --worktree {worktree_quoted}"
+  ```
+- The `{prompt_prefix_file}` value is already `shlex.quote()`-wrapped;
+  do NOT add additional shell quoting around it.
+- Empty-prefix path is still backwards-compatible: callers that
+  never pass `prompt_prefix=` (or pass `""`) work with the legacy
+  4-placeholder template; no runtime dir is created.
+
+### Pitfall captured
+
+- `.flow/pitfalls/dispatch-shim-silent-kw-drop.md` — any shim that
+  accepts `**_kw` while the downstream consumer (template, CLI
+  contract, etc.) doesn't reference the kwarg is a silent-drop
+  class. Adding a new kwarg requires both a placeholder/contract
+  update AND a fail-closed assertion that the downstream really
+  uses it. Trigger paths: `scripts/flow_subagent_dispatch.py` +
+  any `dispatch_fn` call site in `scripts/flow_orchestrator.py`.
+
 ## [0.8.3] - 2026-05-08 (P0.0 hook fix + P0.1 fresh-per-round + P0.4 + P0.5)
 
 ### Added (P0.1 — fresh-worktree-per-round implementer redispatch)
