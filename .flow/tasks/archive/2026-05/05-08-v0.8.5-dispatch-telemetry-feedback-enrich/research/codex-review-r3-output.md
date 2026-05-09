@@ -1,0 +1,17 @@
+**Findings**
+
+P0: 未发现。
+
+P1 — `codex_review` telemetry 在生产路径基本不会写，且 duration 是假的。`dispatch_with_retry` 只在 `review_outcome == "rejected_with_rationale"` 时写 `codex_review`，但生产 `_prod_review` 对所有非 pass GateRunner verdict 都返回 `"fail"`，所以 gate4 codex 实际跑了也不会有事件；测试路径写出的 `duration_ms=0` 也不满足 wall time 要求。见 [flow_orchestrator.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/scripts/flow_orchestrator.py:5398)、[flow_orchestrator.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/scripts/flow_orchestrator.py:5403)、[flow_orchestrator.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/scripts/flow_orchestrator.py:6013)。
+
+P1 — frozen schema 的 `outcome` 枚举被实现改偏了。PRD v1 是 `pass | fail | skip | null`，但代码会写 `blocked`（GateRunner verdict.status）和 `rejected_with_rationale`；schema 文档也把 `rejected_with_rationale` 写进去了。这会让后续 ad-hoc 聚合按 frozen schema 解析时失真。见 [flow_orchestrator.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/scripts/flow_orchestrator.py:5384)、[flow_orchestrator.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/scripts/flow_orchestrator.py:5989)、[telemetry-schema.md](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/templates/telemetry-schema.md:34)。
+
+P1 — diff map 只看 `base_ref..HEAD`，会漏掉 staged/unstaged/untracked 变更。`derive_task_facts` 已经把这些层纳入 authoritative facts，但 enrichment 的 `git diff --stat base..HEAD` / `git diff -U0 base..HEAD` 只覆盖 committed diff；失败 round 如果还没 commit，Round 2 prompt 会直接没有结构摘要。见 [diff_summary.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/scripts/common/diff_summary.py:159)、[diff_summary.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/scripts/common/diff_summary.py:172)、[flow_orchestrator.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/scripts/flow_orchestrator.py:549)。
+
+P1 — Round N-1 enrichment source 在 N>2 时会退回旧 round，且 baseline 不可靠。Round 3 prompt 前，`failed_rounds[-1]` 仍是 Round 1，因为 Round 2 只有在创建 Round 3 成功后才被 append；同时 `RoundRecord` 没有 base commit，fallback `HEAD~1` 只代表最后一个 commit，不代表整轮 diff。见 [flow_orchestrator.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/scripts/flow_orchestrator.py:5145)、[flow_orchestrator.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/scripts/flow_orchestrator.py:5153)、[flow_orchestrator.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/scripts/flow_orchestrator.py:5936)。
+
+P2 — Round 1 `worktree_create` 没有 telemetry。Round 1 worktree 在 `auto_dispatch_task` 里创建，但埋点只包了 Round 2+ helper；如果要求“每 dispatch round 全阶段”，这里缺一行。见 [flow_orchestrator.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/scripts/flow_orchestrator.py:846)、[flow_orchestrator.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/scripts/flow_orchestrator.py:5600)。
+
+P2 — 新 smoke tests 没覆盖生产 gate/worktree 路径。它们用 fake deps 直接调用 `dispatch_with_retry`，所以 `gate_run`、生产 `codex_review`、Round 2 fresh worktree 都没被验证；这也是上面生产漏埋点能通过测试的原因。见 [test_v085_telemetry_and_feedback_enrich.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/tests/smoke/test_v085_telemetry_and_feedback_enrich.py:118)。
+
+我没有运行测试；这是基于当前 diff 的静态 review。

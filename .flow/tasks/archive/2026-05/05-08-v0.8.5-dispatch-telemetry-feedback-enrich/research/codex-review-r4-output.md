@@ -1,0 +1,16 @@
+RED.
+
+**P1**
+- I6 is still not truly fixed. [test_v085_production_path.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/tests/smoke/test_v085_production_path.py:7) claims prod-path coverage with Round 2 fresh worktree + subagent shim mocked, but no test actually drives Round 1 fail -> `_prod_impl` -> `_dispatch_implementer_fresh_worktree` -> prompt enrichment. The I3 “production” test manually builds `RetrySessionState` and calls `_build_prev_round_diff_summary` directly at [test_v085_production_path.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/tests/smoke/test_v085_production_path.py:280). That is not production-path smoke; it bypasses `dispatch_with_retry`, `_prod_impl`, prompt builder, and subagent shim. This is exactly the class of fake coverage I6 was supposed to eliminate.
+
+**P2**
+- I3 is functionally improved but source separation is wrong. `_collect_unstaged()` says “worktree vs HEAD, sans --cached” but runs `git diff --stat HEAD` / `git diff HEAD`, which includes staged changes too, causing staged changes to be duplicated as unstaged at [diff_summary.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/scripts/common/diff_summary.py:263). Use plain `git diff --stat` / `git diff -U0 --no-color` for unstaged-only.
+- I3 untracked coverage misses nested untracked files because `_collect_untracked()` uses plain `git status --porcelain`, which can collapse new directories to `?? dir/` instead of listing files. This weakens the structural map for the common “new package/module directory” case at [diff_summary.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/scripts/common/diff_summary.py:285).
+- I5 has explicit `telemetry_emit_fn` in the `auto_dispatch_task` signature, so runtime fail-closed behavior is mostly OK, but the test only introspects the signature. It does not assert that an unknown kwarg explodes, unlike the prompt-builder kwarg test.
+
+**Verified OK**
+- I1: real `codex_review` telemetry now emits inside `GateRunner.gate4_codex_review`, around the actual Gate 4 call, not from the dead `review_outcome == "rejected_with_rationale"` shim path. This is a real fix.
+- I2: outcome normalization is idempotent for frozen values. GateRunner pre-normalizes, then `emit_event()` normalizes again without changing `pass|fail|skip|None`; raw status is preserved in `fail_reason_raw` for GateRunner non-pass paths.
+- I4: enrichment lookup via `current_round_ctx` does not break the P0.1 two-phase commit invariant. It reads current state before the next implementer dispatch and does not mutate the commit boundary. The existing two-phase commit remains at [flow_orchestrator.py](/data/Claude/flow-framework/.claude/worktrees/agent-aa426c11070d2f2f5/scripts/flow_orchestrator.py:6051).
+
+I could not run the suite meaningfully in this sandbox: `pytest` is unavailable and `unittest` fails because the environment has no usable temp directory. This verdict is from static review plus targeted command inspection.
