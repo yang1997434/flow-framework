@@ -1,7 +1,7 @@
 ---
 slug: v0.8.4-p0.6-commit-helper
-status: active   # active | paused | blocked | done
-phase: triage    # triage | research | implement | check | verify | sediment
+status: done   # active | paused | blocked | done
+phase: sediment   # triage | research | implement | check | verify | sediment
 # blocked_by: list of task slugs this task depends on. Used by `flow task status`
 # to draw the dependency graph (parent slugs must finish first). Default: empty.
 # Example:
@@ -53,8 +53,9 @@ Phase 2 会自动调 wave_planning 切并行 wave。details: docs/superpowers/sp
 
 ## Files Touched
 
-_Updated 2026-05-08 23:01 (last 20 unique edits)_:
+_Updated 2026-05-08 23:03 (last 20 unique edits)_:
 
+- `/tmp/v084-p06-flow-msg.txt`
 - `/tmp/v084-p06-dotfiles-msg.txt`
 - `/home/yangpeng/claude-linux-config/claude/CLAUDE.md`
 - `/home/yangpeng/claude-linux-config/claude/rules/code-commit.md`
@@ -74,4 +75,3 @@ _Updated 2026-05-08 23:01 (last 20 unique edits)_:
 - `/tmp/v083-p01-prefork-msg.txt`
 - `.flow/tasks/05-08-v0.8.3-p0.1-implementer-redispatch/progress.md`
 - `.flow/tasks/05-08-v0.8.3-p0.1-implementer-redispatch/prd.md`
-- `.flow/tasks/05-08-v0.8.3-p0.1-implementer-redispatch/codex-consult-r1-prompt.md`
