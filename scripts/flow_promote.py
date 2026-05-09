@@ -31,6 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from common.exit_codes import USAGE_ERROR  # v0.8.4 P3
 from common.paths import get_flow_dir
 
 
@@ -278,7 +279,7 @@ def main():
 
     if not passes:
         print("\nABORT: criteria not met. See warnings above.")
-        sys.exit(2)
+        sys.exit(USAGE_ERROR)
 
     # Credential grep on source
     content = source.read_text(encoding="utf-8")

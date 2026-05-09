@@ -50,6 +50,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from common.exit_codes import USAGE_ERROR  # noqa: E402  v0.8.4 P3
+
 # Optional config knobs (defaults sane). We do NOT force YAML parsing here
 # (stdlib-only, configurable through env or fall back to constants).
 DEFAULT_DISTILL_COOLDOWN_MIN = 5
@@ -233,7 +235,7 @@ def cmd_distill(args) -> int:
     trigger = args.trigger
     if trigger not in VALID_TRIGGERS:
         print(f"ERROR: invalid trigger {trigger!r}", file=sys.stderr)
-        return 2
+        return USAGE_ERROR
 
     cooldown_min = args.cooldown_minutes if args.cooldown_minutes is not None \
         else DEFAULT_DISTILL_COOLDOWN_MIN

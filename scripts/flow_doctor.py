@@ -23,6 +23,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+from common.exit_codes import USAGE_ERROR  # v0.8.4 P3
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEPS_FILE = REPO_ROOT / "dependencies.json"
 USER_SETTINGS = Path.home() / ".claude" / "settings.json"
@@ -262,7 +264,7 @@ def check_hook_isolation() -> int:
         warn("settings.json", "no flow hooks found — run `flow install`")
         return 1
     if violations:
-        return 2
+        return USAGE_ERROR
     return 0
 
 
@@ -886,7 +888,7 @@ def main():
         sys.exit(0)
     if iso_status == 2:
         print(f"{RED}>> Hook isolation FAILED (Issue #415 risk).{RESET}")
-        sys.exit(2)
+        sys.exit(USAGE_ERROR)
     if total_missing > 0:
         print(f"{RED}>> {total_missing} required dep(s) missing.{RESET}")
         sys.exit(1)

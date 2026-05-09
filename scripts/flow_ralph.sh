@@ -13,12 +13,17 @@
 # Usage:
 #   scripts/flow_ralph.sh <task-slug> [--max-iterations N] [--completion-promise STR] [--dry-run]
 #
-# Exit codes:
-#   0  success (completion-promise observed OR max iterations exhausted gracefully)
-#   1  bad usage / missing prd.md / unrecoverable setup error
-#   2  --help requested (informational)
+# Exit codes (v0.8.4 P3 — aligned with scripts/common/exit_codes.py registry):
+#   0  PASS — success (completion-promise observed OR max iterations exhausted gracefully)
+#   1  GENERIC_FAIL — bad usage / missing prd.md / unrecoverable setup error
+#   2  USAGE_ERROR — --help requested (informational) OR no args supplied (argparse-equivalent)
 
 set -euo pipefail
+
+# ---------- exit-code constants (v0.8.4 P3) ----------
+# Bash analogue of `from common.exit_codes import USAGE_ERROR` in the Python
+# CLIs. Values mirror scripts/common/exit_codes.py — keep in sync.
+readonly USAGE_ERROR=2
 
 # ---------- defaults ----------
 MAX_ITERATIONS=20
@@ -184,7 +189,7 @@ run_one_iteration() {
 # ---------- arg parsing ----------
 if [ "$#" -eq 0 ]; then
   print_help
-  exit 2
+  exit "${USAGE_ERROR}"
 fi
 
 POSITIONAL=()
@@ -192,7 +197,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     -h|--help)
       print_help
-      exit 2
+      exit "${USAGE_ERROR}"
       ;;
     --max-iterations)
       [ "$#" -ge 2 ] || { echo "ERROR: --max-iterations needs a value" >&2; exit 1; }

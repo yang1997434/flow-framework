@@ -30,6 +30,8 @@ import sys
 import subprocess
 from pathlib import Path
 
+from common.exit_codes import USAGE_ERROR  # v0.8.4 P3
+
 
 SCRIPTS = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS.parent
@@ -82,7 +84,7 @@ def main():
         target = SCRIPTS / routing[cmd]
         if not target.is_file():
             print(f"ERROR: {target} not implemented yet (stub)", file=sys.stderr)
-            sys.exit(2)
+            sys.exit(USAGE_ERROR)
         sys.exit(subprocess.call([sys.executable, str(target), *rest]))
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)

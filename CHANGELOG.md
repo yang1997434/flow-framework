@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.8.4 P3] - 2026-05-08 (CLI literal→constant refactor)
+
+### Changed
+
+- **5 internal CLIs**: replaced literal exit code `2` with named
+  `USAGE_ERROR` constant from `scripts/common/exit_codes.py`. Carried
+  from v0.8.2.1's exit-code registry rollout.
+  - `scripts/flow.py` — stub-not-implemented exit (line 86)
+  - `scripts/flow_doctor.py` — violations-detected return (line 268) +
+    hook-isolation-failed exit (line 894)
+  - `scripts/flow_promote.py` — criteria-not-met exit (line 285)
+  - `scripts/flow_autosave.py` — invalid-trigger return (line 240)
+  - `scripts/flow_ralph.sh` — `readonly USAGE_ERROR=2` constant for
+    `exit 2` sites (no-args usage error + --help informational exit)
+- No semantic / behaviour change. `USAGE_ERROR == 2` numeric; all
+  callers (CI, hooks, parent scripts) see the same exit code as before.
+
 ## [0.8.3.1] - 2026-05-08 (hotfix: AFK park rc=5 test time-bomb)
 
 ### Fixed
