@@ -53,8 +53,11 @@ Phase 2 会自动调 wave_planning 切并行 wave。details: docs/superpowers/sp
 
 ## Files Touched
 
-_Updated 2026-05-08 23:13 (last 20 unique edits)_:
+_Updated 2026-05-08 23:15 (last 20 unique edits)_:
 
+- `/tmp/v0831-hotfix-msg.txt`
+- `.flow/pitfalls/test-time-bomb-hardcoded-date-vs-real-now.md`
+- `CHANGELOG.md`
 - `.flow/tasks/05-08-v0.8.3.1-hotfix-afk-park-rc5/prd.md`
 - `tests/smoke/test_phase2_retry_loop.py`
 - `.flow/tasks/05-08-v0.8.4-p0.6-commit-helper/progress.md`
@@ -72,6 +75,3 @@ _Updated 2026-05-08 23:13 (last 20 unique edits)_:
 - `/tmp/v083-p02-prefork-msg.txt`
 - `.flow/tasks/05-08-v0.8.3-p0.2-brief-sentinel-fullset/codex-consult-r3-input.md`
 - `.flow/tasks/05-08-v0.8.3-p0.2-brief-sentinel-fullset/prd.md`
-- `.flow/tasks/05-08-v0.8.3-p0.2-brief-sentinel-fullset/codex-consult-r2-input.md`
-- `.flow/tasks/05-08-v0.8.3-p0.2-brief-sentinel-fullset/codex-consult-r1-input.md`
-- `.flow/pitfalls/edit-absolute-path-resolves-master.md`
