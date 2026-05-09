@@ -26,6 +26,8 @@ tests/temp/
 .flow/**/*.tmp
 .flow/**/.backup-*
 .flow/tasks/**/.checkpoint/
+# v0.8.5 — per-task dispatch telemetry (raw events, observability-only)
+.flow/tasks/**/telemetry.jsonl
 
 # Claude Agent SDK local scratch (ephemeral worktrees, etc.)
 .claude/

@@ -62,6 +62,8 @@ from dispatch_template import (  # type: ignore  # v0.8.2 T4
     build_implementer_prompt,
 )
 from common.exit_codes import PARKED_RECOVERABLE  # type: ignore  # v0.8.2.1
+from common import telemetry as _telemetry_mod  # type: ignore  # v0.8.5
+from common import diff_summary as _diff_summary_mod  # type: ignore  # v0.8.5
 
 
 # Files implicitly shared across tasks — copied from flow_wave_planner; v0.8.0
@@ -721,6 +723,7 @@ def auto_dispatch_task(
     integration_target: str = "master",
     notifier: Optional["Notifier"] = None,  # type: ignore[name-defined]
     prompt_prefix: str = "",
+    telemetry_emit_fn: Optional[Callable[..., None]] = None,
 ) -> "DispatchOutcome":
     """T10 orchestration shell + T11 manifest enforcement.
 
@@ -841,12 +844,52 @@ def auto_dispatch_task(
     # route to state 2 (auto_prepare_interrupted). DO NOT add a
     # try/except that calls consume_auto_prepare_lock on failure.
 
-    ctx = create_task_worktree(
-        repo_root=repo_root,
-        slug=slug,
-        task_idx=task_idx,
-        integration_target=integration_target,
-    )
+    # v0.8.5 codex-review I5 — bracket Round 1 worktree creation with
+    # ``worktree_create`` telemetry. Without this, only Round 2+ has
+    # the event (Round 2+ helper emits its own); Round 1 — by far the
+    # most common path since most tasks don't retry — is invisible to
+    # the ADR Revisit-trigger 1 ("worktree p50 >15s") metric.
+    # Same outcome / fail_reason pattern as the Round 2+ helper:
+    # success → outcome="pass" + worktree_id populated post-create;
+    # failure → outcome="fail" + repr(exc) in fail_reason_raw, then
+    # the exception still propagates (telemetry never blocks).
+    _wc_t0 = time.monotonic()
+    try:
+        ctx = create_task_worktree(
+            repo_root=repo_root,
+            slug=slug,
+            task_idx=task_idx,
+            integration_target=integration_target,
+        )
+    except BaseException as _wc_exc:
+        if telemetry_emit_fn is not None:
+            _wc_dur = int((time.monotonic() - _wc_t0) * 1000.0)
+            try:
+                telemetry_emit_fn(
+                    phase="worktree_create",
+                    round_num=1,
+                    duration_ms=_wc_dur,
+                    outcome="fail",
+                    fail_reason_raw=repr(_wc_exc),
+                    worktree_id=None,
+                )
+            except Exception:
+                # Telemetry never blocks dispatch.
+                pass
+        raise
+    if telemetry_emit_fn is not None:
+        _wc_dur = int((time.monotonic() - _wc_t0) * 1000.0)
+        try:
+            telemetry_emit_fn(
+                phase="worktree_create",
+                round_num=1,
+                duration_ms=_wc_dur,
+                outcome="pass",
+                fail_reason_raw=None,
+                worktree_id=ctx.worktree_id,
+            )
+        except Exception:
+            pass
     # §8.4 row `auto_engaged` requires 14 fields. Any missing key here
     # causes `append_autonomy_event` to raise with the missing-field list
     # — fail-loud BEFORE dispatch, which is the Q7.2 contract.
@@ -1345,6 +1388,7 @@ class GateRunner:
         run_id: str,
         task_id: str,
         prior_baseline: Optional[BaselineRecord] = None,
+        telemetry_emit_fn: Optional[Callable[..., None]] = None,
     ):
         self.ctx = ctx
         self.contract = contract
@@ -1352,6 +1396,17 @@ class GateRunner:
         self.run_id = run_id
         self.task_id = task_id
         self.prior_baseline = prior_baseline
+        # v0.8.5 codex-review I1 — optional telemetry hook. When set,
+        # ``gate4_codex_review`` brackets the actual codex CLI call
+        # and emits one ``codex_review`` event with real wall time.
+        # Default None preserves backward compat with all existing
+        # callers (T12/T13/T15 tests construct without this kwarg).
+        # The fn is called as ``telemetry_emit_fn(phase=..., outcome=...,
+        # duration_ms=..., fail_reason_raw=..., worktree_id=...)``.
+        # Failures inside the fn must be swallowed by the caller —
+        # GateRunner does NOT defend (the production wire-up uses
+        # ``_telemetry_mod.emit_event`` which itself swallows).
+        self.telemetry_emit_fn = telemetry_emit_fn
 
     # ------------------------------------------------------------------
     # Gate 1 — baseline tests inside the worktree (Q3.1).
@@ -1575,6 +1630,70 @@ class GateRunner:
         # branching needs — see field handling below.
         if codex_timeout_sec is None:
             codex_timeout_sec = _GATE4_CODEX_TIMEOUT_SEC
+
+        # v0.8.5 codex-review I1 — wall-time bracket around the codex
+        # CLI invocation. We delegate the legacy logic to
+        # ``_gate4_codex_review_impl`` so any return path inside it is
+        # captured by the surrounding try/finally and the
+        # ``codex_review`` telemetry event emits exactly once with real
+        # ``duration_ms`` regardless of which return branch fired.
+        # ``self.telemetry_emit_fn`` defaults to None for legacy
+        # callers (T12/T13/T15 tests construct GateRunner without
+        # telemetry — those paths skip emit silently).
+        gate_result: Optional[GateResult] = None
+        t0 = time.monotonic()
+        try:
+            gate_result = self._gate4_codex_review_impl(
+                codex_command=codex_command,
+                codex_timeout_sec=codex_timeout_sec,
+            )
+            return gate_result
+        finally:
+            if self.telemetry_emit_fn is not None:
+                duration_ms = int((time.monotonic() - t0) * 1000.0)
+                # Map GateResult.status → frozen schema outcome
+                # (codex review I2 frozen-schema invariant). We
+                # normalise BEFORE handing off so consumers that don't
+                # route through ``common.telemetry.emit_event`` (test
+                # fixtures, future custom loggers) still see a frozen
+                # value. Original verdict is preserved in
+                # ``fail_reason_raw``.
+                raw_status = (
+                    gate_result.status
+                    if gate_result is not None else None
+                )
+                normalised = _telemetry_mod.normalize_outcome(raw_status)
+                # Carry the gate-runner ``details`` into fail_reason_raw
+                # for non-pass paths so triage doesn't lose context.
+                # Always include the raw status string so post-norm
+                # readers can recover (e.g. "inconclusive").
+                fail_reason = None
+                if gate_result is not None and gate_result.status != "pass":
+                    fail_reason = (
+                        f"gate4_codex_review status={raw_status} "
+                        f"details={gate_result.details}"
+                    )
+                try:
+                    self.telemetry_emit_fn(
+                        phase="codex_review",
+                        duration_ms=duration_ms,
+                        outcome=normalised,
+                        fail_reason_raw=fail_reason,
+                        worktree_id=getattr(self.ctx, "worktree_id", None),
+                    )
+                except Exception:
+                    # Telemetry must NEVER take down the gate runner.
+                    # ``common.telemetry.emit_event`` already swallows;
+                    # this is defence-in-depth for stranger fns.
+                    pass
+
+    def _gate4_codex_review_impl(
+        self, *,
+        codex_command: str,
+        codex_timeout_sec: int,
+    ) -> GateResult:
+        """v0.8.5 — legacy gate4_codex_review body. Pure logic; the
+        wrapper above brackets it with telemetry + wall-time."""
         result = _run_shell_with_pgkill(
             codex_command,
             cwd=self.ctx.worktree_path,
@@ -4800,11 +4919,19 @@ class RoundRecord:
 
     Frozen so accidental mutation after a round terminates is a loud
     TypeError (the round is over; its identity must not drift).
+
+    v0.8.5 codex-review I4: ``base_commit`` captures the round's
+    ``original_base_commit`` so enrichment lookup can compute a
+    correct diff against the round's true fork-point (instead of the
+    previous fallback ``HEAD~1`` which was wrong for any retry round).
+    Default empty string keeps callers / fixtures that don't set it
+    backward-compatible (legacy unit tests / older serialised state).
     """
     worktree_id: str
     worktree_path: Path
     branch: str
     round_num: int
+    base_commit: str = ""
 
     @classmethod
     def from_ctx(cls, ctx: "WorktreeContext") -> "RoundRecord":
@@ -4813,6 +4940,7 @@ class RoundRecord:
             worktree_path=ctx.worktree_path,
             branch=ctx.branch,
             round_num=ctx.round_num,
+            base_commit=getattr(ctx, "original_base_commit", "") or "",
         )
 
 
@@ -4870,6 +4998,20 @@ class RetrySessionState:
     # the safe default (Round 1 is a no-op so it doesn't matter; tests
     # that don't set it still see the legacy `task_brief=""` posture).
     task_brief: str = ""
+    # v0.8.5 — dispatch telemetry settings. Both default to "no
+    # telemetry, no enrichment" so legacy tests that don't seed these
+    # fields keep the v0.8.4 behaviour. `_phase2_dispatch` populates
+    # both from contract.dispatch when constructing state.
+    #
+    # ``telemetry_path``: absolute Path to the per-task
+    # ``telemetry.jsonl`` file (PRD R1). When None or
+    # ``telemetry_enabled=False``, no events are written.
+    # ``feedback_enrichment_enabled``: when True, Round 2+ implementer
+    # prompts include the structural diff map of the previous round's
+    # worktree. Independent of telemetry (PRD R5).
+    telemetry_path: Optional[Path] = None
+    telemetry_enabled: bool = False
+    feedback_enrichment_enabled: bool = False
 
 
 @dataclass
@@ -5043,6 +5185,130 @@ def _tick_wallclock_from_clock(
         pass
 
 
+# ── v0.8.5 telemetry helpers ─────────────────────────────────────────
+#
+# Thin wrappers over ``common.telemetry`` that read enable / path off
+# ``RetrySessionState``. Keep these LOCAL to the orchestrator so the
+# common module stays state-agnostic and easily reused by other
+# call sites that do not have a RetrySessionState (e.g. wave dispatch
+# in a future release).
+#
+# Failure-mode invariant: telemetry emit must NEVER raise into the
+# dispatch loop. ``common.telemetry.emit_event`` already swallows;
+# the only way these helpers could escalate is by passing through the
+# ``set_outcome`` / ``set_fail_reason`` calls, which themselves are
+# pure attribute writes.
+
+
+def _telemetry_span(
+    state: "RetrySessionState",
+    *,
+    phase: str,
+    worktree_id: Optional[str],
+):
+    """Return a ``timed_span`` context manager bound to ``state``.
+
+    When ``state.telemetry_enabled`` is False the span still works
+    (caller can ``set_outcome``) but no JSONL line is written.
+    """
+    return _telemetry_mod.timed_span(
+        path=state.telemetry_path or Path("/dev/null"),
+        task_slug=state.task_slug,
+        round_num=state.dispatch_retry_rounds + 1,
+        phase=phase,
+        worktree_id=worktree_id,
+        enabled=bool(state.telemetry_enabled and state.telemetry_path),
+    )
+
+
+def _telemetry_emit(
+    state: "RetrySessionState",
+    *,
+    phase: str,
+    worktree_id: Optional[str],
+    duration_ms: int,
+    outcome: Optional[str],
+    fail_reason_raw: Optional[str] = None,
+) -> None:
+    """Emit a one-shot telemetry event without a wrapping span.
+
+    Used for events that don't bracket a single callable (e.g. the
+    derived ``codex_review`` event whose wall time is a subset of the
+    parent ``reviewer`` span).
+    """
+    _telemetry_mod.emit_event(
+        path=state.telemetry_path or Path("/dev/null"),
+        task_slug=state.task_slug,
+        round_num=state.dispatch_retry_rounds + 1,
+        phase=phase,
+        duration_ms=duration_ms,
+        outcome=outcome,
+        fail_reason_raw=fail_reason_raw,
+        worktree_id=worktree_id,
+        enabled=bool(state.telemetry_enabled and state.telemetry_path),
+    )
+
+
+def _build_prev_round_diff_summary(
+    state: "RetrySessionState",
+) -> Optional[str]:
+    """v0.8.5 — when feedback enrichment is enabled AND we are on Round
+    2+ AND the prev round's worktree exists on disk, build a structural
+    diff map of ``original_base_commit..HEAD`` and return it.
+
+    Returns None whenever any precondition fails (Round 1, switch off,
+    no prev worktree, helper raised). The caller's prompt builder
+    treats None / empty identically — no enrichment section.
+
+    v0.8.5 codex-review I4: lookup ALWAYS prefers
+    ``state.current_round_ctx``. At the top of the retry loop (where
+    enrichment runs), ``current_round_ctx`` is the round whose review
+    just returned non-pass — i.e. the TRUE prev round for the round
+    we are about to start. ``state.failed_rounds`` is for orphan
+    cleanup, NOT enrichment lookup; it lags by one round
+    (``_prod_impl`` only appends the prev ctx AFTER the new round's
+    worktree is created, so on entry to Round N+1 the list still has
+    only Round N-1).
+
+    Fallback (defensive): if ``current_round_ctx`` is unset (test
+    fixture path), use the most recent ``RoundRecord``. The record's
+    ``base_commit`` is now populated by ``RoundRecord.from_ctx`` (I4);
+    if it's empty (legacy state), skip enrichment rather than emit a
+    wrong ``HEAD~1`` diff.
+    """
+    if not state.feedback_enrichment_enabled:
+        return None
+    # Round 1 has no prev round.
+    if state.dispatch_retry_rounds < 1:
+        return None
+    prev_path = None
+    prev_base = None
+    if state.current_round_ctx is not None:
+        prev_path = getattr(state.current_round_ctx, "worktree_path", None)
+        prev_base = getattr(
+            state.current_round_ctx, "original_base_commit", None,
+        )
+    elif state.failed_rounds:
+        prev_round = state.failed_rounds[-1]
+        prev_path = getattr(prev_round, "worktree_path", None)
+        prev_base = getattr(prev_round, "base_commit", "") or None
+    if prev_path is None or not prev_base:
+        # No reliable base → skip enrichment rather than emit a
+        # mis-anchored diff (codex review I4: HEAD~1 fallback was
+        # wrong for any retry round).
+        return None
+    try:
+        return _diff_summary_mod.build_diff_summary(
+            worktree_path=prev_path,
+            base_ref=prev_base,
+        ) or None
+    except Exception:
+        # Any failure → silently degrade to no enrichment. The diff
+        # summary is observability-equivalent feature; never block
+        # dispatch.
+        return None
+
+
 def dispatch_with_retry(
     *,
     state: RetrySessionState,
@@ -5173,15 +5439,44 @@ def dispatch_with_retry(
         # would otherwise hand a fresh subagent an empty brief and the
         # subagent has no context. Tests that don't set `task_brief`
         # see the legacy `""` behaviour (RetrySessionState default).
+        # v0.8.5 — Round 2+ feedback enrichment: structural diff map of
+        # the previous round's worktree, attached as auxiliary context
+        # AFTER the reviewer feedback. Round 1 path returns None
+        # (`_build_prev_round_diff_summary` short-circuits on
+        # ``dispatch_retry_rounds < 1``). Switch-off path also returns
+        # None. Empty diff returns None. Both treated as "no
+        # enrichment" by the prompt builder.
+        prev_diff = _build_prev_round_diff_summary(state)
         prefix = build_implementer_prompt(
             task_brief=state.task_brief or "",
             reviewer_feedback=redacted_feedback or None,
             is_first_pass=True,
             is_doc_only=False,
+            prev_round_diff_summary=prev_diff,
         )
-        impl_deltas = deps.run_implementer_round(
-            state=state, prompt_prefix=prefix,
+        # v0.8.5 — emit "implementer" telemetry event. Wraps the entire
+        # subagent dispatch wall time (PRD R3). Round 1 is a no-op
+        # (auto_dispatch_task already happened upstream); Round 2+ goes
+        # through `_dispatch_implementer_fresh_worktree` which itself
+        # emits the inner "worktree_create" event. The "implementer"
+        # event always lands — even on the no-op round 1 path — so
+        # round-shape comparisons in telemetry stay symmetric.
+        impl_worktree_id = (
+            getattr(state.current_round_ctx, "worktree_id", None)
+            if state.current_round_ctx is not None else None
         )
+        with _telemetry_span(
+            state, phase="implementer", worktree_id=impl_worktree_id,
+        ) as _impl_span:
+            try:
+                impl_deltas = deps.run_implementer_round(
+                    state=state, prompt_prefix=prefix,
+                )
+                _impl_span.set_outcome("pass")
+            except Exception as exc:
+                _impl_span.set_outcome("fail")
+                _impl_span.set_fail_reason(repr(exc))
+                raise
         # T1 budget bookkeeping: register the dispatch + apply deltas.
         try:
             from common import budget_counter as _bc  # type: ignore
@@ -5206,11 +5501,41 @@ def dispatch_with_retry(
             return "budget_hit", snap
 
         # ── Review round (paused-clock bracket around the wait) ──
+        # v0.8.5 — emit "reviewer" telemetry event (PRD R3). Wraps the
+        # full review-callable wall time (gate runner + any codex
+        # round). Outcome ∈ pass | fail | rejected_with_rationale; we
+        # also emit a "codex_review" event downstream when the outcome
+        # is rejected_with_rationale (= codex was actually consulted).
+        review_worktree_id = (
+            getattr(state.current_round_ctx, "worktree_id", None)
+            if state.current_round_ctx is not None else None
+        )
         afk.pause("codex_review", now_iso_fn())
         try:
-            review_outcome = deps.run_codex_review(
-                state=state, impl_deltas=impl_deltas,
-            )
+            with _telemetry_span(
+                state, phase="reviewer", worktree_id=review_worktree_id,
+            ) as _rev_span:
+                try:
+                    review_outcome = deps.run_codex_review(
+                        state=state, impl_deltas=impl_deltas,
+                    )
+                    _rev_span.set_outcome(review_outcome)
+                    if review_outcome != "pass":
+                        _rev_span.set_fail_reason(
+                            state.last_reviewer_feedback or review_outcome
+                        )
+                except Exception as exc:
+                    _rev_span.set_outcome("fail")
+                    _rev_span.set_fail_reason(repr(exc))
+                    raise
+            # v0.8.5 codex-review I1 — the ``codex_review`` event is
+            # now emitted from inside ``GateRunner.gate4_codex_review``
+            # (real wall time, every codex invocation). The previous
+            # shim-level emit here (``duration_ms=0`` placeholder)
+            # was removed: it never fired in production (because
+            # ``_prod_review`` collapses ALL non-pass verdicts to
+            # ``"fail"``) and shipped fake duration data when it
+            # did.
         finally:
             afk.resume(now_iso_fn())
         _progress_log_round(
@@ -5349,6 +5674,7 @@ def _dispatch_implementer_fresh_worktree(
     integration_target: str,
     prompt_prefix: str,
     round_num: int,
+    telemetry_state: Optional["RetrySessionState"] = None,
 ) -> Tuple[WorktreeContext, TaskFacts, dict]:
     """v0.8.3 P0.1 — Round 2+ implementer dispatch into a fresh worktree.
 
@@ -5398,14 +5724,37 @@ def _dispatch_implementer_fresh_worktree(
         )
 
     # Step 1: fresh worktree (round-discriminator naming).
-    try:
-        ctx = create_task_worktree(
-            repo_root=repo_root,
-            slug=slug,
-            task_idx=task_idx,
-            integration_target=integration_target,
-            round_num=round_num,
+    # v0.8.5 — emit ``worktree_create`` telemetry event around the
+    # ``git worktree add`` call (PRD R3). Outcome captures pass / fail;
+    # the failure path also writes ``fail_reason_raw`` before re-raising
+    # InfraFailureError, so telemetry retains the exact subprocess
+    # message even though the orchestrator wraps it.
+    if telemetry_state is not None:
+        wc_span_cm = _telemetry_span(
+            telemetry_state,
+            phase="worktree_create",
+            worktree_id=None,  # not yet created
         )
+    else:
+        wc_span_cm = _telemetry_mod.timed_span(
+            path=Path("/dev/null"), task_slug=slug, round_num=round_num,
+            phase="worktree_create", worktree_id=None, enabled=False,
+        )
+    try:
+        with wc_span_cm as _wc_span:
+            try:
+                ctx = create_task_worktree(
+                    repo_root=repo_root,
+                    slug=slug,
+                    task_idx=task_idx,
+                    integration_target=integration_target,
+                    round_num=round_num,
+                )
+                _wc_span.set_outcome("pass")
+            except (subprocess.CalledProcessError, OSError) as e:
+                _wc_span.set_outcome("fail")
+                _wc_span.set_fail_reason(repr(e))
+                raise
     except (subprocess.CalledProcessError, OSError) as e:
         # No ctx exists yet — orphan-cleanup is not applicable.
         raise InfraFailureError(
@@ -5634,12 +5983,25 @@ def _phase2_dispatch(
     # over Round 1 facts after the round-2+ helper has produced fresh
     # values. `task_brief` is rendered ONCE here; consumed every loop
     # iteration by `dispatch_with_retry::build_implementer_prompt`.
+    # v0.8.5 — pull dispatch observability switches off the contract.
+    # Both default "on" per PRD R5; explicit "off" turns the feature off
+    # without affecting the other (independent switches).
+    dispatch_cfg = getattr(contract, "dispatch", None) or {}
+    telemetry_enabled = dispatch_cfg.get("telemetry", "on") == "on"
+    feedback_enrichment_enabled = (
+        dispatch_cfg.get("feedback_enrichment", "on") == "on"
+    )
+    telemetry_path = task_dir / "telemetry.jsonl"
+
     state = RetrySessionState(
         task_slug=slug,
         progress_path=task_dir / "progress.md",
         current_round_ctx=ctx,
         current_round_facts=facts,
         task_brief=_render_task_brief(task_dir=task_dir, criteria=criteria),
+        telemetry_path=telemetry_path,
+        telemetry_enabled=telemetry_enabled,
+        feedback_enrichment_enabled=feedback_enrichment_enabled,
     )
 
     # ── Build deps (prod default or test-injected) ──────────────────
@@ -5682,6 +6044,10 @@ def _phase2_dispatch(
                 del prompt_prefix
                 return {}
             # Round 2+: fresh worktree dispatch via helper.
+            # v0.8.5 — pass `state` through as ``telemetry_state`` so
+            # the helper emits the ``worktree_create`` event under the
+            # active task slug + round number. Helper ignores it when
+            # state.telemetry_enabled is False (no-op span).
             new_ctx, new_facts, deltas = (
                 _dispatch_implementer_fresh_worktree(
                     repo_root=repo_root,
@@ -5691,6 +6057,7 @@ def _phase2_dispatch(
                     integration_target=round_1_integration_target,
                     prompt_prefix=prompt_prefix,
                     round_num=state.dispatch_retry_rounds + 1,
+                    telemetry_state=state,
                 )
             )
             # Two-phase commit (codex round-1 P0 §2): the helper has
@@ -5724,6 +6091,24 @@ def _phase2_dispatch(
                     "review adapter: state.current_round_ctx/facts "
                     "not seeded; phase2 wiring is broken"
                 )
+            # v0.8.5 codex-review I1 — wire telemetry_emit_fn so
+            # gate4_codex_review can emit a real-wall-time
+            # ``codex_review`` event from inside the gate (not from
+            # the dispatch_with_retry shim, where it never fired in
+            # production because _prod_review collapses verdicts to
+            # "fail"). The lambda captures `state` at call time so
+            # round_num + worktree_id stay current across the loop.
+            def _emit_codex_review(*, phase, duration_ms, outcome,
+                                   fail_reason_raw, worktree_id):
+                _telemetry_emit(
+                    state,
+                    phase=phase,
+                    worktree_id=worktree_id,
+                    duration_ms=duration_ms,
+                    outcome=outcome,
+                    fail_reason_raw=fail_reason_raw,
+                )
+
             gate_runner = GateRunner(
                 ctx=cur_ctx,
                 contract=contract,
@@ -5731,17 +6116,36 @@ def _phase2_dispatch(
                 run_id=run_id,
                 task_id=task_id,
                 prior_baseline=_load_prior_baseline(task_dir, task_id),
+                telemetry_emit_fn=_emit_codex_review,
             )
-            verdict = gate_runner.run_phase2(
-                manifest=manifest,
-                facts=cur_facts,
-                criteria=criteria,
-                attempt_id=attempt_id,
-                retry_idx=state.dispatch_retry_rounds,
-                baseline_command=gate_cmds["baseline"],
-                codex_command=gate_cmds["codex"],
-                smoke_command=gate_cmds["smoke"],
-            )
+            # v0.8.5 — emit ``gate_run`` telemetry event around the gate
+            # runner call (PRD R3). The verdict's status pass/fail is
+            # captured as the outcome; halted_at_gate + details land in
+            # ``fail_reason_raw`` for non-pass.
+            with _telemetry_span(
+                state, phase="gate_run",
+                worktree_id=cur_ctx.worktree_id,
+            ) as _gate_span:
+                try:
+                    verdict = gate_runner.run_phase2(
+                        manifest=manifest,
+                        facts=cur_facts,
+                        criteria=criteria,
+                        attempt_id=attempt_id,
+                        retry_idx=state.dispatch_retry_rounds,
+                        baseline_command=gate_cmds["baseline"],
+                        codex_command=gate_cmds["codex"],
+                        smoke_command=gate_cmds["smoke"],
+                    )
+                    _gate_span.set_outcome(verdict.status)
+                    if verdict.status != "pass":
+                        _gate_span.set_fail_reason(
+                            f"halted_at={verdict.halted_at_gate}"
+                        )
+                except Exception as exc:
+                    _gate_span.set_outcome("fail")
+                    _gate_span.set_fail_reason(repr(exc))
+                    raise
             if verdict.status == "pass":
                 return "pass"
             # Cache reviewer feedback so the next implementer round
@@ -6006,6 +6410,28 @@ def _cmd_auto_execute(slug: str) -> int:
             is_doc_only=False,
         )
 
+        # v0.8.5 codex-review I5 — Round 1 worktree_create telemetry.
+        # Build a closure that emits one event when auto_dispatch_task
+        # creates the round-1 worktree. Mirrors the contract-driven
+        # opt-out at ``_phase2_dispatch`` (PRD R5).
+        _disp_cfg = getattr(plan.contract, "dispatch", None) or {}
+        _telem_enabled = _disp_cfg.get("telemetry", "on") == "on"
+        _telem_path = task_dir / "telemetry.jsonl"
+
+        def _round1_worktree_emit(*, phase, round_num, duration_ms,
+                                  outcome, fail_reason_raw, worktree_id):
+            _telemetry_mod.emit_event(
+                path=_telem_path,
+                task_slug=slug,
+                round_num=round_num,
+                phase=phase,
+                duration_ms=duration_ms,
+                outcome=outcome,
+                fail_reason_raw=fail_reason_raw,
+                worktree_id=worktree_id,
+                enabled=_telem_enabled,
+            )
+
         # ── T10 / T11: dispatch subagent + verify manifest ─────────────
         outcome = auto_dispatch_task(
             slug=slug,
@@ -6020,6 +6446,7 @@ def _cmd_auto_execute(slug: str) -> int:
             integration_target=integration_target,
             notifier=notifier,
             prompt_prefix=round1_prefix,
+            telemetry_emit_fn=_round1_worktree_emit,
         )
         if outcome.status == "blocked":
             print(

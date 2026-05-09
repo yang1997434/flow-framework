@@ -253,6 +253,16 @@ class Contract:
     notification: dict = field(default_factory=lambda: dict(DEFAULT_NOTIFICATION))
     afk_timeout_min: Optional[int] = None
     afk_on_timeout: Optional[str] = None
+    # v0.8.5 — dispatch observability + feedback enrichment switches.
+    # PRD R5: both default to "on" (telemetry writes locally to task
+    # dir; feedback enrichment adds Round 2+ structural diff map to
+    # implementer prompt). The two switches are INDEPENDENT — disabling
+    # one does NOT disable the other.
+    # Shape: {"telemetry": "on"|"off", "feedback_enrichment": "on"|"off"}.
+    dispatch: dict = field(default_factory=lambda: {
+        "telemetry": "on",
+        "feedback_enrichment": "on",
+    })
     unknown_fields: list[str] = field(default_factory=list)
 
 
@@ -336,6 +346,8 @@ def parse_contract(path: Path) -> Contract:
         "notification", "afk_timeout_min", "afk_on_timeout",
         # T1 v0.8.1 additive top-level fields:
         "idempotent_cmd_allowlist", "post_merge_regression_optional",
+        # v0.8.5 — dispatch observability + feedback enrichment switches.
+        "dispatch",
     }
     unknown = sorted(set(raw.keys()) - known)
 
@@ -539,6 +551,21 @@ def parse_contract(path: Path) -> Contract:
         list(DEFAULT_IDEMPOTENT_CMD_ALLOWLIST),
     )
 
+    # v0.8.5 — dispatch observability + feedback enrichment switches.
+    # PRD R5: independent on/off toggles, default both "on". Absent →
+    # default applies. Explicit shape: ``{telemetry: on|off,
+    # feedback_enrichment: on|off}``. Wrong type / unknown values
+    # rejected per fail-closed posture (matches notification handling).
+    dispatch_raw = optional_field(raw, "dispatch", dict_value, {})
+    dispatch_cfg = {
+        "telemetry": _validate_on_off(
+            dispatch_raw, "telemetry", "on",
+        ),
+        "feedback_enrichment": _validate_on_off(
+            dispatch_raw, "feedback_enrichment", "on",
+        ),
+    }
+
     return Contract(
         contract_schema_version=csv,
         autonomy_mode=am,
@@ -556,7 +583,24 @@ def parse_contract(path: Path) -> Contract:
         notification=notification,
         afk_timeout_min=raw.get("afk_timeout_min"),
         afk_on_timeout=afk,
+        dispatch=dispatch_cfg,
         unknown_fields=unknown,
+    )
+
+
+def _validate_on_off(d: dict, key: str, default: str) -> str:
+    """v0.8.5 — accept 'on' / 'off' strings; absent → default; bool
+    True/False shorthand also accepted (translated to 'on'/'off').
+    Anything else raises ContractError."""
+    if key not in d:
+        return default
+    v = d[key]
+    if isinstance(v, bool):
+        return "on" if v else "off"
+    if v == "on" or v == "off":
+        return v
+    raise ContractError(
+        f"dispatch.{key} must be 'on' or 'off' (or boolean); got {v!r}"
     )
 
 

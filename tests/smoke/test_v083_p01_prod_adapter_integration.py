@@ -86,7 +86,10 @@ class _FakeGateRunnerFactory:
         self.invocations: list[dict] = []
 
     def __call__(self, *, ctx, contract, task_dir, run_id, task_id,
-                 prior_baseline=None):
+                 prior_baseline=None, telemetry_emit_fn=None):
+        # v0.8.5 codex-review I1: production GateRunner now accepts
+        # ``telemetry_emit_fn``; this fake factory must accept the
+        # kwarg too (don't need to use it — test verifies routing).
         self.ctx_seen = ctx  # last
         self.invocations.append({"ctx_id": ctx.worktree_id})
         runner = self

@@ -42,9 +42,24 @@ from typing import Optional
 __all__ = [
     "K_CLASS_SENTINEL_PROHIBITION",
     "BLINDSPOT_18_CLASS_SUMMARY_REF",
+    "PREV_ROUND_DIFF_MAP_FRAMING",
     "build_implementer_prompt",
     "build_reviewer_prompt",
 ]
+
+
+# v0.8.5 — verbatim framing string for the Round 2+ structural diff
+# map enrichment section. Pinned by tests so silent rewrites that
+# weaken the "structural map only / use reviewer feedback as primary"
+# message trip CI. Codex round-2 framing (see
+# ``research/codex-consult-r2-output.md``): the diff map enriches
+# *localisation* and *cross-checking*; it is NOT a second source of
+# implementation context. The framing line MUST stay paired with the
+# section header in ``build_implementer_prompt`` below.
+PREV_ROUND_DIFF_MAP_FRAMING: str = (
+    "This is a structural map only; no code content. "
+    "Use reviewer feedback as the primary signal for what to change."
+)
 
 
 # ── Constants ───────────────────────────────────────────────────────
@@ -131,6 +146,7 @@ def build_implementer_prompt(
     reviewer_feedback: Optional[str] = None,
     is_first_pass: bool = True,
     is_doc_only: bool = False,
+    prev_round_diff_summary: Optional[str] = None,
 ) -> str:
     """Compose an implementer dispatch prompt.
 
@@ -149,6 +165,20 @@ def build_implementer_prompt(
     Defaults are safe-by-default: ``is_first_pass=True`` and
     ``is_doc_only=False`` → prohibition prepended. Callers must
     explicitly opt out for doc-only paths.
+
+    v0.8.5 (PRD §R4): ``prev_round_diff_summary`` (Round 2+ only) is a
+    structural diff map of the previous round's changes — file list +
+    per-file +/- counts + top-level ``@@`` hunk headers. NO code
+    lines. When supplied non-empty, an enrichment section is appended
+    AFTER the reviewer feedback with explicit framing
+    (``PREV_ROUND_DIFF_MAP_FRAMING``) so the implementer treats it as
+    auxiliary localisation, not as a second source of context. Round 1
+    callers MUST pass None / empty (there is no prev round). Empty
+    string is treated as None — the section is omitted.
+
+    pitfall:dispatch-shim-silent-kw-drop — every new kwarg uses an
+    explicit named parameter (NOT ``**kw``) so misspelt callers raise
+    ``TypeError`` rather than silently drop the field.
 
     Returns the assembled prompt string.
     """
@@ -174,6 +204,20 @@ def build_implementer_prompt(
         parts.append("## Reviewer feedback (from previous round)")
         parts.append("")
         parts.append(reviewer_feedback)
+
+    # v0.8.5 R4 — Round 2+ structural diff map enrichment. Empty
+    # string treated as None (Round 1 short-circuit + helper-returns-
+    # empty path). The framing line + explicit "structural map only"
+    # label sit BEFORE the body so the implementer reads the disclaimer
+    # before any path / hunk header.
+    if prev_round_diff_summary:
+        parts.append("")
+        parts.append("---")
+        parts.append("## Round N-1 structural diff map (no code lines)")
+        parts.append("")
+        parts.append(PREV_ROUND_DIFF_MAP_FRAMING)
+        parts.append("")
+        parts.append(prev_round_diff_summary)
 
     return "\n".join(parts)
 

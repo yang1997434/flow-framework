@@ -1,5 +1,120 @@
 # Changelog
 
+## [0.8.5] - 2026-05-09 (dispatch telemetry + feedback enrichment)
+
+### Pivot history
+
+Originally scoped as `v0.8.5 P0.7 parallel speculation dispatch` (complex).
+Phase 1 codex consult R1 argued the motivation: cap=2 makes wall-clock gain
+marginal; fresh worktree is not the bottleneck; K-class sentinel race +
+state single-round model would require 1-2 weeks; ADR Revisit triggers from
+v0.8.3 P0.1 are unverified. v0.8.5 pivoted to ship dispatch observability
++ feedback enrichment so any future P0.7 decision is data-driven. P0.7
+formally deferred to v0.8.6 pending 3 data triggers (worktree p50 >15s OR
+implementer p95 >5min; Round 2 FAIL rate >40% concentrated in
+implementation-path-dependent reasons; ≥2 user pulls).
+
+### Added
+
+- **Dispatch telemetry** (R1 / R2 / R5): 5-phase JSONL events per round
+  (`worktree_create` / `implementer` / `reviewer` / `gate_run` /
+  `codex_review`) with frozen schema v1. Default ON;
+  `dispatch.telemetry: off` opt-out. Events land at
+  `<task_dir>/telemetry.jsonl` and follow the task into archive.
+- **Round 2+ feedback enrichment** (R4): structural diff map (stat +
+  `@@` hunk headers, **no code lines**) appended to implementer prompt;
+  covers committed + staged + unstaged + untracked sources. Default ON;
+  `dispatch.feedback_enrichment: off` independent opt-out. Per-file
+  10-hunk-header cap, 200-line total cap, light path/header-only redaction
+  (UUID / email / long token).
+- `scripts/common/telemetry.py` — JSONL writer with `fcntl`-locked append,
+  `timed_span` ContextManager, `normalize_outcome` (frozen 4 values
+  `pass | fail | skip | null`; raw verdict preserved in `fail_reason_raw`).
+- `scripts/common/diff_summary.py` — 4-source diff collector
+  (`_collect_committed` / `_collect_staged` / `_collect_unstaged` /
+  `_collect_untracked`) with isolated git-failure fallback per source.
+- `templates/telemetry-schema.md` — schema v1 documentation +
+  known-limits section.
+- `.flow/v0.8.5-known-limits.md` — deferred items + cosmetic findings
+  (see "Known limits" below).
+
+### Changed
+
+- `scripts/flow_orchestrator.py` — 5-phase telemetry instrumentation
+  threaded through `auto_dispatch_task` / `_phase2_dispatch` /
+  `_dispatch_implementer_fresh_worktree` / `GateRunner.gate4_codex_review`
+  via explicit `telemetry_emit_fn` kwargs (per
+  `pitfall:dispatch-shim-silent-kw-drop`); `RoundRecord` schema gained
+  `base_commit: str = ""` for correct Round N>2 enrichment anchoring;
+  enrichment lookup prefers `current_round_ctx` (preserves P0.1 two-phase
+  commit invariant).
+- `scripts/dispatch_template.py::build_implementer_prompt` — new optional
+  kwarg `prev_round_diff_summary`; appended section with explicit
+  "structural map only; no code content" framing.
+- `scripts/flow_contract.py` — `Contract.dispatch` field with two
+  independent boolean switches; fail-closed on invalid value.
+- `.gitignore` — `tasks/**/telemetry.jsonl` (per-task local artifacts).
+- `tests/smoke/test_v083_p01_prod_adapter_integration.py` — fixture
+  updated to accept new GateRunner constructor kwargs (not masked).
+
+### Acceptance Criteria validation
+
+- **AC1** (telemetry fields frozen) — `tests/unit/test_telemetry_v085.py`
+  + `test_telemetry_outcome_normalization_v085.py`
+- **AC2** (5-phase coverage) — `test_v085_production_path.py` Round 1
+  `worktree_create` + Round 2 `worktree_create` + 2× `gate_run` + 1+
+  `codex_review` events; orchestrator wraps at scripts/flow_orchestrator.py
+  for each phase
+- **AC3** (Round 2 enrichment visible) —
+  `test_v085_production_path.py::TestRound2EnrichmentViaFullRetryLoop`
+  drives full production retry loop end-to-end (only `_invoke_subagent_dispatch`
+  + `_run_shell_with_pgkill` mocked), asserts diff map landed in actual
+  Round 2 prompt with all 4 disk-state sources
+- **AC4** (suite preserved) — 1062 PASS (888 smoke + 174 unit); 985
+  baseline + 77 net new tests, 0 regressions
+- **AC5** (contract opt-out, independent) —
+  `tests/unit/test_contract_dispatch_v085.py::IndependentSwitches` +
+  `BooleanShorthand` + `FailClosedOnInvalid`
+
+### Validation
+
+- **1062 PASS** (888 smoke + 174 unit), 0 fail / 0 regression
+- **3 codex review rounds** — R1 detected 0 P0 / 4 P1 / 2 P2; R2 fixes
+  detected 0 P0 / 1 P1 + 3 P2 (residual); R3 final verdict GREEN
+  (0 P0 / 0 P1 / 0 P2)
+- All 6 codex-detected issues were real bugs (not false positives); the
+  external-reviewer gate caught what implementer self-review missed —
+  validating the K-class sentinel design intent
+
+### Known limits (deferred to v0.8.6)
+
+- `_collect_untracked()` collapses new directories to `?? dir/`; nested
+  files inside new directories not per-file enumerated. Stat block stays
+  correct; structural map degrades for "new package" case.
+- `auto_dispatch_task::telemetry_emit_fn` kwarg has explicit named param +
+  runtime fail-closed but lacks unknown-kwarg explosion introspection
+  test (vs prompt-builder kwarg test style).
+- `_render` emits hunk-block twice when same file appears in multiple
+  sources (e.g. committed + unstaged). Cosmetic — no information loss,
+  200-line cap still binds; deferred dedup to v0.8.6.
+- `test_v085_production_path.py` Round 1 RED payload is malformed for
+  parsed-issue path (gate4 returns `inconclusive`); the test exercises
+  the retry-loop machinery but does not validate the parsed-RED-issue
+  branch — covered separately by existing v0.8.3 tests.
+
+### ADR-lite (P0.7 deferral)
+
+**Decision**: ship telemetry + enrichment in v0.8.5; defer P0.7 parallel
+speculation pending data triggers.
+
+**Revisit triggers** (any one fires): (1) telemetry shows worktree create
+p50 >15s OR implementer wall p95 >5min; (2) Round 2 FAIL rate >40% AND
+FAIL reason concentrated in implementation-path-dependent; (3) ≥2 tasks
+have explicit user pull for parallel speculation.
+
+If 30 days of telemetry data show none of the triggers fire, P0.7 moves
+to long-term backlog or removal.
+
 ## [0.8.4 P3] - 2026-05-08 (CLI literal→constant refactor)
 
 ### Changed
